@@ -1,0 +1,65 @@
+[project]
+name = "scattering-gan-sim"
+version = "0.0.0"
+description = "Minimal simulation scaffold for scattering-corrupted optical fields, DNN reconstruction, and GAN refinement."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "BSD-3-Clause" }
+authors = [
+  { name = "Wayne Yang" }
+]
+dependencies = [
+    "torch==2.11.0; sys_platform != 'linux' and sys_platform != 'win32'",
+    "torch==2.12.0+cu126; sys_platform == 'linux' or sys_platform == 'win32'",
+    "torchvision==0.26.0; sys_platform != 'linux' and sys_platform != 'win32'",
+    "torchvision==0.27.0+cu126; sys_platform == 'linux' or sys_platform == 'win32'",
+    "numpy==2.4.4",
+    "scipy==1.17.1",
+    "matplotlib==3.10.9",
+    "Pillow==12.2.0",
+    "opencv-python-headless==4.13.0.92",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "check_deps",
+    "coherent_data",
+    "data",
+    "d2nn",
+    "experiment",
+    "losses",
+    "metrics",
+    "optics",
+    "patchgan",
+    "runtime",
+    "unet",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest==9.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "cuda: tests that require NVIDIA CUDA hardware",
+    "slow: long-running or evidence-producing tests",
+]

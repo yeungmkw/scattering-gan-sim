@@ -1,0 +1,81 @@
+# macOS and editor state
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+.uv-cache/
+
+# Python build and cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+.tox/
+.nox/
+.hypothesis/
+
+# Jupyter local state
+.ipynb_checkpoints/
+
+# Downloaded datasets and generated experiment artifacts
+data/
+outputs/
+checkpoints/
+runs/
+artifacts/
+wandb/
+mlruns/
+lightning_logs/
+
+# Trained weights and large numeric artifacts
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.npz
+*.npy
+
+# Runtime logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Coding-agent local state and caches
+AGENTS.md
+.codex/
+.agents/
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v3/
+.claude/settings.local.json
+.claude/*.local.json
+.claude/tmp/
+.claude/.cache/
+.cursor/index/
+.cursor/cache/
+.continue/
+.windsurf/
+.serena/
