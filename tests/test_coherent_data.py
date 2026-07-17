@@ -5,6 +5,8 @@ from coherent_data import (
     CoherentD2NNDataset,
     MaterializedCoherentDataset,
     materialize_coherent_dataset,
+    prepare_luo2022_amplitude,
+    prepare_luo2022_field,
     simulate_coherent_observation,
 )
 
@@ -91,3 +93,24 @@ def test_materialized_coherent_dataset_constructor_copies_by_default() -> None:
     source["clean"][0].zero_()
 
     assert torch.all(materialized[0]["clean"] == 1)
+
+
+def test_prepare_luo2022_input_resizes_and_center_pads_amplitude() -> None:
+    image = torch.ones(2, 1, 28, 28)
+
+    amplitude = prepare_luo2022_amplitude(
+        image,
+        resized_shape=(32, 32),
+        canvas_shape=(48, 48),
+    )
+    field = prepare_luo2022_field(
+        image,
+        resized_shape=(32, 32),
+        canvas_shape=(48, 48),
+    )
+
+    assert amplitude.shape == (2, 1, 48, 48)
+    assert field.shape == (2, 48, 48)
+    assert torch.all(amplitude[:, :, 8:40, 8:40] == 1)
+    assert torch.all(amplitude[:, :, :8] == 0)
+    assert torch.allclose(field.real, amplitude[:, 0])

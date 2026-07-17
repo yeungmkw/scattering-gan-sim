@@ -1,0 +1,346 @@
+{
+  "schema_version": 1,
+  "profile_id": "luo2022_thz_r0",
+  "freeze_version": "2026-07-17.2",
+  "status": {
+    "contract": "frozen",
+    "runtime_binding": "implemented",
+    "validation": "small_run_passed_under_2026-07-17.2",
+    "readiness": "ready_for_cuda_training_2026-07-17",
+    "small_run_artifact": "outputs/luo2022_r0_small/manifest.json",
+    "full_scale_diffuser_artifact": "outputs/luo2022_r0_assessment/assessment.json",
+    "claim_level": "reproduction_contract"
+  },
+  "experiment_class": "E4",
+  "comparison_level": "R0",
+  "paper": {
+    "title": "Computational imaging without a computer: seeing through random diffusers at the speed of light",
+    "year": 2022,
+    "implementation_framework_reported": "TensorFlow 1.13.0",
+    "python_version_reported": "3.7.3"
+  },
+  "evidence_labels": {
+    "paper_confirmed": "Explicitly stated in the main paper.",
+    "supplement_confirmed": "Explicitly stated or shown in the supplementary material.",
+    "paper_inferred": "Not stated directly, but strongly constrained by multiple statements in the paper.",
+    "project_choice": "Not published; frozen here as the primary reproduction choice.",
+    "deferred": "Not needed for the first executable R0 baseline."
+  },
+  "scope": {
+    "wavelength_regime": "terahertz",
+    "all_optical_reconstruction": true,
+    "trainable_d2nn": true,
+    "unet": false,
+    "gan": false,
+    "visible_light": false,
+    "volumetric_multiple_scattering": false
+  },
+  "grid": {
+    "shape": [
+      240,
+      240
+    ],
+    "pixel_pitch_m": 0.0003,
+    "pixel_pitch_lambda": 0.4,
+    "field_width_m": 0.072,
+    "field_width_lambda": 96.0,
+    "evidence": "paper_confirmed"
+  },
+  "illumination": {
+    "frequency_hz": 400000000000.0,
+    "wavelength_m": 0.00075,
+    "incident_field": "unit_amplitude_plane_wave",
+    "evidence": "paper_confirmed"
+  },
+  "input": {
+    "dataset": "MNIST",
+    "encoding": "field_amplitude",
+    "original_shape": [
+      28,
+      28
+    ],
+    "resized_shape": [
+      160,
+      160
+    ],
+    "canvas_shape": [
+      240,
+      240
+    ],
+    "resize_method": "bilinear",
+    "align_corners": false,
+    "zero_pad_centered": true,
+    "train_objects": 50000,
+    "test_objects": 10000,
+    "train_index_choice": {
+      "value": "torchvision_mnist_train_indices_0_to_49999",
+      "evidence": "project_choice",
+      "sensitivity_check": "seeded_random_50000_of_60000"
+    },
+    "evidence": "paper_confirmed_except_align_corners_and_train_index_choice"
+  },
+  "diffuser": {
+    "model": "thin_pure_phase_correlated_random_height",
+    "refractive_index_difference": 0.74,
+    "height_mean_lambda": 25.0,
+    "height_std_lambda": 8.0,
+    "gaussian_sigma_lambda": 4.0,
+    "gaussian_sigma_pixels": 10.0,
+    "expected_mean_correlation_length_lambda": 10.0,
+    "training_correlation_validation_samples": 2000,
+    "uniqueness": {
+      "metric": "mean_pixelwise_absolute_difference_of_mean_centered_phase",
+      "minimum_radians": 1.5707963267948966,
+      "phase_representation": "minus_pi_to_pi",
+      "comparison_scope": "all_previously_accepted_training_diffusers_and_current_epoch_candidates",
+      "metric_and_threshold_evidence": "paper_confirmed",
+      "phase_representation_evidence": "paper_inferred_project_choice",
+      "comparison_scope_evidence": "paper_inferred"
+    },
+    "correlation_estimator": {
+      "field": "mean_centered_complex_transmittance",
+      "radial_model": "exp_minus_pi_r_squared_over_L_squared",
+      "fit_correlation_range": [
+        0.2,
+        0.95
+      ],
+      "field_evidence": "paper_inferred_project_choice",
+      "radial_model_evidence": "paper_confirmed",
+      "fit_range_evidence": "project_choice",
+      "acceptance_relative_error": 0.1
+    },
+    "finite_kernel_choice": {
+      "truncate_sigma": 4.0,
+      "radius_pixels": 40,
+      "size_pixels": 81,
+      "padding": "reflect",
+      "output_shape": "same",
+      "evidence": "project_choice",
+      "sensitivity_checks": [
+        "zero_padding",
+        "circular_padding"
+      ]
+    },
+    "equations": [
+      2,
+      3,
+      4,
+      5
+    ],
+    "evidence": "paper_confirmed_except_finite_kernel_choice"
+  },
+  "geometry": {
+    "object_to_diffuser_m": 0.04,
+    "diffuser_to_first_layer_m": 0.002,
+    "layer_to_layer_m": 0.002,
+    "last_layer_to_output_m": 0.007,
+    "evidence": "paper_confirmed"
+  },
+  "propagation": {
+    "normative_equation": "rayleigh_sommerfeld_equation_7",
+    "segment_order": [
+      "object_to_diffuser",
+      "multiply_diffuser_transmittance",
+      "diffuser_to_layer_1",
+      "multiply_layer_1_transmittance",
+      "propagate_and_multiply_layers_2_to_4",
+      "last_layer_to_output",
+      "detector_raw_intensity"
+    ],
+    "reference_backend": {
+      "method": "rayleigh_sommerfeld_fft_linear_convolution",
+      "fft_shape": [
+        480,
+        480
+      ],
+      "quadrature_factor": "pixel_pitch_m_squared",
+      "crop": "center_same_240x240",
+      "complex_dtype": "complex128",
+      "evidence": "project_choice"
+    },
+    "training_backend": {
+      "initial_method": "rayleigh_sommerfeld_fft_linear_convolution",
+      "complex_dtype": "complex64",
+      "angular_spectrum_allowed_after_validation": true,
+      "evidence": "project_choice"
+    },
+    "equations": [
+      6,
+      7,
+      9,
+      10
+    ]
+  },
+  "d2nn": {
+    "layers": 4,
+    "layer_shape": [
+      240,
+      240
+    ],
+    "modulation": "phase_only",
+    "phase_parameterization": "unbounded_real_parameter_used_inside_exp_j_phi",
+    "phase_initialization": {
+      "mode": "zero",
+      "value_radians": 0.0,
+      "evidence": "project_choice",
+      "sensitivity_check": "uniform_0_to_2pi"
+    },
+    "equations": [
+      8,
+      9,
+      10
+    ],
+    "evidence": "paper_confirmed_except_phase_parameterization_and_phase_initialization"
+  },
+  "training": {
+    "epochs": 100,
+    "objects_per_batch": 4,
+    "diffusers_per_epoch": 20,
+    "fields_per_update": 80,
+    "steps_per_epoch": 12500,
+    "regenerate_diffusers_at_epoch_start": true,
+    "reuse_epoch_diffusers_for_all_batches": true,
+    "object_order": {
+      "mode": "random_without_replacement_until_all_50000_are_exhausted",
+      "evidence": "paper_inferred"
+    },
+    "optimizer": {
+      "name": "Adam",
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "epsilon": 1e-08,
+      "weight_decay": 0.0,
+      "evidence": "paper_confirmed_name_project_choice_tensorflow_v1_defaults"
+    },
+    "learning_rate": {
+      "initial": 0.001,
+      "formula": "initial_times_0.99_power_zero_based_epoch",
+      "gamma": 0.99,
+      "update_interval": "epoch",
+      "epoch_100_approx": 0.0003697296376497266,
+      "evidence": "paper_inferred",
+      "rationale": "Per-mini-batch decay contradicts the paper's approximately 3e-4 end-of-training learning rate."
+    },
+    "loss": {
+      "negative_pearson_weight": 1.0,
+      "outside_support_energy_weight": 1.0,
+      "inside_support_energy_reward": 0.5,
+      "uses_raw_output_intensity": true,
+      "equations": [
+        1,
+        11,
+        12,
+        13
+      ],
+      "evidence": "paper_confirmed"
+    },
+    "primary_seed": {
+      "value": 0,
+      "evidence": "project_choice"
+    }
+  },
+  "evaluation": {
+    "test_objects": 10000,
+    "primary_metric": "pearson_correlation_coefficient",
+    "image_values": "raw_output_intensity",
+    "contrast_enhancement_for_metrics": false,
+    "aggregation": {
+      "per_diffuser": "mean_over_10000_test_objects",
+      "across_diffusers": [
+        "mean",
+        "standard_deviation"
+      ]
+    },
+    "diffuser_sets_for_n20": {
+      "all_training_diffusers": 2000,
+      "epochs_1_to_99_diffusers": 1980,
+      "last_10_epochs_diffusers": 200,
+      "last_epoch_diffusers": 20,
+      "new_diffusers": 20
+    },
+    "controls": [
+      "no_diffuser",
+      "free_space_without_d2nn"
+    ],
+    "evidence": "paper_confirmed"
+  },
+  "supplementary_material": {
+    "methods_added": false,
+    "figure_s1": "Trained phase patterns for the four-layer n=20 network.",
+    "figure_s2": "Free-space, lens, numerical D2NN, and experimental distortion comparison.",
+    "figure_s3": "Phase-island overlap analysis after training.",
+    "figure_s4": {
+      "purpose": "Pruning mechanism study, not an R0 acceptance benchmark.",
+      "single_digit_known_new_pcc_baseline": [
+        0.7797,
+        0.7932
+      ],
+      "no_d2nn_known_new_pcc": [
+        0.5321,
+        0.535
+      ],
+      "circular_aperture_diameter_lambda": 80.0,
+      "evidence": "supplement_confirmed"
+    },
+    "figure_s5": {
+      "training_correlation_length_lambda": 10.0,
+      "stress_test_correlation_length_lambda": 5.0,
+      "stress_test_gaussian_sigma_lambda": 2.0,
+      "result_type": "qualitative_generalization_check",
+      "evidence": "supplement_confirmed_and_main_methods_confirmed"
+    }
+  },
+  "deferred": [
+    {
+      "item": "authors_exact_phase_initialization",
+      "reason": "Not reported in the main paper or supplementary material."
+    },
+    {
+      "item": "authors_exact_gaussian_kernel_support_and_boundary",
+      "reason": "Not reported; the frozen project choice must be sensitivity-tested."
+    },
+    {
+      "item": "authors_exact_propagation_padding_crop_and_precision",
+      "reason": "Not reported; the reference implementation choices must be numerically validated."
+    },
+    {
+      "item": "authors_exact_mnist_50000_indices_and_random_seeds",
+      "reason": "Not reported."
+    },
+    {
+      "item": "paper_checkpoint_and_source_code",
+      "reason": "No checkpoint or paper-specific source archive was found in the paper package."
+    },
+    {
+      "item": "figure_digitization_targets_and_acceptance_tolerances",
+      "reason": "To be defined after the executable R0 baseline is stable."
+    },
+    {
+      "item": "resolution_target_and_lens_equations_14_to_20",
+      "reason": "Optional paper controls; not required for the first MNIST R0 run."
+    }
+  ],
+  "change_control": {
+    "rule": "Any change to a paper-confirmed field or frozen project choice requires a freeze_version bump and a documented rationale.",
+    "runtime_rule": "experiment.py must snapshot this source configuration when the R0 profile is implemented.",
+    "current_freeze_change": {
+      "from": "2026-07-17.1",
+      "to": "2026-07-17.2",
+      "changed_fields": [
+        "diffuser.uniqueness.phase_representation",
+        "diffuser.uniqueness.comparison_scope",
+        "diffuser.correlation_estimator"
+      ],
+      "rationale": "The unwrapped-phase interpretation failed the published uniqueness and mean-correlation targets. The selected wrapped-phase and complex-transmittance interpretation passes both targets while remaining explicitly labeled as unpublished implementation inference.",
+      "acceptance": {
+        "small_run": "passed",
+        "paper_scale_diffusers": 2000,
+        "exact_unordered_pairs": 1999000,
+        "minimum_pair_difference_radians": 1.9788169860839844,
+        "pair_pass_fraction": 1.0,
+        "mean_correlation_length_lambda": 10.70466379361538,
+        "correlation_relative_error_to_paper_target": 0.07046637936153796
+      }
+    }
+  }
+}

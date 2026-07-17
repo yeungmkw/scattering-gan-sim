@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -57,6 +58,158 @@ def test_training_cli_accepts_diffuser_ids() -> None:
     assert args.eval_diffuser_ids == [2, 3]
 
 
+def test_d2nn_cli_exposes_isolated_luo2022_profile() -> None:
+    args = experiment.build_parser().parse_args(
+        [
+            "d2nn",
+            "--profile",
+            "luo2022_r0",
+            "--action",
+            "train",
+            "--small-run",
+            "--grid-size",
+            "48",
+            "--diffuser-chunk-size",
+            "1",
+            "--review-eval-batches",
+            "3",
+            "--resume",
+        ]
+    )
+
+    assert args.profile == "luo2022_r0"
+    assert args.action == "train"
+    assert args.small_run is True
+    assert args.grid_size == 48
+    assert args.diffuser_chunk_size == 1
+    assert args.review_eval_batches == 3
+    assert args.resume is True
+
+
+def test_d2nn_cli_exposes_luo2022_readiness_assessment() -> None:
+    args = experiment.build_parser().parse_args(
+        [
+            "d2nn",
+            "--profile",
+            "luo2022_r0",
+            "--action",
+            "assess",
+            "--output-dir",
+            "outputs/assessment",
+        ]
+    )
+
+    assert args.profile == "luo2022_r0"
+    assert args.action == "assess"
+    assert args.output_dir == "outputs/assessment"
+
+
+def test_luo2022_runtime_config_labels_and_controls_small_overrides() -> None:
+    contract = experiment.load_config(experiment.DEFAULT_LUO2022_CONFIG)
+
+    config = experiment.build_luo2022_runtime_config(
+        contract,
+        small_run=True,
+        device=torch.device("cpu"),
+        epochs=2,
+        train_limit=8,
+    )
+
+    assert config["status_label"] == "small run"
+    assert config["runtime"]["epochs"] == 2
+    assert config["runtime"]["train_limit"] == 8
+    assert config["runtime"]["diffuser_chunk_size"] == 2
+    assert config["execution_controls"]["gradient_accumulation_preserves_fields_per_update"] is True
+    assert config["overrides_from_frozen_contract"]["epochs"]["paper_value"] == 100
+    assert "not a paper result" in config["claim_boundary"]
+
+    with pytest.raises(ValueError, match="require --small-run"):
+        experiment.build_luo2022_runtime_config(
+            contract,
+            small_run=False,
+            device=torch.device("cpu"),
+            epochs=2,
+        )
+
+
+def test_luo2022_full_runtime_allows_execution_only_chunking() -> None:
+    contract = experiment.load_config(experiment.DEFAULT_LUO2022_CONFIG)
+
+    config = experiment.build_luo2022_runtime_config(
+        contract,
+        small_run=False,
+        device=torch.device("cuda"),
+        diffuser_chunk_size=2,
+        review_eval_batches=10,
+    )
+
+    assert config["runtime"]["diffusers_per_epoch"] == 20
+    assert config["runtime"]["diffuser_chunk_size"] == 2
+    assert config["runtime"]["review_eval_batches"] == 10
+    assert config["overrides_from_frozen_contract"] == {}
+
+
+def test_luo2022_diffuser_chunking_preserves_one_optimizer_update() -> None:
+    generator = torch.Generator().manual_seed(19)
+    images = torch.rand(2, 1, 28, 28, generator=generator)
+    labels = torch.zeros(2, dtype=torch.long)
+    loader = DataLoader(TensorDataset(images, labels), batch_size=2, shuffle=False)
+    config = experiment.Luo2022OpticsConfig(field_shape=(48, 48))
+    full_model = experiment.Luo2022FourLayerD2NN(config)
+    chunked_model = experiment.Luo2022FourLayerD2NN(config)
+    chunked_model.load_state_dict(full_model.state_dict())
+    diffusers = torch.rand(4, 48, 48, generator=generator)
+    full_optimizer = torch.optim.SGD(full_model.parameters(), lr=1e-3)
+    chunked_optimizer = torch.optim.SGD(chunked_model.parameters(), lr=1e-3)
+
+    full_metrics = experiment.train_luo2022_one_epoch(
+        full_model,
+        loader,
+        diffusers,
+        full_optimizer,
+        resized_shape=(32, 32),
+        canvas_shape=(48, 48),
+        device=torch.device("cpu"),
+        diffuser_chunk_size=4,
+    )
+    chunked_metrics = experiment.train_luo2022_one_epoch(
+        chunked_model,
+        loader,
+        diffusers,
+        chunked_optimizer,
+        resized_shape=(32, 32),
+        canvas_shape=(48, 48),
+        device=torch.device("cpu"),
+        diffuser_chunk_size=1,
+    )
+
+    assert chunked_metrics == pytest.approx(full_metrics, abs=1e-6)
+    assert torch.allclose(chunked_model.phase, full_model.phase, atol=1e-8, rtol=1e-5)
+
+
+def test_training_cli_builds_shared_reconstruction_weights() -> None:
+    args = experiment.build_parser().parse_args(
+        [
+            "unet",
+            "--l1-weight",
+            "0.8",
+            "--negative-pearson-weight",
+            "0.1",
+            "--ssim-weight",
+            "0.2",
+            "--fourier-weight",
+            "0.05",
+        ]
+    )
+
+    assert experiment.reconstruction_weights_from_args(args) == ReconstructionLossWeights(
+        l1=0.8,
+        negative_pearson=0.1,
+        ssim=0.2,
+        fourier=0.05,
+    )
+
+
 def test_experiment_classes_follow_the_roadmap() -> None:
     assert experiment.experiment_class_for_run(
         corruption="phase", train_diffuser_ids=(0,), eval_diffuser_ids=(0,), uses_gan=False
@@ -70,6 +223,37 @@ def test_experiment_classes_follow_the_roadmap() -> None:
     assert experiment.experiment_class_for_run(
         corruption="particles", train_diffuser_ids=(0,), eval_diffuser_ids=(0,), uses_gan=True
     ) == "E3+E2"
+
+
+def test_coherent_training_config_uses_canonical_schema() -> None:
+    config = experiment.coherent_training_config(
+        command="unet",
+        experiment_class="E1",
+        corruption="phase",
+        seed=42,
+        d2nn_seed=7961,
+        train_diffuser_ids=(0, 1),
+        eval_diffuser_ids=(2,),
+        train_limit=32,
+        eval_limit=8,
+        epochs=2,
+        batch_size=4,
+        base_channels=8,
+        lr=2e-3,
+        device=torch.device("cpu"),
+        materialize=True,
+        sample_every=1,
+        max_train_batches=None,
+        max_eval_batches=None,
+        num_workers=0,
+        reconstruction_weights=ReconstructionLossWeights(l1=1.0, negative_pearson=0.1),
+    )
+
+    assert config["schema_version"] == experiment.CONFIG_SCHEMA_VERSION
+    assert config["experiment_class"] == "E1"
+    assert config["diffuser_split"]["evaluation"] == "unseen"
+    assert config["optimization"]["reconstruction_loss_weights"]["negative_pearson"] == 0.1
+    assert config["evaluation"]["metrics_protocol"] == experiment.metrics_protocol_metadata()
 
 
 def test_coherent_unet_train_eval_and_grid(tmp_path: Path) -> None:
@@ -170,5 +354,7 @@ def test_experiment_compare_writes_metric_summary(tmp_path: Path) -> None:
 
     assert result["metric_comparison"]["l1"]["gan_better"] is True
     assert result["metric_comparison"]["psnr"]["gan_better"] is True
+    assert result["schema_version"] == experiment.MANIFEST_SCHEMA_VERSION
+    assert result["metrics_protocol"]["psnr"] == "mean of per-image PSNR values"
     assert (output_dir / "comparison.json").is_file()
     assert (output_dir / "comparison_metrics.png").is_file()

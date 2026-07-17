@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn import functional as F
 from torch.utils.data import Dataset, Subset
 
 from d2nn import (
@@ -21,6 +22,7 @@ from d2nn import (
     SingleLayerD2NN,
     apply_amplitude_particles,
     apply_phase_screen,
+    amplitude_to_complex_field,
     field_intensity,
     field_phase,
     image_to_complex_field,
@@ -225,6 +227,53 @@ def simulate_coherent_observation(
         seed=seed,
         d2nn_seed=d2nn_seed,
     )
+
+
+def prepare_luo2022_amplitude(
+    image: torch.Tensor,
+    *,
+    resized_shape: tuple[int, int],
+    canvas_shape: tuple[int, int],
+) -> torch.Tensor:
+    """Resize and center-pad MNIST as the amplitude input in paper equation (6)."""
+
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+    if image.ndim != 4 or image.shape[1] != 1:
+        raise ValueError("image must have shape (B, 1, H, W) or (1, H, W)")
+    resized_height, resized_width = resized_shape
+    canvas_height, canvas_width = canvas_shape
+    if min(resized_height, resized_width, canvas_height, canvas_width) <= 0:
+        raise ValueError("resized_shape and canvas_shape values must be positive")
+    if resized_height > canvas_height or resized_width > canvas_width:
+        raise ValueError("resized_shape must fit inside canvas_shape")
+    resized = F.interpolate(
+        image.to(dtype=torch.float32),
+        size=resized_shape,
+        mode="bilinear",
+        align_corners=False,
+    )
+    top = (canvas_height - resized_height) // 2
+    left = (canvas_width - resized_width) // 2
+    canvas = resized.new_zeros((resized.shape[0], 1, canvas_height, canvas_width))
+    canvas[..., top : top + resized_height, left : left + resized_width] = resized
+    return canvas
+
+
+def prepare_luo2022_field(
+    image: torch.Tensor,
+    *,
+    resized_shape: tuple[int, int],
+    canvas_shape: tuple[int, int],
+) -> torch.Tensor:
+    """Return the zero-phase amplitude field used by the Luo 2022 R0 path."""
+
+    amplitude = prepare_luo2022_amplitude(
+        image,
+        resized_shape=resized_shape,
+        canvas_shape=canvas_shape,
+    )
+    return amplitude_to_complex_field(amplitude)
 
 
 def build_coherent_mnist_datasets(

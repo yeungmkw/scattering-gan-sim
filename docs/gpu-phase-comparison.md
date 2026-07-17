@@ -26,7 +26,7 @@ with a conditional PatchGAN discriminator.
 |---|---:|---:|---|---|
 | L1 | 0.0549016 | 0.0519791 | lower is better | better |
 | MSE | 0.0231906 | 0.0223656 | lower is better | better |
-| PSNR (per-image mean) | 17.4042 | 17.6024 | higher is better | better |
+| PSNR (per-image mean) | 16.3830 | 16.5356 | higher is better | better |
 | SSIM | 0.805810 | 0.815968 | higher is better | better |
 | Pearson | 0.835173 | 0.825300 | higher is better | worse |
 
@@ -40,9 +40,11 @@ Pearson correlation decreased. That means the GAN stage is not automatically a
 scientific win. It may smooth or sharpen the reconstruction in ways that help
 some perceptual metrics while slightly reducing correlation fidelity.
 
-The PSNR values above were recomputed from the saved checkpoints using the
-current per-image-mean protocol, so they do not depend on evaluation batch
-partitioning.
+The table is synchronized with the canonical saved `metrics.json` values.
+PSNR is the mean of per-image PSNR values, and all dataset metrics use
+sample-count-weighted aggregation. On July 17, 2026, the older PSNR values in
+this note were corrected because they did not match the saved metrics and
+history artifacts; the model checkpoints and metric files were not changed.
 
 ## Artifacts
 
@@ -51,6 +53,10 @@ partitioning.
 | Metrics plot | [gpu_phase_comparison_metrics.png](assets/gpu_phase_comparison_metrics.png) |
 | Sample comparison | [gpu_phase_comparison_samples.png](assets/gpu_phase_comparison_samples.png) |
 | Checkpoints and raw run files | Kept out of Git; regenerate with `python -m experiment full`. |
+
+The ignored raw run directory has backfilled schema-v1 manifests and
+`config.json` snapshots. They are marked as migrated legacy metadata because
+the original runtime/Git provenance was not recorded.
 
 ## Status
 

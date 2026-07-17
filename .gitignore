@@ -38,6 +38,10 @@ dist/
 # Jupyter local state
 .ipynb_checkpoints/
 
+# Internal research contracts and machine-specific readiness notes
+docs/*-reproduction-spec.md
+docs/*-readiness-assessment.md
+
 # Downloaded datasets and generated experiment artifacts
 data/
 outputs/

@@ -52,6 +52,73 @@ def negative_pearson_loss(prediction: torch.Tensor, target: torch.Tensor, *, eps
     return (1.0 - numerator / denominator).mean()
 
 
+def pearson_per_image(prediction: torch.Tensor, target: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
+    """Return one Pearson coefficient per aligned image pair."""
+
+    if prediction.shape != target.shape:
+        raise ValueError("prediction and target must have matching shapes")
+    pred_flat = prediction.flatten(start_dim=1)
+    target_flat = target.flatten(start_dim=1)
+    pred_centered = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+    target_centered = target_flat - target_flat.mean(dim=1, keepdim=True)
+    numerator = (pred_centered * target_centered).sum(dim=1)
+    denominator = (
+        pred_centered.square().sum(dim=1).sqrt() * target_centered.square().sum(dim=1).sqrt()
+    ).clamp_min(eps)
+    return numerator / denominator
+
+
+def luo2022_d2nn_loss(
+    output_intensity: torch.Tensor,
+    target_amplitude: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Implement Luo et al. equations (1) and (11)-(13).
+
+    ``output_intensity`` has shape ``(B, n, H, W)`` and remains raw: no
+    contrast enhancement or per-image normalization is applied.
+    """
+
+    if output_intensity.ndim != 4:
+        raise ValueError("output_intensity must have shape (B, n, H, W)")
+    if target_amplitude.ndim == 4 and target_amplitude.shape[1] == 1:
+        target_amplitude = target_amplitude[:, 0]
+    if target_amplitude.ndim != 3:
+        raise ValueError("target_amplitude must have shape (B, H, W) or (B, 1, H, W)")
+    if output_intensity.shape[0] != target_amplitude.shape[0]:
+        raise ValueError("output and target batch dimensions must match")
+    if output_intensity.shape[-2:] != target_amplitude.shape[-2:]:
+        raise ValueError("output and target spatial dimensions must match")
+    if alpha < 0 or beta < 0:
+        raise ValueError("alpha and beta must be non-negative")
+
+    batch_size, diffuser_count = output_intensity.shape[:2]
+    expanded_target = target_amplitude[:, None].expand_as(output_intensity)
+    flat_output = output_intensity.reshape(batch_size * diffuser_count, *output_intensity.shape[-2:])
+    flat_target = expanded_target.reshape_as(flat_output)
+    pearson = pearson_per_image(flat_output, flat_target, eps=eps)
+
+    support = (target_amplitude > 0).to(dtype=output_intensity.dtype)
+    support = support[:, None].expand_as(output_intensity)
+    support_pixels = support.sum(dim=(-2, -1)).clamp_min(eps)
+    energy = (
+        alpha * ((1.0 - support) * output_intensity).sum(dim=(-2, -1))
+        - beta * (support * output_intensity).sum(dim=(-2, -1))
+    ) / support_pixels
+    negative_pearson = -pearson.reshape(batch_size, diffuser_count)
+    total = (negative_pearson + energy).mean()
+    components = {
+        "total": total,
+        "negative_pearson": negative_pearson.mean(),
+        "energy": energy.mean(),
+        "pearson": pearson.mean(),
+    }
+    return total, components
+
+
 def ssim_index(
     prediction: torch.Tensor,
     target: torch.Tensor,

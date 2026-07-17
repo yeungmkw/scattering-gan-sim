@@ -19,8 +19,10 @@ calibrated optical instrument or a generic image-to-image GAN example. It is
 intended to support controlled experiments on fixed diffusers, unseen diffuser
 generalization, adversarial refinement, and later diffractive front ends.
 
-Each training run records the diffuser split, optical parameters, observation
-normalization, loss weights, package versions, and Git state in its manifest.
+Each training run writes a schema-v1 `config.json` before training, then
+records the diffuser split, optical parameters, observation normalization,
+loss weights, metric aggregation protocol, package versions, and Git state in
+its manifest. The flat `metrics.json` format is retained for compatibility.
 
 ## Quick Start
 
@@ -76,6 +78,33 @@ uv run python -m experiment unet \
 The manifest reports `eval_diffuser_split: "unseen"` when evaluation IDs are
 disjoint from training IDs. Run a corresponding seen-diffuser experiment with
 evaluation IDs drawn from the training set.
+
+The same reconstruction-loss flags are available to `unet`, `gan`, and
+`full`: `--l1-weight`, `--negative-pearson-weight`, `--ssim-weight`, and
+`--fourier-weight`. Their exact values are saved in both `config.json` and the
+manifest.
+
+Assess the frozen Luo 2022 R0 profile before a full run:
+
+```bash
+uv run python -m experiment d2nn \
+  --profile luo2022_r0 \
+  --action assess \
+  --device cpu \
+  --output-dir outputs/luo2022_r0_assessment
+```
+
+Freeze `2026-07-17.2` passes the reduced training rerun and the exact
+240x240 audit of all 1,999,000 unordered pairs in a 2,000-diffuser bank. The
+R0 path is ready to transfer to a CUDA machine; a local GPU benchmark is not a
+prerequisite. Machine-specific readiness notes and reproduction working
+documents remain local and are not tracked in the public repository.
+
+Long CUDA runs write `checkpoints/latest.pt`, one deterministic diffuser bank
+per epoch, `review.json`, and `run_state.json`. On limited-memory GPUs,
+`--diffuser-chunk-size` accumulates the same 80 field-pair gradients before a
+single optimizer update. Resume by repeating the exact command with
+`--resume`.
 
 ## Exploratory Result
 

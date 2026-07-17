@@ -14,6 +14,11 @@ Recommended reading order:
 3. `research-roadmap.md`: what should be added next before making stronger
    claims.
 
+Internal reproduction contracts, supplementary-material audits, and
+machine-specific readiness notes are intentionally kept outside the public
+repository. The executable Luo 2022 R0 source of truth is
+`../configs/luo2022_r0.json`.
+
 The companion notebook is a Chinese walkthrough of the simulation principle:
 
 ```text
