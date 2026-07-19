@@ -99,6 +99,31 @@ HIGHER_IS_BETTER = {"psnr", "ssim", "pearson"}
 ORDERED_METRICS = ("l1", "mse", "psnr", "ssim", "pearson")
 
 
+def luo2022_diffuser_seed_schedule(
+    *,
+    seed: int,
+    epochs: int,
+    training_stride: int,
+    evaluation_offset: int,
+) -> dict[str, Any]:
+    """Return and validate disjoint training/evaluation diffuser seed namespaces."""
+
+    if epochs <= 0 or training_stride <= 0 or evaluation_offset <= 0:
+        raise ValueError("diffuser seed schedule values must be positive")
+    evaluation_base_seed = seed + evaluation_offset
+    training_base_seeds = tuple(seed + epoch * training_stride for epoch in range(1, epochs + 1))
+    if evaluation_base_seed in training_base_seeds:
+        raise ValueError("evaluation diffuser seed overlaps a training epoch seed")
+    return {
+        "training_epoch_formula": "primary_seed_plus_epoch_times_stride",
+        "training_stride": training_stride,
+        "evaluation_formula": "primary_seed_plus_offset",
+        "evaluation_offset": evaluation_offset,
+        "evaluation_base_seed": evaluation_base_seed,
+        "disjoint_for_configured_epochs": True,
+    }
+
+
 def coherent_forward_model_metadata(
     corruption: str,
     *,
@@ -764,6 +789,14 @@ def build_luo2022_runtime_config(
         for name in paper_values
         if resolved[name] != paper_values[name]
     }
+    training_seed_schedule = contract["training"]["diffuser_seed_schedule"]
+    evaluation_seed_schedule = contract["evaluation"]["diffuser_seed_schedule"]
+    diffuser_seed_schedule = luo2022_diffuser_seed_schedule(
+        seed=resolved["seed"],
+        epochs=resolved["epochs"],
+        training_stride=int(training_seed_schedule["epoch_stride"]),
+        evaluation_offset=int(evaluation_seed_schedule["offset"]),
+    )
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "profile_id": contract["profile_id"],
@@ -777,6 +810,7 @@ def build_luo2022_runtime_config(
             else "Executable R0 settings; paper-level reproduction still requires full acceptance comparison."
         ),
         "runtime": resolved,
+        "diffuser_seed_schedule": diffuser_seed_schedule,
         "overrides_from_frozen_contract": overrides,
         "paper_equations": {
             "diffuser": contract["diffuser"]["equations"],
@@ -1716,10 +1750,12 @@ def run_luo2022_training(
     uniqueness_config = contract["diffuser"]["uniqueness"]
     phase_representation = str(uniqueness_config["phase_representation"])
     minimum_difference_radians = float(uniqueness_config["minimum_radians"])
+    diffuser_seed_schedule = runtime_config["diffuser_seed_schedule"]
+    training_diffuser_seed_stride = int(diffuser_seed_schedule["training_stride"])
     eval_diffuser_bank_cpu = make_unique_correlated_diffusers(
         values["eval_diffusers"],
         field_shape=optics_config.field_shape,
-        base_seed=values["seed"] + 10_000_000,
+        base_seed=int(diffuser_seed_schedule["evaluation_base_seed"]),
         minimum_difference_radians=minimum_difference_radians,
         phase_representation=phase_representation,
         **diffuser_kwargs,
@@ -1780,7 +1816,7 @@ def run_luo2022_training(
         epoch_diffusers_cpu = make_unique_correlated_diffusers(
             values["diffusers_per_epoch"],
             field_shape=optics_config.field_shape,
-            base_seed=values["seed"] + epoch * 100_000,
+            base_seed=values["seed"] + epoch * training_diffuser_seed_stride,
             minimum_difference_radians=minimum_difference_radians,
             phase_representation=phase_representation,
             existing_phases=training_diffuser_history[:training_diffuser_count],
@@ -1828,7 +1864,9 @@ def run_luo2022_training(
                     "type": "fixed_test_prefix_monitoring_probe",
                     "max_batches": values["review_eval_batches"],
                 },
-                "training_diffuser_seed_base": values["seed"] + epoch * 100_000,
+                "training_diffuser_seed_base": (
+                    values["seed"] + epoch * training_diffuser_seed_stride
+                ),
                 "accepted_training_diffusers_total": training_diffuser_count,
                 "uniqueness_comparison_scope": uniqueness_config["comparison_scope"],
             }

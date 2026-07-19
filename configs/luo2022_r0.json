@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "profile_id": "luo2022_thz_r0",
-  "freeze_version": "2026-07-17.2",
+  "freeze_version": "2026-07-19.3",
   "status": {
     "contract": "frozen",
     "runtime_binding": "implemented",
-    "validation": "small_run_passed_under_2026-07-17.2",
-    "readiness": "ready_for_cuda_training_2026-07-17",
+    "validation": "small_run_passed_under_2026-07-19.3",
+    "readiness": "ready_for_cuda_retraining_2026-07-19",
     "small_run_artifact": "outputs/luo2022_r0_small/manifest.json",
     "full_scale_diffuser_artifact": "outputs/luo2022_r0_assessment/assessment.json",
     "claim_level": "reproduction_contract"
@@ -237,6 +237,11 @@
     "primary_seed": {
       "value": 0,
       "evidence": "project_choice"
+    },
+    "diffuser_seed_schedule": {
+      "epoch_base_seed_formula": "primary_seed_plus_epoch_times_stride",
+      "epoch_stride": 100000,
+      "evidence": "project_choice"
     }
   },
   "evaluation": {
@@ -257,6 +262,12 @@
       "last_10_epochs_diffusers": 200,
       "last_epoch_diffusers": 20,
       "new_diffusers": 20
+    },
+    "diffuser_seed_schedule": {
+      "base_seed_formula": "primary_seed_plus_offset",
+      "offset": 1000000000,
+      "must_be_disjoint_from_all_training_epoch_base_seeds": true,
+      "evidence": "project_choice"
     },
     "controls": [
       "no_diffuser",
@@ -324,22 +335,19 @@
     "rule": "Any change to a paper-confirmed field or frozen project choice requires a freeze_version bump and a documented rationale.",
     "runtime_rule": "experiment.py must snapshot this source configuration when the R0 profile is implemented.",
     "current_freeze_change": {
-      "from": "2026-07-17.1",
-      "to": "2026-07-17.2",
+      "from": "2026-07-17.2",
+      "to": "2026-07-19.3",
       "changed_fields": [
-        "diffuser.uniqueness.phase_representation",
-        "diffuser.uniqueness.comparison_scope",
-        "diffuser.correlation_estimator"
+        "training.diffuser_seed_schedule",
+        "evaluation.diffuser_seed_schedule"
       ],
-      "rationale": "The unwrapped-phase interpretation failed the published uniqueness and mean-correlation targets. The selected wrapped-phase and complex-transmittance interpretation passes both targets while remaining explicitly labeled as unpublished implementation inference.",
+      "rationale": "The previous evaluation seed offset equaled the epoch-100 training seed offset, so the fixed evaluation diffuser bank was reused for the final training epoch. Separate seed namespaces are required to preserve the published known-versus-new diffuser distinction.",
       "acceptance": {
         "small_run": "passed",
-        "paper_scale_diffusers": 2000,
-        "exact_unordered_pairs": 1999000,
-        "minimum_pair_difference_radians": 1.9788169860839844,
-        "pair_pass_fraction": 1.0,
-        "mean_correlation_length_lambda": 10.70466379361538,
-        "correlation_relative_error_to_paper_target": 0.07046637936153796
+        "configured_training_epochs": 100,
+        "training_epoch_seed_stride": 100000,
+        "evaluation_seed_offset": 1000000000,
+        "seed_namespace_overlap": false
       }
     }
   }

@@ -20,11 +20,11 @@ def test_luo2022_r0_contract_is_frozen_and_runtime_bound() -> None:
     contract = load_contract()
 
     assert contract["profile_id"] == "luo2022_thz_r0"
-    assert contract["freeze_version"] == "2026-07-17.2"
+    assert contract["freeze_version"] == "2026-07-19.3"
     assert contract["status"]["contract"] == "frozen"
     assert contract["status"]["runtime_binding"] == "implemented"
-    assert contract["status"]["validation"] == "small_run_passed_under_2026-07-17.2"
-    assert contract["status"]["readiness"] == "ready_for_cuda_training_2026-07-17"
+    assert contract["status"]["validation"] == "small_run_passed_under_2026-07-19.3"
+    assert contract["status"]["readiness"] == "ready_for_cuda_retraining_2026-07-19"
     assert contract["status"]["small_run_artifact"] == (
         "outputs/luo2022_r0_small/manifest.json"
     )
@@ -91,9 +91,19 @@ def test_luo2022_r0_unpublished_choices_are_explicit() -> None:
     )
     assert contract["propagation"]["reference_backend"]["evidence"] == "project_choice"
     assert contract["training"]["primary_seed"]["evidence"] == "project_choice"
+    assert contract["training"]["diffuser_seed_schedule"] == {
+        "epoch_base_seed_formula": "primary_seed_plus_epoch_times_stride",
+        "epoch_stride": 100_000,
+        "evidence": "project_choice",
+    }
+    assert contract["evaluation"]["diffuser_seed_schedule"] == {
+        "base_seed_formula": "primary_seed_plus_offset",
+        "offset": 1_000_000_000,
+        "must_be_disjoint_from_all_training_epoch_base_seeds": True,
+        "evidence": "project_choice",
+    }
     assert all(item["reason"] for item in contract["deferred"])
     freeze_change = contract["change_control"]["current_freeze_change"]
-    assert freeze_change["from"] == "2026-07-17.1"
-    assert freeze_change["to"] == "2026-07-17.2"
-    assert freeze_change["acceptance"]["exact_unordered_pairs"] == 1_999_000
-    assert freeze_change["acceptance"]["pair_pass_fraction"] == 1.0
+    assert freeze_change["from"] == "2026-07-17.2"
+    assert freeze_change["to"] == "2026-07-19.3"
+    assert freeze_change["acceptance"]["seed_namespace_overlap"] is False

@@ -147,6 +147,24 @@ def test_luo2022_full_runtime_allows_execution_only_chunking() -> None:
     assert config["runtime"]["diffuser_chunk_size"] == 2
     assert config["runtime"]["review_eval_batches"] == 10
     assert config["overrides_from_frozen_contract"] == {}
+    assert config["diffuser_seed_schedule"] == {
+        "training_epoch_formula": "primary_seed_plus_epoch_times_stride",
+        "training_stride": 100_000,
+        "evaluation_formula": "primary_seed_plus_offset",
+        "evaluation_offset": 1_000_000_000,
+        "evaluation_base_seed": 1_000_000_000,
+        "disjoint_for_configured_epochs": True,
+    }
+
+
+def test_luo2022_diffuser_seed_schedule_rejects_training_evaluation_overlap() -> None:
+    with pytest.raises(ValueError, match="overlaps"):
+        experiment.luo2022_diffuser_seed_schedule(
+            seed=0,
+            epochs=100,
+            training_stride=100_000,
+            evaluation_offset=10_000_000,
+        )
 
 
 def test_luo2022_diffuser_chunking_preserves_one_optimizer_update() -> None:
