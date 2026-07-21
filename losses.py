@@ -82,6 +82,32 @@ def luo2022_d2nn_loss(
     contrast enhancement or per-image normalization is applied.
     """
 
+    per_pair = luo2022_d2nn_components_per_pair(
+        output_intensity,
+        target_amplitude,
+        alpha=alpha,
+        beta=beta,
+        eps=eps,
+    )
+    components = {name: value.mean() for name, value in per_pair.items()}
+    return components["total"], components
+
+
+def luo2022_d2nn_components_per_pair(
+    output_intensity: torch.Tensor,
+    target_amplitude: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Return Luo et al. loss components for every object-diffuser pair.
+
+    Each returned tensor has shape ``(B, n)``. Keeping this axis is required
+    for the paper's two-level evaluation: average over objects for each
+    diffuser, then summarize the diffuser distribution.
+    """
+
     if output_intensity.ndim != 4:
         raise ValueError("output_intensity must have shape (B, n, H, W)")
     if target_amplitude.ndim == 4 and target_amplitude.shape[1] == 1:
@@ -109,14 +135,12 @@ def luo2022_d2nn_loss(
         - beta * (support * output_intensity).sum(dim=(-2, -1))
     ) / support_pixels
     negative_pearson = -pearson.reshape(batch_size, diffuser_count)
-    total = (negative_pearson + energy).mean()
-    components = {
-        "total": total,
-        "negative_pearson": negative_pearson.mean(),
-        "energy": energy.mean(),
-        "pearson": pearson.mean(),
+    return {
+        "total": negative_pearson + energy,
+        "negative_pearson": negative_pearson,
+        "energy": energy,
+        "pearson": pearson.reshape(batch_size, diffuser_count),
     }
-    return total, components
 
 
 def ssim_index(

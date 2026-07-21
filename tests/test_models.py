@@ -1,7 +1,12 @@
 import torch
 
 from experiment import adversarial_loss
-from losses import ReconstructionLossWeights, luo2022_d2nn_loss, reconstruction_loss
+from losses import (
+    ReconstructionLossWeights,
+    luo2022_d2nn_components_per_pair,
+    luo2022_d2nn_loss,
+    reconstruction_loss,
+)
 from patchgan import PatchDiscriminator
 from unet import UNetReconstructor
 
@@ -53,8 +58,14 @@ def test_luo2022_loss_uses_raw_intensity_and_updates_every_pair() -> None:
     loss, components = luo2022_d2nn_loss(output, target)
     loss.backward()
 
+    per_pair = luo2022_d2nn_components_per_pair(output.detach(), target)
     assert loss.ndim == 0
     assert set(components) == {"total", "negative_pearson", "energy", "pearson"}
+    assert all(value.shape == (2, 3) for value in per_pair.values())
+    assert all(
+        torch.allclose(components[name], per_pair[name].mean(), atol=1e-7)
+        for name in components
+    )
     assert torch.allclose(components["pearson"], torch.tensor(1.0), atol=1e-6)
     assert output.grad is not None
     assert torch.all(output.grad.flatten(start_dim=2).abs().sum(dim=2) > 0)

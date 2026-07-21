@@ -94,7 +94,7 @@ uv run python -m experiment d2nn \
   --output-dir outputs/luo2022_r0_assessment
 ```
 
-Freeze `2026-07-17.2` passes the reduced training rerun and the exact
+Freeze `2026-07-19.3` passes the reduced training rerun and the exact
 240x240 audit of all 1,999,000 unordered pairs in a 2,000-diffuser bank. The
 R0 path is ready to transfer to a CUDA machine; a local GPU benchmark is not a
 prerequisite. Machine-specific readiness notes and reproduction working
@@ -105,6 +105,23 @@ per epoch, `review.json`, and `run_state.json`. On limited-memory GPUs,
 `--diffuser-chunk-size` accumulates the same 80 field-pair gradients before a
 single optimizer update. Resume by repeating the exact command with
 `--resume`.
+
+After training, collect the paper's two-level statistics without retraining:
+
+```bash
+uv run python -m experiment d2nn \
+  --profile luo2022_r0 \
+  --action evaluate \
+  --device cuda \
+  --output-dir outputs/luo2022_r0 \
+  --diffuser-chunk-size 20
+```
+
+The post-hoc evaluator resumes from completed diffuser rows and writes both
+JSONL and CSV evidence. It averages all configured test objects separately
+for each diffuser, then reports distributions for all training diffusers,
+epochs 1 through 99, the final 10 epochs, the final epoch, unseen diffusers,
+and the no-diffuser control.
 
 ## Exploratory Result
 

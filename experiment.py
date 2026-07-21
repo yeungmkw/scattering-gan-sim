@@ -13,6 +13,8 @@ one CLI surface for the reusable prototype system:
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import json
 import platform
 import shutil
@@ -63,7 +65,12 @@ from d2nn import (
     summarize_diffuser_bank_uniqueness,
 )
 from data import build_torchvision_dataset
-from losses import ReconstructionLossWeights, luo2022_d2nn_loss, reconstruction_loss
+from losses import (
+    ReconstructionLossWeights,
+    luo2022_d2nn_components_per_pair,
+    luo2022_d2nn_loss,
+    reconstruction_loss,
+)
 from metrics import reconstruction_metrics
 from patchgan import PatchDiscriminator
 from runtime import (
@@ -303,7 +310,11 @@ def build_parser() -> argparse.ArgumentParser:
     d2nn_parser.add_argument("--download", action="store_true")
     d2nn_parser.add_argument("--corruption", choices=("phase", "particles"), default="phase")
     d2nn_parser.add_argument("--profile", choices=("legacy", "luo2022_r0"), default="legacy")
-    d2nn_parser.add_argument("--action", choices=("inspect", "train", "assess"), default="inspect")
+    d2nn_parser.add_argument(
+        "--action",
+        choices=("inspect", "train", "assess", "evaluate"),
+        default="inspect",
+    )
     d2nn_parser.add_argument("--config-path", type=Path, default=DEFAULT_LUO2022_CONFIG)
     d2nn_parser.add_argument("--small-run", action="store_true")
     d2nn_parser.add_argument("--device", default="cpu")
@@ -341,6 +352,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help="Resume the Luo 2022 run from OUTPUT_DIR/checkpoints/latest.pt.",
+    )
+    d2nn_parser.add_argument(
+        "--posthoc-output-dir",
+        type=Path,
+        default=None,
+        help="Directory for resumable per-diffuser evidence; defaults inside OUTPUT_DIR.",
+    )
+    d2nn_parser.add_argument(
+        "--posthoc-populations",
+        choices=("training", "new", "no_diffuser"),
+        nargs="+",
+        default=("training", "new", "no_diffuser"),
+        help="Frozen diffuser populations to evaluate with --action evaluate.",
     )
 
     unet_parser = subparsers.add_parser("unet", help="Train the coherent U-Net reconstructor.")
@@ -409,6 +433,16 @@ def add_training_args(parser: argparse.ArgumentParser, *, default_output: str) -
 def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "d2nn":
         if args.profile == "luo2022_r0":
+            if args.action == "evaluate":
+                return run_luo2022_posthoc_evaluation(
+                    run_dir=Path(args.output_dir),
+                    config_path=args.config_path,
+                    download=args.download,
+                    device_name=args.device,
+                    diffuser_chunk_size=args.diffuser_chunk_size,
+                    output_dir=args.posthoc_output_dir,
+                    populations=tuple(args.posthoc_populations),
+                )
             if args.action == "assess":
                 return run_luo2022_readiness_assessment(
                     output_dir=Path(args.output_dir),
@@ -2132,6 +2166,490 @@ def evaluate_luo2022_model(
     if count == 0:
         raise ValueError("evaluation loader yielded no batches")
     return {name: total / count for name, total in totals.items()}
+
+
+@torch.no_grad()
+def evaluate_luo2022_model_per_diffuser(
+    model: Luo2022FourLayerD2NN,
+    loader: DataLoader,
+    diffuser_phase: torch.Tensor,
+    *,
+    resized_shape: tuple[int, int],
+    canvas_shape: tuple[int, int],
+    device: torch.device,
+    max_batches: int | None = None,
+    diffuser_chunk_size: int | None = None,
+) -> list[dict[str, float | int]]:
+    """Evaluate object means separately for every diffuser.
+
+    Luo et al. first average PCC over the test objects for each diffuser and
+    then summarize the diffuser distribution. The ordinary evaluator returns
+    only the equal-weight global mean; this function preserves the diffuser
+    axis needed for the published protocol.
+    """
+
+    if diffuser_phase.ndim != 3 or diffuser_phase.shape[0] == 0:
+        raise ValueError("diffuser_phase must have shape (n, H, W) with n > 0")
+
+    model.eval()
+    metric_names = ("total", "negative_pearson", "energy", "pearson")
+    totals = {
+        name: torch.zeros(int(diffuser_phase.shape[0]), dtype=torch.float64)
+        for name in metric_names
+    }
+    object_count = 0
+    for batch_index, (image, _label) in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        image = image.to(device)
+        target = prepare_luo2022_amplitude(
+            image,
+            resized_shape=resized_shape,
+            canvas_shape=canvas_shape,
+        )
+        field = amplitude_to_complex_field(target)
+        chunk_size = int(diffuser_chunk_size or diffuser_phase.shape[0])
+        total_diffusers = int(diffuser_phase.shape[0])
+        for start in range(0, total_diffusers, chunk_size):
+            stop = min(start + chunk_size, total_diffusers)
+            output = model(field, diffuser_phase[start:stop])
+            components = luo2022_d2nn_components_per_pair(output, target)
+            for name in metric_names:
+                totals[name][start:stop] += (
+                    components[name].detach().sum(dim=0).to(device="cpu", dtype=torch.float64)
+                )
+        object_count += int(image.shape[0])
+
+    if object_count == 0:
+        raise ValueError("evaluation loader yielded no batches")
+    return [
+        {
+            "object_count": object_count,
+            **{
+                name: float((totals[name][index] / object_count).item())
+                for name in metric_names
+            },
+        }
+        for index in range(int(diffuser_phase.shape[0]))
+    ]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_luo2022_posthoc_rows(
+    path: Path,
+    *,
+    checkpoint_sha256: str,
+) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    rows: dict[str, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            diffuser_id = str(row["diffuser_id"])
+            if row.get("checkpoint_sha256") != checkpoint_sha256:
+                raise ValueError(
+                    f"post-hoc row {line_number} was produced by a different checkpoint"
+                )
+            if diffuser_id in rows:
+                raise ValueError(f"duplicate post-hoc diffuser_id: {diffuser_id}")
+            rows[diffuser_id] = row
+    return rows
+
+
+def _append_luo2022_posthoc_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True))
+            handle.write("\n")
+        handle.flush()
+
+
+def _luo2022_metric_distribution(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    metric_names = ("total", "negative_pearson", "energy", "pearson")
+    summary: dict[str, Any] = {"diffuser_count": len(rows)}
+    if not rows:
+        return summary
+    object_counts = {int(row["object_count"]) for row in rows}
+    if len(object_counts) != 1:
+        raise ValueError("post-hoc rows do not share one object count")
+    summary["objects_per_diffuser"] = object_counts.pop()
+    summary["metrics"] = {}
+    for name in metric_names:
+        values = np.asarray([float(row[name]) for row in rows], dtype=np.float64)
+        mean = float(values.mean())
+        sample_std = float(values.std(ddof=1)) if len(values) > 1 else None
+        standard_error = sample_std / float(np.sqrt(len(values))) if sample_std is not None else None
+        summary["metrics"][name] = {
+            "mean": mean,
+            "sample_std": sample_std,
+            "standard_error": standard_error,
+            "ci95_normal": (
+                [mean - 1.96 * standard_error, mean + 1.96 * standard_error]
+                if standard_error is not None
+                else None
+            ),
+            "minimum": float(values.min()),
+            "maximum": float(values.max()),
+        }
+    return summary
+
+
+def summarize_luo2022_posthoc_rows(
+    rows: list[dict[str, Any]],
+    *,
+    target_epochs: int,
+) -> dict[str, Any]:
+    """Summarize the paper's known and unseen diffuser populations."""
+
+    training_rows = [row for row in rows if row["population"] == "training"]
+    groups = {
+        "all_training_diffusers": training_rows,
+        "epochs_1_to_penultimate_training_diffusers": [
+            row for row in training_rows if int(row["training_epoch"]) < target_epochs
+        ],
+        "last_10_epoch_training_diffusers": [
+            row
+            for row in training_rows
+            if int(row["training_epoch"]) >= max(1, target_epochs - 9)
+        ],
+        "final_epoch_known_diffusers": [
+            row for row in training_rows if int(row["training_epoch"]) == target_epochs
+        ],
+        "new_unseen_diffusers": [row for row in rows if row["population"] == "new"],
+        "no_diffuser_control": [row for row in rows if row["population"] == "no_diffuser"],
+    }
+    return {name: _luo2022_metric_distribution(group_rows) for name, group_rows in groups.items()}
+
+
+def _write_luo2022_posthoc_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fieldnames = (
+        "diffuser_id",
+        "population",
+        "training_epoch",
+        "within_epoch_index",
+        "object_count",
+        "pearson",
+        "negative_pearson",
+        "energy",
+        "total",
+        "checkpoint_sha256",
+        "source_freeze_version",
+    )
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name) for name in fieldnames})
+
+
+def run_luo2022_posthoc_evaluation(
+    *,
+    run_dir: Path,
+    config_path: Path = DEFAULT_LUO2022_CONFIG,
+    download: bool = False,
+    device_name: str = "cpu",
+    diffuser_chunk_size: int | None = None,
+    output_dir: Path | None = None,
+    populations: tuple[str, ...] = ("training", "new", "no_diffuser"),
+) -> dict[str, Any]:
+    """Collect resumable per-diffuser evidence from a frozen R0 checkpoint."""
+
+    allowed_populations = {"training", "new", "no_diffuser"}
+    requested_populations = tuple(dict.fromkeys(populations))
+    if not requested_populations or not set(requested_populations) <= allowed_populations:
+        raise ValueError("post-hoc populations must be training, new, or no_diffuser")
+
+    runtime_config_path = run_dir / "config.json"
+    manifest_path = run_dir / "manifest.json"
+    if not runtime_config_path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError("completed Luo 2022 run config and manifest are required")
+    runtime_config = load_config(runtime_config_path)
+    manifest = load_config(manifest_path)
+    source_config_path = run_dir / "source_config.json"
+    contract = load_config(source_config_path if source_config_path.is_file() else config_path)
+    freeze_version = str(contract["freeze_version"])
+    if runtime_config["source_freeze_version"] != freeze_version:
+        raise ValueError("runtime configuration freeze version does not match source configuration")
+    if manifest["source_freeze_version"] != freeze_version:
+        raise ValueError("manifest freeze version does not match source configuration")
+
+    final_checkpoint_path = run_dir / "checkpoints" / "luo2022_d2nn.pt"
+    latest_checkpoint_path = run_dir / "checkpoints" / "latest.pt"
+    checkpoint_path = (
+        final_checkpoint_path if final_checkpoint_path.is_file() else latest_checkpoint_path
+    )
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError("completed Luo 2022 checkpoint is required")
+    checkpoint_sha256 = _sha256_file(checkpoint_path)
+    runtime_config_sha256 = _sha256_file(runtime_config_path)
+    evidence_dir = output_dir or (run_dir / "posthoc_evaluation")
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    rows_path = evidence_dir / "per_diffuser_metrics.jsonl"
+    state_path = evidence_dir / "posthoc_state.json"
+    fingerprint = {
+        "checkpoint_sha256": checkpoint_sha256,
+        "runtime_config_sha256": runtime_config_sha256,
+        "source_freeze_version": freeze_version,
+    }
+    if state_path.is_file():
+        saved_state = load_config(state_path)
+        if saved_state["evidence_fingerprint"] != fingerprint:
+            raise ValueError("post-hoc state does not match the frozen run")
+    rows_by_id = _load_luo2022_posthoc_rows(
+        rows_path,
+        checkpoint_sha256=checkpoint_sha256,
+    )
+
+    values = runtime_config["runtime"]
+    target_epochs = int(values["epochs"])
+    expected_counts = {
+        "training": target_epochs * int(values["diffusers_per_epoch"]),
+        "new": int(values["eval_diffusers"]),
+        "no_diffuser": 1,
+    }
+    device = select_device(device_name)
+    seed_everything(int(values["seed"]))
+    eval_base = build_torchvision_dataset(
+        name="MNIST",
+        root=DEFAULT_DATA_ROOT,
+        train=False,
+        image_size=int(contract["input"]["original_shape"][0]),
+        download=download,
+    )
+    eval_dataset = Subset(eval_base, range(min(int(values["eval_limit"]), len(eval_base))))
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=int(values["batch_size"]),
+        shuffle=False,
+    )
+    optics_config = Luo2022OpticsConfig(
+        field_shape=(int(values["grid_size"]), int(values["grid_size"])),
+        wavelength=float(contract["illumination"]["wavelength_m"]),
+        pixel_size=float(contract["grid"]["pixel_pitch_m"]),
+        object_to_diffuser_distance=float(contract["geometry"]["object_to_diffuser_m"]),
+        diffuser_to_first_layer_distance=float(contract["geometry"]["diffuser_to_first_layer_m"]),
+        layer_distance=float(contract["geometry"]["layer_to_layer_m"]),
+        output_distance=float(contract["geometry"]["last_layer_to_output_m"]),
+        num_layers=int(contract["d2nn"]["layers"]),
+        pad_factor=2,
+    )
+    model = Luo2022FourLayerD2NN(optics_config).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if checkpoint["source_freeze_version"] != freeze_version:
+        raise ValueError("checkpoint freeze version does not match source configuration")
+    if checkpoint["runtime_config"] != runtime_config:
+        raise ValueError("checkpoint runtime configuration does not match the frozen run")
+    model.load_state_dict(checkpoint["model"])
+
+    effective_chunk_size = int(
+        diffuser_chunk_size or values["diffuser_chunk_size"] or values["diffusers_per_epoch"]
+    )
+    if effective_chunk_size <= 0:
+        raise ValueError("diffuser chunk size must be positive")
+    resized_shape = (int(values["input_size"]), int(values["input_size"]))
+    diffuser_kwargs = {
+        "wavelength": optics_config.wavelength,
+        "pixel_size": optics_config.pixel_size,
+        "refractive_index_difference": float(contract["diffuser"]["refractive_index_difference"]),
+        "height_mean_lambda": float(contract["diffuser"]["height_mean_lambda"]),
+        "height_std_lambda": float(contract["diffuser"]["height_std_lambda"]),
+        "gaussian_sigma_lambda": float(contract["diffuser"]["gaussian_sigma_lambda"]),
+        "truncate_sigma": float(contract["diffuser"]["finite_kernel_choice"]["truncate_sigma"]),
+        "padding": str(contract["diffuser"]["finite_kernel_choice"]["padding"]),
+    }
+
+    def save_progress(stage: str) -> None:
+        population_counts = {
+            population: sum(
+                row["population"] == population for row in rows_by_id.values()
+            )
+            for population in allowed_populations
+        }
+        write_json(
+            state_path,
+            {
+                "schema_version": 1,
+                "status": "running",
+                "stage": stage,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+                "requested_populations": list(requested_populations),
+                "completed_population_counts": population_counts,
+                "expected_population_counts": expected_counts,
+                "objects_per_diffuser": len(eval_dataset),
+                "evidence_fingerprint": fingerprint,
+            },
+        )
+
+    def evaluate_and_record(
+        phases_cpu: torch.Tensor,
+        row_metadata: list[dict[str, Any]],
+        *,
+        stage: str,
+    ) -> None:
+        missing = [
+            (index, metadata)
+            for index, metadata in enumerate(row_metadata)
+            if metadata["diffuser_id"] not in rows_by_id
+        ]
+        if not missing:
+            save_progress(stage)
+            return
+        missing_indices = [index for index, _metadata in missing]
+        phases = phases_cpu[missing_indices].to(device)
+        metrics = evaluate_luo2022_model_per_diffuser(
+            model,
+            eval_loader,
+            phases,
+            resized_shape=resized_shape,
+            canvas_shape=optics_config.field_shape,
+            device=device,
+            max_batches=values["max_eval_batches"],
+            diffuser_chunk_size=effective_chunk_size,
+        )
+        new_rows: list[dict[str, Any]] = []
+        for (_index, metadata), metric in zip(missing, metrics, strict=True):
+            row = {
+                **metadata,
+                **metric,
+                "checkpoint_sha256": checkpoint_sha256,
+                "source_freeze_version": freeze_version,
+            }
+            new_rows.append(row)
+            rows_by_id[str(row["diffuser_id"])] = row
+        _append_luo2022_posthoc_rows(rows_path, new_rows)
+        save_progress(stage)
+
+    save_progress("initializing")
+    if "training" in requested_populations:
+        for epoch in range(1, target_epochs + 1):
+            phase_path = run_dir / "diffusers" / f"training_epoch_{epoch:03d}.pt"
+            if not phase_path.is_file():
+                raise FileNotFoundError(f"saved training diffuser bank is missing for epoch {epoch}")
+            phases_cpu = torch.load(phase_path, map_location="cpu", weights_only=True)
+            if int(phases_cpu.shape[0]) != int(values["diffusers_per_epoch"]):
+                raise ValueError(f"training diffuser count mismatch for epoch {epoch}")
+            metadata = [
+                {
+                    "diffuser_id": f"training:e{epoch:03d}:i{index:02d}",
+                    "population": "training",
+                    "training_epoch": epoch,
+                    "within_epoch_index": index,
+                }
+                for index in range(int(phases_cpu.shape[0]))
+            ]
+            evaluate_and_record(phases_cpu, metadata, stage=f"training_epoch_{epoch:03d}")
+
+    if "new" in requested_populations:
+        diffuser_seed_schedule = runtime_config["diffuser_seed_schedule"]
+        uniqueness = contract["diffuser"]["uniqueness"]
+        phases_cpu = make_unique_correlated_diffusers(
+            int(values["eval_diffusers"]),
+            field_shape=optics_config.field_shape,
+            base_seed=int(diffuser_seed_schedule["evaluation_base_seed"]),
+            minimum_difference_radians=float(uniqueness["minimum_radians"]),
+            phase_representation=str(uniqueness["phase_representation"]),
+            **diffuser_kwargs,
+        )
+        metadata = [
+            {
+                "diffuser_id": f"new:i{index:02d}",
+                "population": "new",
+                "training_epoch": None,
+                "within_epoch_index": index,
+            }
+            for index in range(int(phases_cpu.shape[0]))
+        ]
+        evaluate_and_record(phases_cpu, metadata, stage="new_unseen_diffusers")
+
+    if "no_diffuser" in requested_populations:
+        phases_cpu = torch.zeros((1, *optics_config.field_shape), dtype=torch.float32)
+        evaluate_and_record(
+            phases_cpu,
+            [
+                {
+                    "diffuser_id": "no_diffuser",
+                    "population": "no_diffuser",
+                    "training_epoch": None,
+                    "within_epoch_index": 0,
+                }
+            ],
+            stage="no_diffuser_control",
+        )
+
+    rows = sorted(
+        rows_by_id.values(),
+        key=lambda row: (
+            {"training": 0, "new": 1, "no_diffuser": 2}[str(row["population"])],
+            int(row["training_epoch"] or 0),
+            int(row["within_epoch_index"]),
+        ),
+    )
+    summaries = summarize_luo2022_posthoc_rows(rows, target_epochs=target_epochs)
+    _write_luo2022_posthoc_csv(evidence_dir / "per_diffuser_metrics.csv", rows)
+    completed_counts = {
+        population: sum(row["population"] == population for row in rows)
+        for population in allowed_populations
+    }
+    requested_complete = all(
+        completed_counts[population] == expected_counts[population]
+        for population in requested_populations
+    )
+    summary = {
+        "schema_version": 1,
+        "status": "completed" if requested_complete else "incomplete",
+        "completed_at_utc": datetime.now(UTC).isoformat(),
+        "requested_populations": list(requested_populations),
+        "completed_population_counts": completed_counts,
+        "expected_population_counts": expected_counts,
+        "aggregation_protocol": (
+            "mean over test objects per diffuser, then distribution across diffusers"
+        ),
+        "confidence_interval": "normal approximation using sample standard error",
+        "groups": summaries,
+        "evidence_fingerprint": fingerprint,
+        "source_run": {
+            "profile_id": manifest["profile_id"],
+            "source_freeze_version": freeze_version,
+            "git": manifest["runtime"]["git"],
+        },
+        "runtime": run_metadata(),
+        "artifacts": {
+            "per_diffuser_jsonl": "per_diffuser_metrics.jsonl",
+            "per_diffuser_csv": "per_diffuser_metrics.csv",
+            "state": "posthoc_state.json",
+        },
+        "claim_boundary": (
+            "Post-hoc numerical evidence from the frozen checkpoint; paper-level "
+            "acceptance still depends on published-value uncertainty and implementation audit."
+        ),
+    }
+    write_json(evidence_dir / "posthoc_summary.json", summary)
+    write_json(
+        state_path,
+        {
+            "schema_version": 1,
+            "status": summary["status"],
+            "completed_at_utc": summary["completed_at_utc"],
+            "requested_populations": list(requested_populations),
+            "completed_population_counts": completed_counts,
+            "expected_population_counts": expected_counts,
+            "objects_per_diffuser": len(eval_dataset),
+            "evidence_fingerprint": fingerprint,
+            "summary": "posthoc_summary.json",
+        },
+    )
+    return summary
 
 
 @torch.no_grad()

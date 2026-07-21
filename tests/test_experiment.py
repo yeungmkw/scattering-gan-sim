@@ -104,6 +104,33 @@ def test_d2nn_cli_exposes_luo2022_readiness_assessment() -> None:
     assert args.output_dir == "outputs/assessment"
 
 
+def test_d2nn_cli_exposes_luo2022_posthoc_evaluation() -> None:
+    args = experiment.build_parser().parse_args(
+        [
+            "d2nn",
+            "--profile",
+            "luo2022_r0",
+            "--action",
+            "evaluate",
+            "--output-dir",
+            "outputs/frozen_run",
+            "--posthoc-output-dir",
+            "outputs/evidence",
+            "--posthoc-populations",
+            "new",
+            "no_diffuser",
+            "--diffuser-chunk-size",
+            "2",
+        ]
+    )
+
+    assert args.action == "evaluate"
+    assert args.output_dir == "outputs/frozen_run"
+    assert args.posthoc_output_dir == Path("outputs/evidence")
+    assert args.posthoc_populations == ["new", "no_diffuser"]
+    assert args.diffuser_chunk_size == 2
+
+
 def test_luo2022_runtime_config_labels_and_controls_small_overrides() -> None:
     contract = experiment.load_config(experiment.DEFAULT_LUO2022_CONFIG)
 
@@ -203,6 +230,90 @@ def test_luo2022_diffuser_chunking_preserves_one_optimizer_update() -> None:
 
     assert chunked_metrics == pytest.approx(full_metrics, abs=1e-6)
     assert torch.allclose(chunked_model.phase, full_model.phase, atol=1e-8, rtol=1e-5)
+
+
+def test_luo2022_per_diffuser_metrics_preserve_global_mean() -> None:
+    generator = torch.Generator().manual_seed(29)
+    images = torch.rand(4, 1, 28, 28, generator=generator)
+    labels = torch.zeros(4, dtype=torch.long)
+    loader = DataLoader(TensorDataset(images, labels), batch_size=2, shuffle=False)
+    config = experiment.Luo2022OpticsConfig(field_shape=(48, 48))
+    model = experiment.Luo2022FourLayerD2NN(config)
+    diffusers = torch.rand(3, 48, 48, generator=generator)
+
+    aggregate = experiment.evaluate_luo2022_model(
+        model,
+        loader,
+        diffusers,
+        resized_shape=(32, 32),
+        canvas_shape=(48, 48),
+        device=torch.device("cpu"),
+        diffuser_chunk_size=2,
+    )
+    per_diffuser = experiment.evaluate_luo2022_model_per_diffuser(
+        model,
+        loader,
+        diffusers,
+        resized_shape=(32, 32),
+        canvas_shape=(48, 48),
+        device=torch.device("cpu"),
+        diffuser_chunk_size=1,
+    )
+
+    assert len(per_diffuser) == 3
+    assert all(row["object_count"] == 4 for row in per_diffuser)
+    for metric in ("total", "negative_pearson", "energy", "pearson"):
+        assert sum(float(row[metric]) for row in per_diffuser) / 3 == pytest.approx(
+            aggregate[metric],
+            abs=1e-6,
+        )
+
+
+def test_luo2022_posthoc_summary_recreates_paper_populations() -> None:
+    rows = [
+        {
+            "population": "training",
+            "training_epoch": epoch,
+            "object_count": 10,
+            "pearson": float(epoch) / 10,
+            "negative_pearson": -float(epoch) / 10,
+            "energy": -0.1,
+            "total": -float(epoch) / 10 - 0.1,
+        }
+        for epoch in range(1, 13)
+    ]
+    rows.extend(
+        [
+            {
+                "population": "new",
+                "training_epoch": None,
+                "object_count": 10,
+                "pearson": 0.5,
+                "negative_pearson": -0.5,
+                "energy": -0.1,
+                "total": -0.6,
+            },
+            {
+                "population": "no_diffuser",
+                "training_epoch": None,
+                "object_count": 10,
+                "pearson": 0.7,
+                "negative_pearson": -0.7,
+                "energy": -0.1,
+                "total": -0.8,
+            },
+        ]
+    )
+
+    summary = experiment.summarize_luo2022_posthoc_rows(rows, target_epochs=12)
+
+    assert summary["all_training_diffusers"]["diffuser_count"] == 12
+    assert summary["epochs_1_to_penultimate_training_diffusers"]["diffuser_count"] == 11
+    assert summary["last_10_epoch_training_diffusers"]["diffuser_count"] == 10
+    assert summary["final_epoch_known_diffusers"]["diffuser_count"] == 1
+    assert summary["new_unseen_diffusers"]["diffuser_count"] == 1
+    assert summary["no_diffuser_control"]["diffuser_count"] == 1
+    assert summary["all_training_diffusers"]["metrics"]["pearson"]["sample_std"] is not None
 
 
 def test_training_cli_builds_shared_reconstruction_weights() -> None:
