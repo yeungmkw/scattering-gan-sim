@@ -846,6 +846,40 @@ def test_luo2022_control_ladder_isolated_resume_and_trained_regression(
         experiment.Luo2022FourLayerD2NN.forward_without_diffractive_layers
     )
     original_four_layer_operator = experiment.Luo2022FourLayerD2NN.forward
+    zero_phase_model = experiment.Luo2022FourLayerD2NN(optics_config)
+    control_operators = {
+        "direct_free_space_no_d2nn": model.forward_without_diffractive_layers,
+        "zero_phase_four_layer": zero_phase_model.forward,
+        "trained_four_layer": model.forward,
+    }
+    experiment._validate_luo2022_control_ladder_operator_bindings(
+        control_operators,
+        trained_model=model,
+        zero_phase_model=zero_phase_model,
+    )
+    swapped_control_operators = dict(control_operators)
+    swapped_control_operators["direct_free_space_no_d2nn"] = zero_phase_model.forward
+    with pytest.raises(
+        RuntimeError,
+        match="direct_free_space_no_d2nn is not bound to the trained model's "
+        "direct-propagation operator",
+    ):
+        experiment._validate_luo2022_control_ladder_operator_bindings(
+            swapped_control_operators,
+            trained_model=model,
+            zero_phase_model=zero_phase_model,
+    )
+    swapped_control_operators = dict(control_operators)
+    swapped_control_operators["zero_phase_four_layer"] = model.forward
+    with pytest.raises(
+        RuntimeError,
+        match="zero_phase_four_layer is not bound to its expected four-layer optical operator",
+    ):
+        experiment._validate_luo2022_control_ladder_operator_bindings(
+            swapped_control_operators,
+            trained_model=model,
+            zero_phase_model=zero_phase_model,
+        )
     operator_calls: set[str] = set()
     routed_controls: list[str] = []
 
@@ -886,6 +920,8 @@ def test_luo2022_control_ladder_isolated_resume_and_trained_regression(
         if getattr(forward, "__func__", None) is track_direct_operator:
             return "direct_free_space_no_d2nn"
         phase = getattr(forward, "phase", None)
+        if not isinstance(phase, torch.Tensor):
+            phase = getattr(getattr(forward, "__self__", None), "phase", None)
         if not isinstance(phase, torch.Tensor):
             pytest.fail("C0 evaluator received an unrecognized forward operator")
         return (

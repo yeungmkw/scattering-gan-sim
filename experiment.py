@@ -5119,6 +5119,42 @@ def _summarize_luo2022_control_ladder_rows(
     }
 
 
+def _validate_luo2022_control_ladder_operator_bindings(
+    forward_operators: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]],
+    *,
+    trained_model: Luo2022FourLayerD2NN,
+    zero_phase_model: Luo2022FourLayerD2NN,
+) -> None:
+    """Reject a C0 run if a named control is bound to the wrong optical operator."""
+
+    if set(forward_operators) != set(LUO2022_CONTROL_LADDER_IDS):
+        raise RuntimeError("control-ladder operator bindings do not cover the frozen controls")
+
+    direct_operator = forward_operators["direct_free_space_no_d2nn"]
+    if (
+        getattr(direct_operator, "__self__", None) is not trained_model
+        or getattr(direct_operator, "__func__", None)
+        is not Luo2022FourLayerD2NN.forward_without_diffractive_layers
+    ):
+        raise RuntimeError(
+            "direct_free_space_no_d2nn is not bound to the trained model's "
+            "direct-propagation operator"
+        )
+
+    for control_id, expected_model in (
+        ("zero_phase_four_layer", zero_phase_model),
+        ("trained_four_layer", trained_model),
+    ):
+        forward_operator = forward_operators[control_id]
+        if (
+            getattr(forward_operator, "__self__", None) is not expected_model
+            or getattr(forward_operator, "__func__", None) is not Luo2022FourLayerD2NN.forward
+        ):
+            raise RuntimeError(
+                f"{control_id} is not bound to its expected four-layer optical operator"
+            )
+
+
 def run_luo2022_c0_optical_control_ladder(
     *,
     run_dir: Path,
@@ -5801,9 +5837,14 @@ def run_luo2022_c0_optical_control_ladder(
 
     forward_operators: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
         "direct_free_space_no_d2nn": trained_model.forward_without_diffractive_layers,
-        "zero_phase_four_layer": zero_phase_model,
-        "trained_four_layer": trained_model,
+        "zero_phase_four_layer": zero_phase_model.forward,
+        "trained_four_layer": trained_model.forward,
     }
+    _validate_luo2022_control_ladder_operator_bindings(
+        forward_operators,
+        trained_model=trained_model,
+        zero_phase_model=zero_phase_model,
+    )
     save_progress("initializing")
     for control_id in LUO2022_CONTROL_LADDER_IDS:
         for population, phases_cpu, metadata_rows in phase_groups:
