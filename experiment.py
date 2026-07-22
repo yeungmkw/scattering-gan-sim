@@ -62,6 +62,7 @@ from d2nn import (
     make_correlated_diffuser_phase,
     make_random_phase_screen,
     make_unique_correlated_diffusers,
+    represent_diffuser_phase,
     summarize_cross_diffuser_uniqueness,
     summarize_diffuser_bank_uniqueness,
 )
@@ -326,7 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     d2nn_parser.add_argument("--profile", choices=("legacy", "luo2022_r0"), default="legacy")
     d2nn_parser.add_argument(
         "--action",
-        choices=("inspect", "train", "assess", "evaluate", "diagnose"),
+        choices=("inspect", "train", "assess", "scatter-audit", "evaluate", "diagnose"),
         default="inspect",
     )
     d2nn_parser.add_argument("--config-path", type=Path, default=DEFAULT_LUO2022_CONFIG)
@@ -437,6 +438,12 @@ def build_parser() -> argparse.ArgumentParser:
             "is therefore opt-in; the final-epoch cross-bank audit always runs."
         ),
     )
+    d2nn_parser.add_argument(
+        "--scatter-audit-output-dir",
+        type=Path,
+        default=Path("outputs/luo2022_r0_scatter_audit"),
+        help="Independent JSON evidence directory for --action scatter-audit.",
+    )
 
     unet_parser = subparsers.add_parser("unet", help="Train the coherent U-Net reconstructor.")
     add_training_args(unet_parser, default_output="outputs/coherent_unet")
@@ -537,6 +544,12 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     output_dir=Path(args.output_dir),
                     config_path=args.config_path,
                     device_name=args.device,
+                    seed=args.seed,
+                )
+            if args.action == "scatter-audit":
+                return run_luo2022_scatter_correlation_convention_audit(
+                    output_dir=args.scatter_audit_output_dir,
+                    config_path=args.config_path,
                     seed=args.seed,
                 )
             if args.action != "train":
@@ -1204,6 +1217,244 @@ def run_luo2022_readiness_assessment(
         encoding="utf-8",
     )
     return assessment
+
+
+def run_luo2022_scatter_correlation_convention_audit(
+    *,
+    output_dir: Path,
+    config_path: Path = DEFAULT_LUO2022_CONFIG,
+    seed: int | None = None,
+    sample_count: int | None = None,
+) -> dict[str, Any]:
+    """Audit unpublished phase-autocorrelation conventions without changing R0.
+
+    Luo et al. report ``sigma=4 lambda`` and an average phase-autocorrelation
+    length of about ``10 lambda``, but do not publish the discrete estimator,
+    phase branch, or fitting interval. This read-only evidence action holds
+    every published diffuser parameter and the frozen finite-kernel choice
+    fixed, then reports sensitivity to those unpublished measurement choices.
+
+    ``sample_count`` exists for focused function tests only. The CLI always
+    defaults to the paper-scale count frozen in the R0 contract.
+    """
+
+    contract = load_config(config_path)
+    canonical_contract = load_config(DEFAULT_LUO2022_CONFIG)
+    if contract != canonical_contract:
+        raise ValueError("scatter audit requires the exact frozen R0 contract")
+    if (
+        str(contract["freeze_version"]) != "2026-07-19.3"
+        or float(contract["diffuser"]["gaussian_sigma_lambda"]) != 4.0
+        or float(contract["diffuser"]["expected_mean_correlation_length_lambda"]) != 10.0
+        or float(contract["diffuser"]["finite_kernel_choice"]["truncate_sigma"]) != 4.0
+        or str(contract["diffuser"]["finite_kernel_choice"]["padding"]) != "reflect"
+    ):
+        raise ValueError("scatter audit requires the published R0 diffuser parameters")
+
+    expected_sample_count = int(contract["diffuser"]["training_correlation_validation_samples"])
+    resolved_sample_count = expected_sample_count if sample_count is None else int(sample_count)
+    if resolved_sample_count < 2:
+        raise ValueError("scatter audit requires at least two diffuser samples")
+    resolved_seed = int(contract["training"]["primary_seed"]["value"] if seed is None else seed)
+    seed_everything(resolved_seed)
+    optics_config = Luo2022OpticsConfig(
+        field_shape=tuple(int(value) for value in contract["grid"]["shape"]),
+        wavelength=float(contract["illumination"]["wavelength_m"]),
+        pixel_size=float(contract["grid"]["pixel_pitch_m"]),
+        object_to_diffuser_distance=float(contract["geometry"]["object_to_diffuser_m"]),
+        diffuser_to_first_layer_distance=float(contract["geometry"]["diffuser_to_first_layer_m"]),
+        layer_distance=float(contract["geometry"]["layer_to_layer_m"]),
+        output_distance=float(contract["geometry"]["last_layer_to_output_m"]),
+        num_layers=int(contract["d2nn"]["layers"]),
+        pad_factor=2,
+    )
+    diffuser_kwargs = _luo2022_diffuser_kwargs(optics_config, contract)
+    target_length = float(contract["diffuser"]["expected_mean_correlation_length_lambda"])
+    tolerance = float(contract["diffuser"]["correlation_estimator"]["acceptance_relative_error"])
+    convention_specs = (
+        {
+            "id": "unwrapped_phase_frozen_fit",
+            "observable": "phase_autocorrelation",
+            "phase_representation": "unwrapped",
+            "fit_range": (0.20, 0.95),
+            "relation_to_frozen_r0": "sensitivity_only",
+        },
+        {
+            "id": "zero_to_2pi_phase_frozen_fit",
+            "observable": "phase_autocorrelation",
+            "phase_representation": "zero_to_2pi",
+            "fit_range": (0.20, 0.95),
+            "relation_to_frozen_r0": "sensitivity_only",
+        },
+        {
+            "id": "minus_pi_to_pi_phase_frozen_fit",
+            "observable": "phase_autocorrelation",
+            "phase_representation": "minus_pi_to_pi",
+            "fit_range": (0.20, 0.95),
+            "relation_to_frozen_r0": "sensitivity_only",
+        },
+        {
+            "id": "minus_pi_to_pi_phase_low_correlation_fit",
+            "observable": "phase_autocorrelation",
+            "phase_representation": "minus_pi_to_pi",
+            "fit_range": (0.05, 0.80),
+            "relation_to_frozen_r0": "sensitivity_only",
+        },
+        {
+            "id": "complex_transmittance_frozen_fit",
+            "observable": "complex_transmittance_autocovariance",
+            "phase_representation": None,
+            "fit_range": tuple(
+                float(value)
+                for value in contract["diffuser"]["correlation_estimator"]["fit_correlation_range"]
+            ),
+            "relation_to_frozen_r0": "frozen_acceptance_estimator",
+        },
+    )
+    audit_spec = {
+        "schema_version": 1,
+        "implementation_version": "luo2022_r0_scatter_correlation_convention_audit_v1",
+        "read_only": True,
+        "sample_count": resolved_sample_count,
+        "seed": resolved_seed,
+        "conventions": [
+            {
+                **spec,
+                "fit_range": [float(value) for value in spec["fit_range"]],
+            }
+            for spec in convention_specs
+        ],
+    }
+    fingerprint = {
+        "source_config_sha256": _sha256_file(config_path),
+        "source_freeze_version": str(contract["freeze_version"]),
+        "audit_spec": audit_spec,
+    }
+    result_path = output_dir / "scatter_correlation_convention_audit.json"
+    if result_path.is_file():
+        saved = load_config(result_path)
+        if (
+            saved.get("status") == "completed"
+            and saved.get("evidence_fingerprint") == fingerprint
+        ):
+            return saved
+        raise ValueError("existing scatter audit does not match the requested frozen evidence")
+
+    values_by_convention = {
+        str(spec["id"]): np.empty(resolved_sample_count, dtype=np.float64)
+        for spec in convention_specs
+    }
+    started = time.perf_counter()
+    for index in range(resolved_sample_count):
+        phase = make_correlated_diffuser_phase(
+            optics_config.field_shape,
+            seed=resolved_seed + index,
+            **diffuser_kwargs,
+        )
+        for spec in convention_specs:
+            convention_id = str(spec["id"])
+            fit_range = tuple(float(value) for value in spec["fit_range"])
+            if spec["observable"] == "phase_autocorrelation":
+                represented = represent_diffuser_phase(
+                    phase,
+                    mode=str(spec["phase_representation"]),
+                )
+                value = estimate_phase_correlation_length(
+                    represented,
+                    pixel_size=optics_config.pixel_size,
+                    wavelength=optics_config.wavelength,
+                    fit_range=fit_range,
+                )
+            else:
+                value = estimate_transmittance_correlation_length(
+                    phase,
+                    pixel_size=optics_config.pixel_size,
+                    wavelength=optics_config.wavelength,
+                    fit_range=fit_range,
+                )
+            values_by_convention[convention_id][index] = value
+    generation_and_estimation_seconds = time.perf_counter() - started
+
+    conventions: list[dict[str, Any]] = []
+    for spec in convention_specs:
+        convention_id = str(spec["id"])
+        values = values_by_convention[convention_id]
+        mean = float(values.mean())
+        sample_standard_deviation = float(values.std(ddof=1))
+        standard_error = sample_standard_deviation / float(np.sqrt(values.size))
+        relative_error = abs(mean - target_length) / target_length
+        conventions.append(
+            {
+                **spec,
+                "fit_range": [float(value) for value in spec["fit_range"]],
+                "sample_mean_correlation_length_lambda": mean,
+                "sample_standard_deviation_lambda": sample_standard_deviation,
+                "standard_error_lambda": standard_error,
+                "ci95_normal_lambda": [
+                    mean - 1.96 * standard_error,
+                    mean + 1.96 * standard_error,
+                ],
+                "minimum_lambda": float(values.min()),
+                "maximum_lambda": float(values.max()),
+                "reported_target_lambda": target_length,
+                "relative_error_to_reported_target": relative_error,
+                "consistent_with_reported_L_under_this_convention": relative_error <= tolerance,
+            }
+        )
+
+    result = {
+        "schema_version": 1,
+        "status": "completed",
+        "completed_at_utc": datetime.now(UTC).isoformat(),
+        "implementation_version": audit_spec["implementation_version"],
+        "read_only": True,
+        "source_freeze_version": str(contract["freeze_version"]),
+        "source_config_sha256": fingerprint["source_config_sha256"],
+        "evidence_fingerprint": fingerprint,
+        "paper_constraints": {
+            "published_gaussian_sigma_lambda": 4.0,
+            "configured_gaussian_sigma_lambda": float(
+                contract["diffuser"]["gaussian_sigma_lambda"]
+            ),
+            "reported_target_correlation_length_lambda": target_length,
+            "paper_observable_wording": "phase-autocorrelation",
+            "discrete_estimator_published": False,
+            "physical_parameters_unchanged": True,
+        },
+        "generation": {
+            "sample_count": resolved_sample_count,
+            "paper_scale_sample_count": expected_sample_count,
+            "reduced_test_audit": resolved_sample_count != expected_sample_count,
+            "candidate_seed_formula": "resolved_primary_seed_plus_index",
+            "finite_kernel_and_padding": {
+                "truncate_sigma": float(
+                    contract["diffuser"]["finite_kernel_choice"]["truncate_sigma"]
+                ),
+                "padding": str(contract["diffuser"]["finite_kernel_choice"]["padding"]),
+                "output_shape": str(
+                    contract["diffuser"]["finite_kernel_choice"]["output_shape"]
+                ),
+            },
+            "generation_and_estimation_seconds": generation_and_estimation_seconds,
+        },
+        "conventions": conventions,
+        "claim_boundary": [
+            (
+                "A convention consistent with the reported L approximately 10 lambda does "
+                "not identify the authors' unpublished estimator."
+            ),
+            "This audit does not alter the frozen R0 correlation acceptance criterion.",
+            "This audit does not establish training or reconstruction superiority.",
+            (
+                "The raw sequential seed bank is used to audit phase-autocorrelation wording; "
+                "it is not substituted for the training bank's uniqueness acceptance protocol."
+            ),
+        ],
+        "runtime": run_metadata(),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(result_path, result)
+    return result
 
 
 def _phase_difference_summary(

@@ -105,6 +105,23 @@ def test_d2nn_cli_exposes_luo2022_readiness_assessment() -> None:
     assert args.output_dir == "outputs/assessment"
 
 
+def test_d2nn_cli_exposes_luo2022_scatter_correlation_audit() -> None:
+    args = experiment.build_parser().parse_args(
+        [
+            "d2nn",
+            "--profile",
+            "luo2022_r0",
+            "--action",
+            "scatter-audit",
+            "--scatter-audit-output-dir",
+            "outputs/independent_scatter_evidence",
+        ]
+    )
+
+    assert args.action == "scatter-audit"
+    assert args.scatter_audit_output_dir == Path("outputs/independent_scatter_evidence")
+
+
 def test_d2nn_cli_exposes_luo2022_posthoc_evaluation() -> None:
     args = experiment.build_parser().parse_args(
         [
@@ -176,6 +193,57 @@ def test_luo2022_diagnosis_rejects_output_inside_frozen_run(tmp_path: Path) -> N
         experiment.run_luo2022_diagnosis(
             run_dir=run_dir,
             diagnostic_output_dir=run_dir / "diagnosis",
+        )
+
+
+def test_luo2022_scatter_correlation_audit_writes_reproducible_read_only_json(
+    tmp_path: Path,
+) -> None:
+    first = experiment.run_luo2022_scatter_correlation_convention_audit(
+        output_dir=tmp_path / "first",
+        sample_count=4,
+        seed=112,
+    )
+    second = experiment.run_luo2022_scatter_correlation_convention_audit(
+        output_dir=tmp_path / "second",
+        sample_count=4,
+        seed=112,
+    )
+
+    assert first["read_only"] is True
+    assert first["generation"]["reduced_test_audit"] is True
+    assert first["paper_constraints"]["published_gaussian_sigma_lambda"] == pytest.approx(4.0)
+    assert first["paper_constraints"]["configured_gaussian_sigma_lambda"] == pytest.approx(4.0)
+    assert [item["id"] for item in first["conventions"]] == [
+        "unwrapped_phase_frozen_fit",
+        "zero_to_2pi_phase_frozen_fit",
+        "minus_pi_to_pi_phase_frozen_fit",
+        "minus_pi_to_pi_phase_low_correlation_fit",
+        "complex_transmittance_frozen_fit",
+    ]
+    assert list((tmp_path / "first").iterdir()) == [
+        tmp_path / "first" / "scatter_correlation_convention_audit.json"
+    ]
+    assert [
+        item["sample_mean_correlation_length_lambda"] for item in first["conventions"]
+    ] == pytest.approx(
+        [item["sample_mean_correlation_length_lambda"] for item in second["conventions"]]
+    )
+
+
+def test_luo2022_scatter_correlation_audit_rejects_nonfrozen_contract(
+    tmp_path: Path,
+) -> None:
+    contract = deepcopy(experiment.load_config(experiment.DEFAULT_LUO2022_CONFIG))
+    contract["diffuser"]["gaussian_sigma_lambda"] = 3.0
+    altered_path = tmp_path / "altered_contract.json"
+    write_json(altered_path, contract)
+
+    with pytest.raises(ValueError, match="exact frozen R0 contract"):
+        experiment.run_luo2022_scatter_correlation_convention_audit(
+            output_dir=tmp_path / "evidence",
+            config_path=altered_path,
+            sample_count=4,
         )
 
 
