@@ -20,7 +20,7 @@ import platform
 import shutil
 import time
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
@@ -62,13 +62,17 @@ from d2nn import (
     make_correlated_diffuser_phase,
     make_random_phase_screen,
     make_unique_correlated_diffusers,
+    summarize_cross_diffuser_uniqueness,
     summarize_diffuser_bank_uniqueness,
 )
 from data import build_torchvision_dataset
 from losses import (
     ReconstructionLossWeights,
     luo2022_d2nn_components_per_pair,
+    luo2022_d2nn_energy_breakdown_per_pair,
     luo2022_d2nn_loss,
+    masked_pearson_per_image,
+    pearson_per_image,
     reconstruction_loss,
 )
 from metrics import reconstruction_metrics
@@ -312,7 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     d2nn_parser.add_argument("--profile", choices=("legacy", "luo2022_r0"), default="legacy")
     d2nn_parser.add_argument(
         "--action",
-        choices=("inspect", "train", "assess", "evaluate"),
+        choices=("inspect", "train", "assess", "evaluate", "diagnose"),
         default="inspect",
     )
     d2nn_parser.add_argument("--config-path", type=Path, default=DEFAULT_LUO2022_CONFIG)
@@ -365,6 +369,45 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=("training", "new", "no_diffuser"),
         help="Frozen diffuser populations to evaluate with --action evaluate.",
+    )
+    d2nn_parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Completed frozen R0 run directory for --action diagnose; defaults to --output-dir.",
+    )
+    d2nn_parser.add_argument(
+        "--diagnostic-output-dir",
+        type=Path,
+        default=Path("outputs/luo2022_r0_diagnosis"),
+        help="Independent ignored evidence directory for --action diagnose.",
+    )
+    d2nn_parser.add_argument(
+        "--diagnostic-batches",
+        type=int,
+        default=1,
+        help="Fixed test-prefix batches used for the read-only R0 diagnosis.",
+    )
+    d2nn_parser.add_argument(
+        "--diagnostic-diffusers",
+        type=int,
+        default=3,
+        help="Known and unseen diffusers included in batch-level optical diagnostics.",
+    )
+    d2nn_parser.add_argument(
+        "--diagnostic-pad-factors",
+        type=int,
+        nargs="+",
+        default=(2, 3, 4),
+        help="Padding factors for the discrete propagation sensitivity probe.",
+    )
+    d2nn_parser.add_argument(
+        "--diagnostic-cross-bank-audit",
+        action="store_true",
+        help=(
+            "Audit every new-versus-training diffuser pair. This is CPU-intensive and "
+            "is therefore opt-in; the final-epoch cross-bank audit always runs."
+        ),
     )
 
     unet_parser = subparsers.add_parser("unet", help="Train the coherent U-Net reconstructor.")
@@ -442,6 +485,18 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     diffuser_chunk_size=args.diffuser_chunk_size,
                     output_dir=args.posthoc_output_dir,
                     populations=tuple(args.posthoc_populations),
+                )
+            if args.action == "diagnose":
+                return run_luo2022_diagnosis(
+                    run_dir=args.run_dir or Path(args.output_dir),
+                    diagnostic_output_dir=args.diagnostic_output_dir,
+                    config_path=args.config_path,
+                    download=args.download,
+                    device_name=args.device,
+                    diagnostic_batches=args.diagnostic_batches,
+                    diagnostic_diffusers=args.diagnostic_diffusers,
+                    diagnostic_pad_factors=tuple(args.diagnostic_pad_factors),
+                    cross_bank_audit=args.diagnostic_cross_bank_audit,
                 )
             if args.action == "assess":
                 return run_luo2022_readiness_assessment(
@@ -1616,6 +1671,7 @@ def save_luo2022_checkpoint(
     loader_generator: torch.Generator,
     runtime_config: dict[str, Any],
     source_freeze_version: str,
+    source_config_sha256: str,
 ) -> None:
     """Atomically save enough state to resume at the next epoch."""
 
@@ -1636,6 +1692,7 @@ def save_luo2022_checkpoint(
             ),
             "runtime_config": runtime_config,
             "source_freeze_version": source_freeze_version,
+            "source_config_sha256": source_config_sha256,
         },
         temporary_path,
     )
@@ -1668,6 +1725,7 @@ def run_luo2022_training(
     """Train the four-layer R0 D2NN using the frozen Luo 2022 contract."""
 
     contract = load_config(config_path)
+    source_config_sha256 = _sha256_file(config_path)
     device = select_device(device_name)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -1821,6 +1879,11 @@ def run_luo2022_training(
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         if checkpoint["source_freeze_version"] != contract["freeze_version"]:
             raise ValueError("resume checkpoint freeze version does not match source configuration")
+        if (
+            checkpoint.get("source_config_sha256") is not None
+            and checkpoint["source_config_sha256"] != source_config_sha256
+        ):
+            raise ValueError("resume checkpoint source configuration hash does not match")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -1926,6 +1989,7 @@ def run_luo2022_training(
             loader_generator=loader_generator,
             runtime_config=runtime_config,
             source_freeze_version=contract["freeze_version"],
+            source_config_sha256=source_config_sha256,
         )
         write_json(
             output_dir / "run_state.json",
@@ -2000,6 +2064,7 @@ def run_luo2022_training(
             "model": model.state_dict(),
             "runtime_config": runtime_config,
             "source_freeze_version": contract["freeze_version"],
+            "source_config_sha256": source_config_sha256,
         },
         output_dir / "checkpoints" / "luo2022_d2nn.pt",
     )
@@ -2010,6 +2075,7 @@ def run_luo2022_training(
         "comparison_level": "R0-small" if small_run else "R0",
         "profile_id": contract["profile_id"],
         "source_freeze_version": contract["freeze_version"],
+        "source_config_sha256": source_config_sha256,
         "claim_boundary": runtime_config["claim_boundary"],
         "dataset": "MNIST",
         "input_encoding": "field_amplitude",
@@ -2240,6 +2306,1177 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_tensor(tensor: torch.Tensor) -> str:
+    """Return a device-independent hash for a tensor used as evidence input."""
+
+    normalized = tensor.detach().to(device="cpu").contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(normalized.dtype).encode("utf-8"))
+    digest.update(str(tuple(normalized.shape)).encode("utf-8"))
+    digest.update(normalized.numpy().tobytes(order="C"))
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class Luo2022FrozenRunArtifacts:
+    """Verified immutable inputs needed for a post-hoc R0 diagnostic."""
+
+    run_dir: Path
+    runtime_config: dict[str, Any]
+    contract: dict[str, Any]
+    manifest: dict[str, Any]
+    checkpoint: dict[str, Any]
+    checkpoint_path: Path
+    checkpoint_sha256: str
+    runtime_config_sha256: str
+    source_config_sha256: str
+    manifest_sha256: str
+    run_state_sha256: str
+    source_config_integrity: str
+
+
+def _luo2022_runtime_contract_projection(contract: dict[str, Any]) -> dict[str, Any]:
+    """Return every frozen-contract field copied into the runtime snapshot."""
+
+    return {
+        "profile_id": contract["profile_id"],
+        "source_freeze_version": contract["freeze_version"],
+        "experiment_class": contract["experiment_class"],
+        "comparison_level": contract["comparison_level"],
+        "paper_equations": {
+            "diffuser": contract["diffuser"]["equations"],
+            "propagation": contract["propagation"]["equations"],
+            "d2nn": contract["d2nn"]["equations"],
+            "loss": contract["training"]["loss"]["equations"],
+        },
+        "physical_parameters": {
+            "wavelength_m": contract["illumination"]["wavelength_m"],
+            "pixel_pitch_m": contract["grid"]["pixel_pitch_m"],
+            "geometry": contract["geometry"],
+            "diffuser": contract["diffuser"],
+            "d2nn_layers": contract["d2nn"]["layers"],
+        },
+        "training_protocol": {
+            "regenerate_diffusers_at_epoch_start": contract["training"][
+                "regenerate_diffusers_at_epoch_start"
+            ],
+            "reuse_epoch_diffusers_for_all_batches": contract["training"][
+                "reuse_epoch_diffusers_for_all_batches"
+            ],
+            "optimizer": contract["training"]["optimizer"],
+            "learning_rate": contract["training"]["learning_rate"],
+            "loss": contract["training"]["loss"],
+        },
+    }
+
+
+def _validate_luo2022_run_local_contract(
+    *,
+    runtime_config: dict[str, Any],
+    contract: dict[str, Any],
+) -> None:
+    """Reject a source contract that cannot have produced the runtime snapshot."""
+
+    expected = _luo2022_runtime_contract_projection(contract)
+    observed = {key: runtime_config.get(key) for key in expected}
+    if observed != expected:
+        raise ValueError(
+            "run-local source configuration does not match immutable fields in the "
+            "frozen runtime configuration"
+        )
+
+
+def _load_luo2022_frozen_run_artifacts(
+    *,
+    run_dir: Path,
+    config_path: Path,
+    device: torch.device,
+) -> Luo2022FrozenRunArtifacts:
+    """Load a completed R0 run after validating its frozen provenance."""
+
+    runtime_config_path = run_dir / "config.json"
+    source_config_path = run_dir / "source_config.json"
+    manifest_path = run_dir / "manifest.json"
+    run_state_path = run_dir / "run_state.json"
+    final_checkpoint_path = run_dir / "checkpoints" / "luo2022_d2nn.pt"
+    required_paths = (
+        runtime_config_path,
+        source_config_path,
+        manifest_path,
+        run_state_path,
+        final_checkpoint_path,
+    )
+    if not all(path.is_file() for path in required_paths):
+        raise FileNotFoundError(
+            "completed Luo 2022 diagnosis requires runtime config, frozen source config, "
+            "manifest, completed state, and final checkpoint"
+        )
+
+    runtime_config = load_config(runtime_config_path)
+    manifest = load_config(manifest_path)
+    run_state = load_config(run_state_path)
+    if run_state.get("status") != "completed":
+        raise ValueError("diagnosis requires a completed frozen R0 run")
+    contract_path = source_config_path
+    contract = load_config(contract_path)
+    requested_contract = load_config(config_path)
+    if requested_contract != contract:
+        raise ValueError(
+            "requested diagnosis config does not exactly match the run-local frozen source "
+            "configuration"
+        )
+    _validate_luo2022_run_local_contract(
+        runtime_config=runtime_config,
+        contract=contract,
+    )
+    expected_epochs = int(runtime_config["runtime"]["epochs"])
+    if int(run_state.get("target_epochs", -1)) != expected_epochs:
+        raise ValueError("completed run state target_epochs does not match frozen runtime configuration")
+    if int(run_state.get("completed_epoch", -1)) != expected_epochs:
+        raise ValueError("completed run state epoch does not match frozen runtime configuration")
+    freeze_version = str(contract["freeze_version"])
+    if runtime_config.get("source_freeze_version") != freeze_version:
+        raise ValueError("runtime configuration freeze version does not match source configuration")
+    if manifest.get("source_freeze_version") != freeze_version:
+        raise ValueError("manifest freeze version does not match source configuration")
+    if manifest.get("profile_id") != contract.get("profile_id"):
+        raise ValueError("manifest profile does not match source configuration")
+
+    checkpoint = torch.load(final_checkpoint_path, map_location=device, weights_only=True)
+    if checkpoint.get("source_freeze_version") != freeze_version:
+        raise ValueError("checkpoint freeze version does not match source configuration")
+    if checkpoint.get("runtime_config") != runtime_config:
+        raise ValueError("checkpoint runtime configuration does not match the frozen run")
+    if "model" not in checkpoint:
+        raise ValueError("frozen R0 checkpoint does not contain model parameters")
+    source_config_sha256 = _sha256_file(contract_path)
+    recorded_source_hashes = {
+        name: value
+        for name, value in {
+            "manifest": manifest.get("source_config_sha256"),
+            "checkpoint": checkpoint.get("source_config_sha256"),
+        }.items()
+        if value is not None
+    }
+    for artifact_name, recorded_hash in recorded_source_hashes.items():
+        if str(recorded_hash) != source_config_sha256:
+            raise ValueError(
+                f"{artifact_name} source configuration hash does not match the run-local copy"
+            )
+    optics_config = _luo2022_optics_config_from_frozen_run(runtime_config, contract)
+    try:
+        checkpoint_model = Luo2022FourLayerD2NN(optics_config).to(device)
+        checkpoint_model.load_state_dict(checkpoint["model"], strict=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            "final checkpoint model state is incompatible with the frozen optical configuration"
+        ) from exc
+    source_config_integrity = (
+        "sha256_bound_by_manifest_and_checkpoint"
+        if set(recorded_source_hashes) == {"manifest", "checkpoint"}
+        else (
+            "sha256_bound_by_" + "_and_".join(sorted(recorded_source_hashes))
+            if recorded_source_hashes
+            else "requested_frozen_config_and_runtime_projection_verified"
+        )
+    )
+
+    return Luo2022FrozenRunArtifacts(
+        run_dir=run_dir,
+        runtime_config=runtime_config,
+        contract=contract,
+        manifest=manifest,
+        checkpoint=checkpoint,
+        checkpoint_path=final_checkpoint_path,
+        checkpoint_sha256=_sha256_file(final_checkpoint_path),
+        runtime_config_sha256=_sha256_file(runtime_config_path),
+        source_config_sha256=source_config_sha256,
+        manifest_sha256=_sha256_file(manifest_path),
+        run_state_sha256=_sha256_file(run_state_path),
+        source_config_integrity=source_config_integrity,
+    )
+
+
+def _luo2022_optics_config_from_frozen_run(
+    runtime_config: dict[str, Any],
+    contract: dict[str, Any],
+    *,
+    pad_factor: int = 2,
+) -> Luo2022OpticsConfig:
+    values = runtime_config["runtime"]
+    return Luo2022OpticsConfig(
+        field_shape=(int(values["grid_size"]), int(values["grid_size"])),
+        wavelength=float(contract["illumination"]["wavelength_m"]),
+        pixel_size=float(contract["grid"]["pixel_pitch_m"]),
+        object_to_diffuser_distance=float(contract["geometry"]["object_to_diffuser_m"]),
+        diffuser_to_first_layer_distance=float(contract["geometry"]["diffuser_to_first_layer_m"]),
+        layer_distance=float(contract["geometry"]["layer_to_layer_m"]),
+        output_distance=float(contract["geometry"]["last_layer_to_output_m"]),
+        num_layers=int(contract["d2nn"]["layers"]),
+        pad_factor=pad_factor,
+    )
+
+
+def _luo2022_diffuser_kwargs(
+    optics_config: Luo2022OpticsConfig,
+    contract: dict[str, Any],
+) -> dict[str, float | str]:
+    return {
+        "wavelength": optics_config.wavelength,
+        "pixel_size": optics_config.pixel_size,
+        "refractive_index_difference": float(contract["diffuser"]["refractive_index_difference"]),
+        "height_mean_lambda": float(contract["diffuser"]["height_mean_lambda"]),
+        "height_std_lambda": float(contract["diffuser"]["height_std_lambda"]),
+        "gaussian_sigma_lambda": float(contract["diffuser"]["gaussian_sigma_lambda"]),
+        "truncate_sigma": float(contract["diffuser"]["finite_kernel_choice"]["truncate_sigma"]),
+        "padding": str(contract["diffuser"]["finite_kernel_choice"]["padding"]),
+    }
+
+
+def _luo2022_frozen_diffuser_seed_schedule(
+    runtime_config: dict[str, Any],
+    contract: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Validate or derive the frozen non-overlapping diffuser seed schedule.
+
+    The run-level copy was introduced after earlier R0 smoke artifacts existed.
+    A completed run is accepted without that copy only when its own frozen
+    source configuration declares both the training stride and evaluation
+    offset. Runs that predate the isolation policy are rejected instead of
+    silently being assigned a modern schedule.
+    """
+
+    training_schedule = contract.get("training", {}).get("diffuser_seed_schedule")
+    evaluation_schedule = contract.get("evaluation", {}).get("diffuser_seed_schedule")
+    if not isinstance(training_schedule, dict) or not isinstance(evaluation_schedule, dict):
+        raise ValueError(
+            "frozen run predates the diffuser seed-isolation policy; "
+            "its unseen-diffuser status cannot be certified"
+        )
+    try:
+        expected = luo2022_diffuser_seed_schedule(
+            seed=int(runtime_config["runtime"]["seed"]),
+            epochs=int(runtime_config["runtime"]["epochs"]),
+            training_stride=int(training_schedule["epoch_stride"]),
+            evaluation_offset=int(evaluation_schedule["offset"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "frozen source configuration does not define a valid diffuser seed-isolation schedule"
+        ) from exc
+
+    recorded = runtime_config.get("diffuser_seed_schedule")
+    if recorded is None:
+        return expected, "derived_from_frozen_source_config"
+    if not isinstance(recorded, dict):
+        raise ValueError("runtime diffuser seed schedule must be a mapping")
+    for key, expected_value in expected.items():
+        if recorded.get(key) != expected_value:
+            raise ValueError(
+                f"runtime diffuser seed schedule field {key!r} does not match frozen source config"
+            )
+    return expected, "validated_runtime_copy"
+
+
+def _luo2022_tensor_summary(values: torch.Tensor) -> dict[str, float | int]:
+    values = values.detach().to(device="cpu", dtype=torch.float64).flatten()
+    if values.numel() == 0:
+        raise ValueError("cannot summarize an empty tensor")
+    return {
+        "count": int(values.numel()),
+        "mean": float(values.mean()),
+        "minimum": float(values.min()),
+        "maximum": float(values.max()),
+        "sample_std": float(values.std(unbiased=True)) if values.numel() > 1 else 0.0,
+    }
+
+
+def _luo2022_complex_intensity(field: torch.Tensor) -> torch.Tensor:
+    if not torch.is_complex(field):
+        raise TypeError("field must be complex")
+    return field.real.square() + field.imag.square()
+
+
+def _luo2022_edge_mask(
+    field_shape: tuple[int, int],
+    *,
+    fraction: float = 0.1,
+    device: torch.device,
+) -> torch.Tensor:
+    if not 0 < fraction < 0.5:
+        raise ValueError("edge fraction must be between zero and one half")
+    height, width = field_shape
+    border_y = max(1, int(round(height * fraction)))
+    border_x = max(1, int(round(width * fraction)))
+    mask = torch.ones(field_shape, dtype=torch.bool, device=device)
+    mask[border_y : height - border_y, border_x : width - border_x] = False
+    return mask
+
+
+def _luo2022_field_summary(
+    field: torch.Tensor,
+    *,
+    pixel_size: float,
+) -> dict[str, Any]:
+    """Summarize field energy and border occupancy without assuming conservation."""
+
+    intensity = _luo2022_complex_intensity(field)
+    energy = intensity.flatten(start_dim=-2).sum(dim=-1) * pixel_size**2
+    edge_mask = _luo2022_edge_mask(
+        tuple(int(value) for value in field.shape[-2:]),
+        device=field.device,
+    )
+    edge_energy = intensity[..., edge_mask].sum(dim=-1) * pixel_size**2
+    edge_fraction = edge_energy / energy.clamp_min(torch.finfo(intensity.dtype).eps)
+    return {
+        "field_count": int(energy.numel()),
+        "integrated_energy": _luo2022_tensor_summary(energy),
+        "edge_energy_fraction": _luo2022_tensor_summary(edge_fraction),
+        "mean_intensity": _luo2022_tensor_summary(intensity.mean(dim=(-2, -1))),
+        "speckle_contrast": _luo2022_tensor_summary(
+            intensity.std(dim=(-2, -1), unbiased=False)
+            / intensity.mean(dim=(-2, -1)).clamp_min(torch.finfo(intensity.dtype).eps)
+        ),
+    }
+
+
+def _luo2022_phase_multiply_energy_error(
+    before: torch.Tensor,
+    after: torch.Tensor,
+) -> float:
+    before_energy = _luo2022_complex_intensity(before).flatten(start_dim=-2).sum(dim=-1)
+    after_energy = _luo2022_complex_intensity(after).flatten(start_dim=-2).sum(dim=-1)
+    while before_energy.ndim < after_energy.ndim:
+        before_energy = before_energy.unsqueeze(-1)
+    difference = (after_energy - before_energy).abs() / before_energy.abs().clamp_min(
+        torch.finfo(before_energy.dtype).eps
+    )
+    return float(difference.mean().detach().cpu())
+
+
+def _luo2022_center_mask(
+    target: torch.Tensor,
+    *,
+    input_size: int,
+) -> torch.Tensor:
+    height, width = target.shape[-2:]
+    if input_size <= 0 or input_size > min(height, width):
+        raise ValueError("input_size must fit within the diagnostic canvas")
+    top = (height - input_size) // 2
+    left = (width - input_size) // 2
+    mask = torch.zeros_like(target, dtype=torch.bool)
+    mask[..., top : top + input_size, left : left + input_size] = True
+    return mask
+
+
+def _luo2022_roi_metrics(
+    output_intensity: torch.Tensor,
+    target_amplitude: torch.Tensor,
+    *,
+    input_size: int,
+) -> dict[str, Any]:
+    if target_amplitude.ndim == 4 and target_amplitude.shape[1] == 1:
+        target_amplitude = target_amplitude[:, 0]
+    if output_intensity.ndim != 4 or target_amplitude.ndim != 3:
+        raise ValueError("ROI metrics require (B, n, H, W) output and (B, H, W) target")
+    expanded_target = target_amplitude[:, None].expand_as(output_intensity)
+    masks = {
+        "full_canvas": torch.ones_like(target_amplitude, dtype=torch.bool),
+        "center_input_region": _luo2022_center_mask(target_amplitude, input_size=input_size),
+        "target_support": target_amplitude > 0,
+    }
+    output_energy = output_intensity.sum(dim=(-2, -1)).clamp_min(
+        torch.finfo(output_intensity.dtype).eps
+    )
+    metrics: dict[str, Any] = {}
+    for name, mask in masks.items():
+        expanded_mask = mask[:, None].expand_as(output_intensity)
+        flat_output = output_intensity.reshape(-1, *output_intensity.shape[-2:])
+        flat_target = expanded_target.reshape_as(flat_output)
+        flat_mask = expanded_mask.reshape_as(flat_output)
+        pcc = masked_pearson_per_image(flat_output, flat_target, flat_mask).reshape(
+            output_intensity.shape[:2]
+        )
+        energy_fraction = (
+            (output_intensity * expanded_mask).sum(dim=(-2, -1)) / output_energy
+        )
+        metrics[name] = {
+            "pcc": _luo2022_tensor_summary(pcc),
+            "output_energy_fraction": _luo2022_tensor_summary(energy_fraction),
+            "roi_pixel_count": int(mask[0].sum().item()),
+        }
+    full_components = luo2022_d2nn_components_per_pair(output_intensity, target_amplitude)
+    metrics["full_canvas"]["pcc_matches_frozen_metric_abs_error"] = float(
+        abs(
+            metrics["full_canvas"]["pcc"]["mean"]
+            - float(full_components["pearson"].mean().detach().cpu())
+        )
+    )
+    return metrics
+
+
+def _luo2022_loss_scale_summary(
+    output_intensity: torch.Tensor,
+    target_amplitude: torch.Tensor,
+) -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    for scale in (0.1, 1.0, 10.0):
+        components = luo2022_d2nn_components_per_pair(output_intensity * scale, target_amplitude)
+        results[str(scale)] = {
+            name: float(value.mean().detach().cpu())
+            for name, value in components.items()
+        }
+    return {
+        "scales": results,
+        "interpretation": (
+            "For positive output scaling, PCC should be invariant while the equation (12) "
+            "energy term scales linearly; this is a loss-property diagnostic, not a metric change."
+        ),
+    }
+
+
+def _luo2022_diffuser_statistics(
+    phases: torch.Tensor,
+    *,
+    optics_config: Luo2022OpticsConfig,
+) -> dict[str, Any]:
+    if phases.ndim != 3 or phases.shape[0] == 0:
+        raise ValueError("diffuser statistics require a nonempty (count, H, W) bank")
+    phase_lengths: list[float] = []
+    wrapped_phase_lengths: list[float] = []
+    transmittance_lengths: list[float] = []
+    for phase in phases:
+        phase_lengths.append(
+            estimate_phase_correlation_length(
+                phase,
+                pixel_size=optics_config.pixel_size,
+                wavelength=optics_config.wavelength,
+            )
+        )
+        wrapped_phase_lengths.append(
+            estimate_phase_correlation_length(
+                torch.angle(torch.exp(1j * phase)),
+                pixel_size=optics_config.pixel_size,
+                wavelength=optics_config.wavelength,
+            )
+        )
+        transmittance_lengths.append(
+            estimate_transmittance_correlation_length(
+                phase,
+                pixel_size=optics_config.pixel_size,
+                wavelength=optics_config.wavelength,
+            )
+        )
+    height, width = phases.shape[-2:]
+    edge_mask = _luo2022_edge_mask((height, width), device=phases.device)
+    center_mask = ~edge_mask
+    return {
+        "count": int(phases.shape[0]),
+        "unwrapped_phase_correlation_length_lambda": _luo2022_tensor_summary(
+            torch.tensor(phase_lengths)
+        ),
+        "wrapped_phase_correlation_length_lambda": _luo2022_tensor_summary(
+            torch.tensor(wrapped_phase_lengths)
+        ),
+        "complex_transmittance_correlation_length_lambda": _luo2022_tensor_summary(
+            torch.tensor(transmittance_lengths)
+        ),
+        "phase_standard_deviation_radians": _luo2022_tensor_summary(
+            phases.std(dim=(-2, -1), unbiased=False)
+        ),
+        "phase_center_mean_radians": _luo2022_tensor_summary(
+            phases[..., center_mask].mean(dim=-1)
+        ),
+        "phase_edge_mean_radians": _luo2022_tensor_summary(
+            phases[..., edge_mask].mean(dim=-1)
+        ),
+        "phase_center_standard_deviation_radians": _luo2022_tensor_summary(
+            phases[..., center_mask].std(dim=-1, unbiased=False)
+        ),
+        "phase_edge_standard_deviation_radians": _luo2022_tensor_summary(
+            phases[..., edge_mask].std(dim=-1, unbiased=False)
+        ),
+    }
+
+
+def _luo2022_merge_cross_bank_summaries(
+    summaries: list[dict[str, float | int | str]],
+) -> dict[str, float | int | str]:
+    if not summaries:
+        raise ValueError("at least one cross-bank summary is required")
+    pair_count = sum(int(summary["pair_count"]) for summary in summaries)
+    if pair_count == 0:
+        raise ValueError("cross-bank summaries contain no pairs")
+    return {
+        "phase_representation": str(summaries[0]["phase_representation"]),
+        "pair_count": pair_count,
+        "minimum_radians": min(float(summary["minimum_radians"]) for summary in summaries),
+        "mean_radians": (
+            sum(
+                int(summary["pair_count"]) * float(summary["mean_radians"])
+                for summary in summaries
+            )
+            / pair_count
+        ),
+        "maximum_radians": max(float(summary["maximum_radians"]) for summary in summaries),
+        "pass_count": sum(int(summary["pass_count"]) for summary in summaries),
+        "pair_pass_fraction": (
+            sum(int(summary["pass_count"]) for summary in summaries) / pair_count
+        ),
+    }
+
+
+def _luo2022_cross_bank_audit_record(
+    summary: dict[str, float | int | str],
+    *,
+    expected_pair_count: int,
+    coverage: str,
+) -> dict[str, Any]:
+    """State audit coverage and certification without overstating seed isolation."""
+
+    observed_pair_count = int(summary["pair_count"])
+    if observed_pair_count != expected_pair_count:
+        raise RuntimeError("cross-bank audit pair count does not match the expected coverage")
+    all_pairs_pass_threshold = int(summary["pass_count"]) == observed_pair_count
+    if coverage == "all_training":
+        certification = (
+            "certified_against_all_training_diffusers"
+            if all_pairs_pass_threshold
+            else "not_certified_threshold_violation"
+        )
+    elif coverage == "final_epoch_only":
+        certification = (
+            "not_certified_final_epoch_only"
+            if all_pairs_pass_threshold
+            else "not_certified_threshold_violation"
+        )
+    else:
+        raise ValueError(f"unknown cross-bank audit coverage: {coverage}")
+    return {
+        "status": "completed",
+        "audit_coverage": coverage,
+        "expected_pair_count": expected_pair_count,
+        "all_pairs_pass_threshold": all_pairs_pass_threshold,
+        "unseen_certification": certification,
+        **summary,
+    }
+
+
+def _luo2022_learning_rate_audit(
+    *,
+    run_dir: Path,
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    history_path = run_dir / "history.json"
+    if not history_path.is_file():
+        return {"status": "missing_history"}
+    history = load_config(history_path)
+    if not history:
+        return {"status": "empty_history"}
+    learning_rate = contract["training"]["learning_rate"]
+    initial = float(learning_rate["initial"])
+    gamma = float(learning_rate["gamma"])
+    discrepancies: list[float] = []
+    entries: list[dict[str, float | int]] = []
+    for entry in history:
+        epoch = int(entry["epoch"])
+        expected = initial * gamma ** (epoch - 1)
+        observed = float(entry["learning_rate"])
+        discrepancy = observed - expected
+        discrepancies.append(abs(discrepancy))
+        entries.append(
+            {
+                "epoch": epoch,
+                "expected": expected,
+                "observed": observed,
+                "observed_minus_expected": discrepancy,
+            }
+        )
+    return {
+        "status": "audited",
+        "formula": "initial_times_gamma_power_zero_based_epoch",
+        "update_interval": str(learning_rate["update_interval"]),
+        "entry_count": len(entries),
+        "maximum_absolute_error": max(discrepancies),
+        "first": entries[0],
+        "last": entries[-1],
+    }
+
+
+def _luo2022_trace_summary(
+    trace: dict[str, torch.Tensor],
+    *,
+    pixel_size: float,
+) -> dict[str, Any]:
+    fields = {
+        name: _luo2022_field_summary(field, pixel_size=pixel_size)
+        for name, field in trace.items()
+    }
+    phase_multiply_errors = {
+        "diffuser": _luo2022_phase_multiply_energy_error(
+            trace["before_diffuser"],
+            trace["after_diffuser"],
+        ),
+    }
+    layer_count = sum(name.startswith("after_layer_") for name in trace)
+    for layer_index in range(1, layer_count + 1):
+        phase_multiply_errors[f"layer_{layer_index}"] = _luo2022_phase_multiply_energy_error(
+            trace[f"before_layer_{layer_index}"],
+            trace[f"after_layer_{layer_index}"],
+        )
+    return {
+        "fields": fields,
+        "phase_multiply_mean_relative_energy_error": phase_multiply_errors,
+        "interpretation": (
+            "Propagation energy changes are reported rather than asserted to be zero because "
+            "the frozen FFT implementation center-crops after each propagation segment."
+        ),
+    }
+
+
+def _luo2022_padding_sensitivity(
+    *,
+    model: Luo2022FourLayerD2NN,
+    field: torch.Tensor,
+    diffusers: torch.Tensor,
+    base_output: torch.Tensor,
+    runtime_config: dict[str, Any],
+    contract: dict[str, Any],
+    device: torch.device,
+    pad_factors: tuple[int, ...],
+) -> dict[str, Any]:
+    if not pad_factors or any(factor < 2 for factor in pad_factors):
+        raise ValueError("diagnostic pad factors must all be at least two")
+    reference_norm = base_output.flatten(start_dim=1).norm(dim=1).clamp_min(
+        torch.finfo(base_output.dtype).eps
+    )
+    records: dict[str, Any] = {}
+    original_pad_factor = model.config.pad_factor
+    for pad_factor in tuple(dict.fromkeys(pad_factors)):
+        if pad_factor == original_pad_factor:
+            output = base_output
+        else:
+            optics_config = _luo2022_optics_config_from_frozen_run(
+                runtime_config,
+                contract,
+                pad_factor=pad_factor,
+            )
+            probe_model = Luo2022FourLayerD2NN(optics_config).to(device)
+            with torch.no_grad():
+                probe_model.phase.copy_(model.phase)
+                output = probe_model(field, diffusers)
+        relative_l2 = (
+            (output - base_output).flatten(start_dim=1).norm(dim=1) / reference_norm
+        )
+        output_pcc = pearson_per_image(
+            output.reshape(-1, *output.shape[-2:]),
+            base_output.reshape(-1, *base_output.shape[-2:]),
+        )
+        records[str(pad_factor)] = {
+            "relative_l2_to_pad_factor_" + str(original_pad_factor): _luo2022_tensor_summary(
+                relative_l2
+            ),
+            "pcc_to_pad_factor_" + str(original_pad_factor): _luo2022_tensor_summary(output_pcc),
+        }
+    return {
+        "reference_pad_factor": original_pad_factor,
+        "records": records,
+        "interpretation": (
+            "This is a discrete propagation-window sensitivity probe. It does not select "
+            "a replacement padding policy for the frozen run."
+        ),
+    }
+
+
+def _luo2022_semigroup_probe(
+    field: torch.Tensor,
+    *,
+    optics_config: Luo2022OpticsConfig,
+) -> dict[str, Any]:
+    """Compare two 2 mm segments with one 4 mm segment under the frozen discretization."""
+
+    segment = RayleighSommerfeldPropagator(
+        field_shape=optics_config.field_shape,
+        wavelength=optics_config.wavelength,
+        pixel_size=optics_config.pixel_size,
+        distance=optics_config.layer_distance,
+        pad_factor=optics_config.pad_factor,
+    )
+    combined = RayleighSommerfeldPropagator(
+        field_shape=optics_config.field_shape,
+        wavelength=optics_config.wavelength,
+        pixel_size=optics_config.pixel_size,
+        distance=2.0 * optics_config.layer_distance,
+        pad_factor=optics_config.pad_factor,
+    )
+    two_step = segment.propagate(segment.propagate(field))
+    one_step = combined.propagate(field)
+    denominator = one_step.flatten(start_dim=1).norm(dim=1).clamp_min(
+        torch.finfo(one_step.real.dtype).eps
+    )
+    relative_l2 = (two_step - one_step).flatten(start_dim=1).norm(dim=1) / denominator
+    intensity_pcc = pearson_per_image(
+        _luo2022_complex_intensity(two_step),
+        _luo2022_complex_intensity(one_step),
+    )
+    return {
+        "two_segment_distance_m": optics_config.layer_distance,
+        "single_segment_distance_m": 2.0 * optics_config.layer_distance,
+        "relative_complex_field_l2": _luo2022_tensor_summary(relative_l2),
+        "intensity_pcc": _luo2022_tensor_summary(intensity_pcc),
+        "interpretation": (
+            "A finite-window, center-cropped discrete propagation need not satisfy the "
+            "continuous free-space semigroup identity exactly."
+        ),
+    }
+
+
+def run_luo2022_diagnosis(
+    *,
+    run_dir: Path,
+    diagnostic_output_dir: Path,
+    config_path: Path = DEFAULT_LUO2022_CONFIG,
+    download: bool = False,
+    device_name: str = "cpu",
+    diagnostic_batches: int = 1,
+    diagnostic_diffusers: int = 3,
+    diagnostic_pad_factors: tuple[int, ...] = (2, 3, 4),
+    cross_bank_audit: bool = False,
+) -> dict[str, Any]:
+    """Generate read-only physical and numerical evidence for a frozen R0 run.
+
+    The function deliberately does not prepare, mutate, or resume ``run_dir``.
+    It writes independent diagnostics only after the config, final checkpoint,
+    and completed-run manifest pass an exact provenance check.
+    """
+
+    if diagnostic_batches <= 0 or diagnostic_diffusers <= 0:
+        raise ValueError("diagnostic batches and diffusers must be positive")
+    if not diagnostic_pad_factors or any(factor < 2 for factor in diagnostic_pad_factors):
+        raise ValueError("diagnostic pad factors must be integers of at least two")
+    run_resolved = run_dir.resolve()
+    diagnostic_resolved = diagnostic_output_dir.resolve()
+    if diagnostic_resolved == run_resolved or run_resolved in diagnostic_resolved.parents:
+        raise ValueError("diagnostic output directory must be outside the frozen run directory")
+
+    device = select_device(device_name)
+    frozen = _load_luo2022_frozen_run_artifacts(
+        run_dir=run_dir,
+        config_path=config_path,
+        device=device,
+    )
+    values = frozen.runtime_config["runtime"]
+    target_epochs = int(values["epochs"])
+    requested_diffuser_count = int(diagnostic_diffusers)
+    optics_config = _luo2022_optics_config_from_frozen_run(
+        frozen.runtime_config,
+        frozen.contract,
+    )
+    final_training_path = run_dir / "diffusers" / f"training_epoch_{target_epochs:03d}.pt"
+    if not final_training_path.is_file():
+        raise FileNotFoundError("final training diffuser bank is required for diagnosis")
+    final_training_diffuser_sha256 = _sha256_file(final_training_path)
+    final_training_diffusers = torch.load(
+        final_training_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    expected_training_count = int(values["diffusers_per_epoch"])
+    expected_diffuser_shape = (expected_training_count, *optics_config.field_shape)
+    if tuple(final_training_diffusers.shape) != expected_diffuser_shape:
+        raise ValueError("final training diffuser bank shape does not match frozen runtime configuration")
+
+    diffuser_kwargs = _luo2022_diffuser_kwargs(optics_config, frozen.contract)
+    uniqueness = frozen.contract["diffuser"]["uniqueness"]
+    seed_schedule, seed_schedule_provenance = _luo2022_frozen_diffuser_seed_schedule(
+        frozen.runtime_config,
+        frozen.contract,
+    )
+    new_diffusers = make_unique_correlated_diffusers(
+        int(values["eval_diffusers"]),
+        field_shape=optics_config.field_shape,
+        base_seed=int(seed_schedule["evaluation_base_seed"]),
+        minimum_difference_radians=float(uniqueness["minimum_radians"]),
+        phase_representation=str(uniqueness["phase_representation"]),
+        **diffuser_kwargs,
+    )
+    evaluation_seed_diffuser_sha256 = _sha256_tensor(new_diffusers)
+
+    all_training_diffuser_banks_sha256: str | None = None
+    if cross_bank_audit:
+        all_training_digest = hashlib.sha256()
+        for epoch in range(1, target_epochs + 1):
+            phase_path = run_dir / "diffusers" / f"training_epoch_{epoch:03d}.pt"
+            if not phase_path.is_file():
+                raise FileNotFoundError(
+                    f"training diffuser bank is missing for cross-bank audit epoch {epoch}"
+                )
+            all_training_digest.update(
+                f"{epoch}:{_sha256_file(phase_path)}\n".encode("utf-8")
+            )
+        all_training_diffuser_banks_sha256 = all_training_digest.hexdigest()
+    history_path = run_dir / "history.json"
+    history_sha256 = _sha256_file(history_path) if history_path.is_file() else None
+    diagnostic_spec = {
+        "schema_version": 2,
+        "implementation_version": "luo2022_r0_diagnosis_v2",
+        "diagnostic_batches": int(diagnostic_batches),
+        "diagnostic_diffusers": requested_diffuser_count,
+        "diagnostic_pad_factors": [int(value) for value in diagnostic_pad_factors],
+        "cross_bank_audit": bool(cross_bank_audit),
+        "read_only": True,
+    }
+    fingerprint = {
+        "profile_id": frozen.contract["profile_id"],
+        "source_freeze_version": frozen.contract["freeze_version"],
+        "checkpoint_sha256": frozen.checkpoint_sha256,
+        "runtime_config_sha256": frozen.runtime_config_sha256,
+        "source_config_sha256": frozen.source_config_sha256,
+        "manifest_sha256": frozen.manifest_sha256,
+        "run_state_sha256": frozen.run_state_sha256,
+        "final_training_diffuser_sha256": final_training_diffuser_sha256,
+        "all_training_diffuser_banks_sha256": all_training_diffuser_banks_sha256,
+        "evaluation_seed_diffuser_sha256": evaluation_seed_diffuser_sha256,
+        "history_sha256": history_sha256,
+        "diagnostic_spec": diagnostic_spec,
+    }
+    state_path = diagnostic_output_dir / "diagnostic_state.json"
+    result_path = diagnostic_output_dir / "diagnosis.json"
+    if state_path.is_file():
+        saved_state = load_config(state_path)
+        if saved_state.get("evidence_fingerprint") != fingerprint:
+            raise ValueError("existing diagnostic state does not match the frozen run or request")
+        if saved_state.get("status") == "completed" and result_path.is_file():
+            saved_result = load_config(result_path)
+            if (
+                saved_result.get("status") != "completed"
+                or saved_result.get("read_only") is not True
+                or saved_result.get("evidence_fingerprint") != fingerprint
+            ):
+                raise ValueError("completed diagnostic result does not match its saved state")
+            return saved_result
+        raise ValueError("existing diagnostic state is incomplete; do not overwrite evidence")
+    if result_path.is_file():
+        raise ValueError("diagnostic result exists without a matching diagnostic state")
+
+    model = Luo2022FourLayerD2NN(optics_config).to(device)
+    model.load_state_dict(frozen.checkpoint["model"], strict=True)
+    model.eval()
+    phase_before = model.phase.detach().clone()
+    diagnostic_output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(
+        state_path,
+        {
+            "schema_version": 2,
+            "status": "running",
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+            "read_only": True,
+            "evidence_fingerprint": fingerprint,
+        },
+    )
+    selected_count = min(
+        requested_diffuser_count,
+        int(final_training_diffusers.shape[0]),
+        int(new_diffusers.shape[0]),
+    )
+    if selected_count <= 0:
+        raise ValueError("frozen run contains no diffusers for diagnosis")
+    selected_known = final_training_diffusers[:selected_count]
+    selected_new = new_diffusers[:selected_count]
+    no_diffuser = torch.zeros((1, *optics_config.field_shape), dtype=torch.float32)
+    evaluation_diffusers_device = new_diffusers.to(device)
+
+    final_cross_summary = summarize_cross_diffuser_uniqueness(
+        evaluation_diffusers_device,
+        final_training_diffusers.to(device),
+        phase_representation=str(uniqueness["phase_representation"]),
+        threshold_radians=float(uniqueness["minimum_radians"]),
+    )
+    expected_final_cross_pairs = int(values["eval_diffusers"]) * expected_training_count
+    final_cross_audit = _luo2022_cross_bank_audit_record(
+        final_cross_summary,
+        expected_pair_count=expected_final_cross_pairs,
+        coverage="final_epoch_only",
+    )
+    all_training_cross_summary: dict[str, Any]
+    if cross_bank_audit:
+        summaries: list[dict[str, float | int | str]] = []
+        for epoch in range(1, target_epochs + 1):
+            phase_path = run_dir / "diffusers" / f"training_epoch_{epoch:03d}.pt"
+            training_bank = torch.load(phase_path, map_location="cpu", weights_only=True)
+            if tuple(training_bank.shape) != expected_diffuser_shape:
+                raise ValueError(
+                    f"training diffuser bank at epoch {epoch} does not match frozen runtime shape"
+                )
+            summaries.append(
+                summarize_cross_diffuser_uniqueness(
+                    evaluation_diffusers_device,
+                    training_bank.to(device),
+                    phase_representation=str(uniqueness["phase_representation"]),
+                    threshold_radians=float(uniqueness["minimum_radians"]),
+                )
+            )
+        merged_cross_summary = _luo2022_merge_cross_bank_summaries(summaries)
+        expected_pair_count = (
+            int(values["eval_diffusers"]) * target_epochs * expected_training_count
+        )
+        all_training_cross_summary = _luo2022_cross_bank_audit_record(
+            merged_cross_summary,
+            expected_pair_count=expected_pair_count,
+            coverage="all_training",
+        )
+    else:
+        all_training_cross_summary = {
+            "status": "not_requested",
+            "audit_coverage": "not_requested",
+            "all_pairs_pass_threshold": None,
+            "unseen_certification": "not_certified_full_training_audit_not_requested",
+            "reason": (
+                "Seed namespaces are disjoint, but the new population must not be described "
+                "as phase-audited unseen until every evaluation-to-training diffuser pair is checked."
+            ),
+        }
+
+    seed_everything(int(values["seed"]))
+    eval_base = build_torchvision_dataset(
+        name="MNIST",
+        root=DEFAULT_DATA_ROOT,
+        train=False,
+        image_size=int(frozen.contract["input"]["original_shape"][0]),
+        download=download,
+    )
+    eval_dataset = Subset(eval_base, range(min(int(values["eval_limit"]), len(eval_base))))
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=int(values["batch_size"]),
+        shuffle=False,
+    )
+
+    populations = {
+        "final_epoch_known_sample": selected_known,
+        "evaluation_seed_population_sample": selected_new,
+        "no_diffuser": no_diffuser,
+    }
+    population_batches: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in populations
+    }
+    first_new_field: torch.Tensor | None = None
+    first_new_output: torch.Tensor | None = None
+    first_new_trace: dict[str, torch.Tensor] | None = None
+    first_new_target: torch.Tensor | None = None
+
+    with torch.no_grad():
+        for batch_index, (image, _label) in enumerate(eval_loader):
+            if batch_index >= diagnostic_batches:
+                break
+            target = prepare_luo2022_amplitude(
+                image.to(device),
+                resized_shape=(int(values["input_size"]), int(values["input_size"])),
+                canvas_shape=optics_config.field_shape,
+            )
+            field = amplitude_to_complex_field(target)
+            for population, phases_cpu in populations.items():
+                phases = phases_cpu.to(device)
+                if population == "evaluation_seed_population_sample" and first_new_trace is None:
+                    output, trace = model.forward_with_trace(field, phases)
+                    first_new_field = field
+                    first_new_output = output
+                    first_new_trace = trace
+                    first_new_target = target
+                else:
+                    output = model(field, phases)
+                components = luo2022_d2nn_components_per_pair(output, target)
+                energy_breakdown = luo2022_d2nn_energy_breakdown_per_pair(output, target)
+                population_batches[population].append(
+                    {
+                        "batch_index": batch_index,
+                        "object_count": int(target.shape[0]),
+                        "diffuser_count": int(phases.shape[0]),
+                        "frozen_loss_components": {
+                            name: float(value.mean().detach().cpu())
+                            for name, value in components.items()
+                        },
+                        "energy_breakdown": {
+                            name: _luo2022_tensor_summary(value)
+                            for name, value in energy_breakdown.items()
+                        },
+                        "roi_metrics": _luo2022_roi_metrics(
+                            output,
+                            target,
+                            input_size=int(values["input_size"]),
+                        ),
+                        "loss_scale_sensitivity": _luo2022_loss_scale_summary(output, target),
+                    }
+                )
+
+        if (
+            first_new_field is None
+            or first_new_output is None
+            or first_new_trace is None
+            or first_new_target is None
+        ):
+            raise ValueError("evaluation loader yielded no diagnostic batches")
+        zero_phase_model = Luo2022FourLayerD2NN(optics_config).to(device).eval()
+        zero_phase_output = zero_phase_model(first_new_field, selected_new.to(device))
+        zero_phase_components = luo2022_d2nn_components_per_pair(
+            zero_phase_output,
+            first_new_target,
+        )
+        zero_phase_reference = {
+            "frozen_checkpoint_phase_l2": float(model.phase.detach().square().sum().sqrt().cpu()),
+            "components": {
+                name: float(value.mean().detach().cpu())
+                for name, value in zero_phase_components.items()
+            },
+            "roi_metrics": _luo2022_roi_metrics(
+                zero_phase_output,
+                first_new_target,
+                input_size=int(values["input_size"]),
+            ),
+            "claim_boundary": (
+                "This is a zero-phase four-layer network control, not an ideal free-space "
+                "reference: it retains the frozen sequence of finite-window propagations."
+            ),
+        }
+        padding_sensitivity = _luo2022_padding_sensitivity(
+            model=model,
+            field=first_new_field,
+            diffusers=selected_new.to(device),
+            base_output=first_new_output,
+            runtime_config=frozen.runtime_config,
+            contract=frozen.contract,
+            device=device,
+            pad_factors=diagnostic_pad_factors,
+        )
+        semigroup = _luo2022_semigroup_probe(
+            first_new_field[:1],
+            optics_config=optics_config,
+        )
+        trace_summary = _luo2022_trace_summary(
+            first_new_trace,
+            pixel_size=optics_config.pixel_size,
+        )
+
+    result = {
+        "schema_version": 2,
+        "status": "completed",
+        "completed_at_utc": datetime.now(UTC).isoformat(),
+        "read_only": True,
+        "evidence_fingerprint": fingerprint,
+        "diagnostic_spec": diagnostic_spec,
+        "source_run": {
+            "profile_id": frozen.manifest["profile_id"],
+            "source_freeze_version": frozen.contract["freeze_version"],
+            "checkpoint": "checkpoints/luo2022_d2nn.pt",
+            "git": frozen.manifest.get("runtime", {}).get("git"),
+        },
+        "artifact_integrity": {
+            "completed_run_state_required": True,
+            "checkpoint_sha256": frozen.checkpoint_sha256,
+            "runtime_config_sha256": frozen.runtime_config_sha256,
+            "source_config_sha256": frozen.source_config_sha256,
+            "manifest_sha256": frozen.manifest_sha256,
+            "run_state_sha256": frozen.run_state_sha256,
+            "final_training_diffuser_sha256": final_training_diffuser_sha256,
+            "all_training_diffuser_banks_sha256": all_training_diffuser_banks_sha256,
+            "evaluation_seed_diffuser_sha256": evaluation_seed_diffuser_sha256,
+            "history_sha256": history_sha256,
+            "source_config_integrity": frozen.source_config_integrity,
+            "model_phase_unchanged": bool(torch.equal(model.phase.detach(), phase_before)),
+        },
+        "diffusers": {
+            "frozen_contract": {
+                "gaussian_sigma_lambda": frozen.contract["diffuser"]["gaussian_sigma_lambda"],
+                "finite_kernel": frozen.contract["diffuser"]["finite_kernel_choice"],
+                "uniqueness": uniqueness,
+                "r0_acceptance_correlation_estimator": frozen.contract["diffuser"][
+                    "correlation_estimator"
+                ],
+                "seed_schedule": seed_schedule,
+                "seed_schedule_provenance": seed_schedule_provenance,
+            },
+            "selection": {
+                "batch_forward_diagnostic_requested_count_per_population": requested_diffuser_count,
+                "batch_forward_diagnostic_selected_count_per_population": selected_count,
+                "batch_forward_known_source": f"final training epoch {target_epochs}",
+                "batch_forward_evaluation_source": "frozen evaluation seed schedule",
+                "full_final_epoch_training_diffuser_count": int(
+                    final_training_diffusers.shape[0]
+                ),
+                "full_evaluation_seed_diffuser_count": int(new_diffusers.shape[0]),
+            },
+            "known_final_epoch": _luo2022_diffuser_statistics(
+                final_training_diffusers,
+                optics_config=optics_config,
+            ),
+            "evaluation_seed_population": _luo2022_diffuser_statistics(
+                new_diffusers,
+                optics_config=optics_config,
+            ),
+            "known_final_epoch_internal_uniqueness": (
+                summarize_diffuser_bank_uniqueness(
+                    final_training_diffusers,
+                    phase_representation=str(uniqueness["phase_representation"]),
+                    threshold_radians=float(uniqueness["minimum_radians"]),
+                )
+                if final_training_diffusers.shape[0] > 1
+                else {"status": "not_applicable_for_one_diffuser"}
+            ),
+            "evaluation_seed_population_internal_uniqueness": (
+                summarize_diffuser_bank_uniqueness(
+                    new_diffusers,
+                    phase_representation=str(uniqueness["phase_representation"]),
+                    threshold_radians=float(uniqueness["minimum_radians"]),
+                )
+                if new_diffusers.shape[0] > 1
+                else {"status": "not_applicable_for_one_diffuser"}
+            ),
+            "evaluation_seed_vs_final_epoch_training": final_cross_audit,
+            "evaluation_seed_vs_all_training": all_training_cross_summary,
+            "interpretation": (
+                "The unwrapped phase autocorrelation is the closest available numerical "
+                "reading of the paper's wording. The complex-transmittance autocorrelation "
+                "is separately reported because it is the frozen R0 acceptance estimator."
+            ),
+        },
+        "batch_level_forward_diagnostics": {
+            "scope": (
+                "These are fixed-prefix forward diagnostics over selected diffuser samples; "
+                "they are not the full-population performance evaluation."
+            ),
+            "populations": population_batches,
+        },
+        "trace_evaluation_seed_population_first_batch": trace_summary,
+        "zero_phase_four_layer_reference": zero_phase_reference,
+        "propagation_window_sensitivity": {
+            "padding": padding_sensitivity,
+            "two_step_vs_one_step": semigroup,
+        },
+        "learning_rate_audit": _luo2022_learning_rate_audit(
+            run_dir=run_dir,
+            contract=frozen.contract,
+        ),
+        "claim_boundary": (
+            "Read-only diagnostics for a frozen digital R0 checkpoint. The output identifies "
+            "implementation sensitivities and does not itself establish a closer paper reproduction, "
+            "physical hardware validity, or a performance improvement."
+        ),
+    }
+    write_json(result_path, result)
+    write_json(
+        state_path,
+        {
+            "schema_version": 2,
+            "status": "completed",
+            "completed_at_utc": result["completed_at_utc"],
+            "read_only": True,
+            "evidence_fingerprint": fingerprint,
+            "result": "diagnosis.json",
+        },
+    )
+    return result
 
 
 def _load_luo2022_posthoc_rows(

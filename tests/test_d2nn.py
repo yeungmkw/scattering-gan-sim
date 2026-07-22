@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from PIL import Image
+import pytest
 import torch
 
 from d2nn import (
@@ -26,6 +27,7 @@ from d2nn import (
     make_correlated_diffuser_phase,
     make_random_phase_screen,
     make_unique_correlated_diffusers,
+    summarize_cross_diffuser_uniqueness,
     summarize_diffuser_bank_uniqueness,
 )
 from experiment import run_d2nn_inspection
@@ -350,6 +352,125 @@ def test_luo2022_four_layer_path_updates_all_phase_layers() -> None:
     assert model.phase.shape == (4, 48, 48)
     assert model.phase.grad is not None
     assert torch.all(model.phase.grad.flatten(start_dim=1).abs().sum(dim=1) > 0)
+
+
+def test_luo2022_forward_trace_matches_forward_and_phase_masks_preserve_energy() -> None:
+    config = Luo2022OpticsConfig(field_shape=(48, 48))
+    model = Luo2022FourLayerD2NN(config)
+    field = amplitude_to_complex_field(torch.rand(2, 1, 48, 48))
+    diffusers = make_unique_correlated_diffusers(
+        2,
+        field_shape=config.field_shape,
+        base_seed=17,
+        wavelength=config.wavelength,
+        pixel_size=config.pixel_size,
+    )
+
+    output = model(field, diffusers)
+    traced_output, trace = model.forward_with_trace(field, diffusers)
+
+    assert torch.allclose(traced_output, output, rtol=0.0, atol=0.0)
+
+    def energy(value: torch.Tensor) -> torch.Tensor:
+        return (value.real.square() + value.imag.square()).sum(dim=(-2, -1))
+
+    assert torch.allclose(
+        energy(trace["before_diffuser"])[:, None],
+        energy(trace["after_diffuser"]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    for layer_index in range(1, config.num_layers + 1):
+        assert torch.allclose(
+            energy(trace[f"before_layer_{layer_index}"]),
+            energy(trace[f"after_layer_{layer_index}"]),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+
+def test_luo2022_phase_initialization_is_checkpoint_compatible_and_seeded() -> None:
+    config = Luo2022OpticsConfig(field_shape=(32, 32))
+    default_model = Luo2022FourLayerD2NN(config)
+    explicit_zero_model = Luo2022FourLayerD2NN(config, phase_initialization="zero")
+    random_a = Luo2022FourLayerD2NN(
+        config,
+        phase_initialization="uniform_0_to_2pi",
+        phase_seed=9,
+    )
+    random_b = Luo2022FourLayerD2NN(
+        config,
+        phase_initialization="uniform_0_to_2pi",
+        phase_seed=9,
+    )
+    random_c = Luo2022FourLayerD2NN(
+        config,
+        phase_initialization="uniform_0_to_2pi",
+        phase_seed=10,
+    )
+
+    assert torch.count_nonzero(default_model.phase) == 0
+    assert torch.equal(default_model.phase, explicit_zero_model.phase)
+    default_model.load_state_dict(explicit_zero_model.state_dict(), strict=True)
+    assert torch.equal(random_a.phase, random_b.phase)
+    assert not torch.equal(random_a.phase, random_c.phase)
+    assert float(random_a.phase.detach().min()) >= 0.0
+    assert float(random_a.phase.detach().max()) < float(2.0 * torch.pi)
+
+
+def test_cross_diffuser_uniqueness_audits_all_cross_bank_pairs() -> None:
+    left = torch.tensor(
+        [
+            [[0.0, 1.0], [2.0, 3.0]],
+            [[1.0, 3.0], [5.0, 7.0]],
+        ]
+    )
+    right = torch.tensor(
+        [
+            [[3.0, 2.0], [1.0, 0.0]],
+            [[0.0, 2.0], [1.0, 4.0]],
+            [[4.0, 1.0], [6.0, 2.0]],
+        ]
+    )
+    threshold = 0.6
+
+    summary = summarize_cross_diffuser_uniqueness(
+        left,
+        right,
+        phase_representation="unwrapped",
+        threshold_radians=threshold,
+        block_size=1,
+    )
+    expected = torch.tensor(
+        [
+            diffuser_phase_difference(
+                left[left_index],
+                right[right_index],
+                phase_representation="unwrapped",
+            )
+            for left_index in range(left.shape[0])
+            for right_index in range(right.shape[0])
+        ]
+    )
+
+    assert summary["pair_count"] == 6
+    assert summary["minimum_radians"] == float(expected.min())
+    assert summary["maximum_radians"] == float(expected.max())
+    assert summary["mean_radians"] == float(expected.mean())
+    assert summary["pass_count"] == int((expected > threshold).sum())
+
+
+def test_cross_diffuser_uniqueness_requires_matching_device_and_dtype() -> None:
+    left = torch.zeros(1, 2, 2, dtype=torch.float32)
+    right = torch.zeros(1, 2, 2, dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="same dtype"):
+        summarize_cross_diffuser_uniqueness(
+            left,
+            right,
+            phase_representation="unwrapped",
+            threshold_radians=0.0,
+        )
 
 
 def test_d2nn_inspection_saves_required_artifacts_for_phase_and_particles(tmp_path: Path) -> None:

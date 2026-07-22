@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -131,6 +132,48 @@ def test_d2nn_cli_exposes_luo2022_posthoc_evaluation() -> None:
     assert args.diffuser_chunk_size == 2
 
 
+def test_d2nn_cli_exposes_read_only_luo2022_diagnosis() -> None:
+    args = experiment.build_parser().parse_args(
+        [
+            "d2nn",
+            "--profile",
+            "luo2022_r0",
+            "--action",
+            "diagnose",
+            "--run-dir",
+            "outputs/frozen_run",
+            "--diagnostic-output-dir",
+            "outputs/independent_evidence",
+            "--diagnostic-batches",
+            "2",
+            "--diagnostic-diffusers",
+            "4",
+            "--diagnostic-pad-factors",
+            "2",
+            "4",
+            "--diagnostic-cross-bank-audit",
+        ]
+    )
+
+    assert args.action == "diagnose"
+    assert args.run_dir == Path("outputs/frozen_run")
+    assert args.diagnostic_output_dir == Path("outputs/independent_evidence")
+    assert args.diagnostic_batches == 2
+    assert args.diagnostic_diffusers == 4
+    assert args.diagnostic_pad_factors == [2, 4]
+    assert args.diagnostic_cross_bank_audit is True
+
+
+def test_luo2022_diagnosis_rejects_output_inside_frozen_run(tmp_path: Path) -> None:
+    run_dir = tmp_path / "frozen"
+
+    with pytest.raises(ValueError, match="outside the frozen run"):
+        experiment.run_luo2022_diagnosis(
+            run_dir=run_dir,
+            diagnostic_output_dir=run_dir / "diagnosis",
+        )
+
+
 def test_luo2022_runtime_config_labels_and_controls_small_overrides() -> None:
     contract = experiment.load_config(experiment.DEFAULT_LUO2022_CONFIG)
 
@@ -192,6 +235,179 @@ def test_luo2022_diffuser_seed_schedule_rejects_training_evaluation_overlap() ->
             training_stride=100_000,
             evaluation_offset=10_000_000,
         )
+
+
+def test_frozen_diffuser_seed_schedule_requires_or_validates_isolation_evidence() -> None:
+    contract = experiment.load_config(experiment.DEFAULT_LUO2022_CONFIG)
+    runtime_config = experiment.build_luo2022_runtime_config(
+        contract,
+        small_run=True,
+        device=torch.device("cpu"),
+        epochs=2,
+        train_limit=8,
+    )
+
+    schedule, provenance = experiment._luo2022_frozen_diffuser_seed_schedule(
+        runtime_config,
+        contract,
+    )
+    assert provenance == "validated_runtime_copy"
+    assert schedule["training_stride"] == 100_000
+    assert schedule["evaluation_offset"] == 1_000_000_000
+
+    without_runtime_copy = deepcopy(runtime_config)
+    without_runtime_copy.pop("diffuser_seed_schedule")
+    derived, derived_provenance = experiment._luo2022_frozen_diffuser_seed_schedule(
+        without_runtime_copy,
+        contract,
+    )
+    assert derived_provenance == "derived_from_frozen_source_config"
+    assert derived == schedule
+
+    inconsistent_runtime = deepcopy(runtime_config)
+    inconsistent_runtime["diffuser_seed_schedule"]["evaluation_base_seed"] = 7
+    with pytest.raises(ValueError, match="does not match"):
+        experiment._luo2022_frozen_diffuser_seed_schedule(inconsistent_runtime, contract)
+
+    pre_isolation_contract = deepcopy(contract)
+    pre_isolation_contract["training"].pop("diffuser_seed_schedule")
+    pre_isolation_contract["evaluation"].pop("diffuser_seed_schedule")
+    with pytest.raises(ValueError, match="cannot be certified"):
+        experiment._luo2022_frozen_diffuser_seed_schedule(without_runtime_copy, pre_isolation_contract)
+
+
+def _write_completed_luo2022_run_fixture(run_dir: Path) -> tuple[dict, dict]:
+    contract = experiment.load_config(experiment.DEFAULT_LUO2022_CONFIG)
+    runtime_config = experiment.build_luo2022_runtime_config(
+        contract,
+        small_run=True,
+        device=torch.device("cpu"),
+        epochs=2,
+        train_limit=8,
+    )
+    checkpoint_path = run_dir / "checkpoints" / "luo2022_d2nn.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+    write_json(run_dir / "config.json", runtime_config)
+    write_json(run_dir / "source_config.json", contract)
+    source_config_sha256 = experiment._sha256_file(run_dir / "source_config.json")
+    optics_config = experiment._luo2022_optics_config_from_frozen_run(runtime_config, contract)
+    model = experiment.Luo2022FourLayerD2NN(optics_config)
+    write_json(
+        run_dir / "manifest.json",
+        {
+            "profile_id": contract["profile_id"],
+            "source_freeze_version": contract["freeze_version"],
+            "source_config_sha256": source_config_sha256,
+        },
+    )
+    write_json(
+        run_dir / "run_state.json",
+        {
+            "status": "completed",
+            "target_epochs": 2,
+            "completed_epoch": 2,
+        },
+    )
+    torch.save(
+        {
+            "source_freeze_version": contract["freeze_version"],
+            "runtime_config": runtime_config,
+            "source_config_sha256": source_config_sha256,
+            "model": model.state_dict(),
+        },
+        checkpoint_path,
+    )
+    return contract, runtime_config
+
+
+def test_luo2022_diagnosis_loader_requires_run_local_completed_contract(tmp_path: Path) -> None:
+    run_dir = tmp_path / "completed"
+    contract, runtime_config = _write_completed_luo2022_run_fixture(run_dir)
+
+    artifacts = experiment._load_luo2022_frozen_run_artifacts(
+        run_dir=run_dir,
+        config_path=experiment.DEFAULT_LUO2022_CONFIG,
+        device=torch.device("cpu"),
+    )
+
+    assert artifacts.contract == contract
+    assert artifacts.runtime_config == runtime_config
+    assert artifacts.run_state_sha256
+    assert artifacts.source_config_integrity == "sha256_bound_by_manifest_and_checkpoint"
+
+    write_json(
+        run_dir / "run_state.json",
+        {
+            "status": "completed",
+            "target_epochs": 2,
+            "completed_epoch": 1,
+        },
+    )
+    with pytest.raises(ValueError, match="epoch does not match"):
+        experiment._load_luo2022_frozen_run_artifacts(
+            run_dir=run_dir,
+            config_path=experiment.DEFAULT_LUO2022_CONFIG,
+            device=torch.device("cpu"),
+        )
+
+    write_json(
+        run_dir / "run_state.json",
+        {
+            "status": "completed",
+            "target_epochs": 2,
+            "completed_epoch": 2,
+        },
+    )
+    changed_contract = deepcopy(contract)
+    changed_contract["geometry"]["layer_to_layer_m"] = 0.003
+    write_json(run_dir / "source_config.json", changed_contract)
+    changed_hash = experiment._sha256_file(run_dir / "source_config.json")
+    write_json(
+        run_dir / "manifest.json",
+        {
+            "profile_id": contract["profile_id"],
+            "source_freeze_version": contract["freeze_version"],
+            "source_config_sha256": changed_hash,
+        },
+    )
+    checkpoint_path = run_dir / "checkpoints" / "luo2022_d2nn.pt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    checkpoint["source_config_sha256"] = changed_hash
+    torch.save(checkpoint, checkpoint_path)
+    changed_config_path = tmp_path / "changed_source_config.json"
+    write_json(changed_config_path, changed_contract)
+    with pytest.raises(ValueError, match="immutable fields"):
+        experiment._load_luo2022_frozen_run_artifacts(
+            run_dir=run_dir,
+            config_path=changed_config_path,
+            device=torch.device("cpu"),
+        )
+
+    (run_dir / "source_config.json").unlink()
+    with pytest.raises(FileNotFoundError, match="frozen source config"):
+        experiment._load_luo2022_frozen_run_artifacts(
+            run_dir=run_dir,
+            config_path=experiment.DEFAULT_LUO2022_CONFIG,
+            device=torch.device("cpu"),
+        )
+
+
+def test_luo2022_diagnosis_rejects_invalid_checkpoint_before_writing_state(tmp_path: Path) -> None:
+    run_dir = tmp_path / "completed"
+    _write_completed_luo2022_run_fixture(run_dir)
+    checkpoint_path = run_dir / "checkpoints" / "luo2022_d2nn.pt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    checkpoint["model"] = {"not_a_phase_parameter": torch.zeros(1)}
+    torch.save(checkpoint, checkpoint_path)
+    diagnostic_output_dir = tmp_path / "independent_diagnosis"
+
+    with pytest.raises(ValueError, match="model state"):
+        experiment.run_luo2022_diagnosis(
+            run_dir=run_dir,
+            diagnostic_output_dir=diagnostic_output_dir,
+        )
+
+    assert not diagnostic_output_dir.exists()
 
 
 def test_luo2022_diffuser_chunking_preserves_one_optimizer_update() -> None:

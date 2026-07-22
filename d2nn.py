@@ -527,6 +527,78 @@ def summarize_diffuser_bank_uniqueness(
     }
 
 
+def summarize_cross_diffuser_uniqueness(
+    left_phases: torch.Tensor,
+    right_phases: torch.Tensor,
+    *,
+    phase_representation: str,
+    threshold_radians: float,
+    block_size: int = 32,
+) -> dict[str, float | int | str]:
+    """Exactly summarize paper-style phase distances between two diffuser banks.
+
+    Unlike :func:`summarize_diffuser_bank_uniqueness`, every cross-bank pair is
+    included. This supports a post-hoc audit of whether held-out evaluation
+    diffusers are distinct from all training diffusers under the frozen phase
+    representation and threshold.
+    """
+
+    if (
+        left_phases.ndim != 3
+        or right_phases.ndim != 3
+        or torch.is_complex(left_phases)
+        or torch.is_complex(right_phases)
+        or tuple(left_phases.shape[-2:]) != tuple(right_phases.shape[-2:])
+    ):
+        raise ValueError("diffuser banks must be real tensors with matching (count, height, width)")
+    if left_phases.shape[0] == 0 or right_phases.shape[0] == 0:
+        raise ValueError("diffuser banks must each contain at least one phase")
+    if left_phases.device != right_phases.device:
+        raise ValueError("cross-bank diffuser tensors must be on the same device")
+    if left_phases.dtype != right_phases.dtype:
+        raise ValueError("cross-bank diffuser tensors must use the same dtype")
+    if threshold_radians < 0 or block_size <= 0:
+        raise ValueError("uniqueness settings are invalid")
+
+    def centered_vectors(phases: torch.Tensor) -> torch.Tensor:
+        represented = represent_diffuser_phase(phases, mode=phase_representation)
+        centered = represented - represented.mean(dim=(-2, -1), keepdim=True)
+        return centered.flatten(start_dim=1).contiguous()
+
+    left_vectors = centered_vectors(left_phases)
+    right_vectors = centered_vectors(right_phases)
+    pixel_count = int(left_vectors.shape[1])
+    pair_count = 0
+    pass_count = 0
+    difference_sum = 0.0
+    minimum = float("inf")
+    maximum = float("-inf")
+
+    for left_start in range(0, int(left_vectors.shape[0]), block_size):
+        left = left_vectors[left_start : left_start + block_size]
+        for right_start in range(0, int(right_vectors.shape[0]), block_size):
+            right = right_vectors[right_start : right_start + block_size]
+            differences = torch.cdist(left, right, p=1).flatten() / pixel_count
+            pair_count += int(differences.numel())
+            pass_count += int((differences > threshold_radians).sum())
+            difference_sum += float(differences.sum(dtype=torch.float64))
+            minimum = min(minimum, float(differences.min()))
+            maximum = max(maximum, float(differences.max()))
+
+    expected_pair_count = int(left_phases.shape[0]) * int(right_phases.shape[0])
+    if pair_count != expected_pair_count:
+        raise RuntimeError("cross-bank diffuser audit did not cover every pair")
+    return {
+        "phase_representation": phase_representation,
+        "pair_count": pair_count,
+        "minimum_radians": minimum,
+        "mean_radians": difference_sum / pair_count,
+        "maximum_radians": maximum,
+        "pass_count": pass_count,
+        "pair_pass_fraction": pass_count / pair_count,
+    }
+
+
 def estimate_phase_correlation_length(
     phase: torch.Tensor,
     *,
@@ -741,10 +813,27 @@ def make_unique_correlated_diffusers(
 class Luo2022FourLayerD2NN(nn.Module):
     """Trainable phase-only D2NN implementing paper equations (6)-(10)."""
 
-    def __init__(self, config: Luo2022OpticsConfig) -> None:
+    def __init__(
+        self,
+        config: Luo2022OpticsConfig,
+        *,
+        phase_initialization: str = "zero",
+        phase_seed: int = 0,
+    ) -> None:
         super().__init__()
         self.config = config
-        self.phase = nn.Parameter(torch.zeros((config.num_layers, *config.field_shape)))
+        if phase_initialization == "zero":
+            initial_phase = torch.zeros((config.num_layers, *config.field_shape))
+        elif phase_initialization == "uniform_0_to_2pi":
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(phase_seed))
+            initial_phase = 2.0 * torch.pi * torch.rand(
+                (config.num_layers, *config.field_shape),
+                generator=generator,
+            )
+        else:
+            raise ValueError("phase_initialization must be 'zero' or 'uniform_0_to_2pi'")
+        self.phase = nn.Parameter(initial_phase)
         propagation_kwargs = {
             "field_shape": config.field_shape,
             "wavelength": config.wavelength,
@@ -781,21 +870,73 @@ class Luo2022FourLayerD2NN(nn.Module):
     def forward(self, object_field: torch.Tensor, diffuser_phase: torch.Tensor) -> torch.Tensor:
         """Return raw detector intensity with shape ``(B, n, H, W)``."""
 
-        distorted = self.distort(object_field, diffuser_phase)
+        output, _trace = self._forward_fields(
+            object_field,
+            diffuser_phase,
+            collect_trace=False,
+        )
+        return output
+
+    def forward_with_trace(
+        self,
+        object_field: torch.Tensor,
+        diffuser_phase: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return raw intensity and intermediate fields from the exact forward path.
+
+        This is a diagnostic helper. It retains no extra model state and does
+        not modify the frozen R0 configuration or parameters.
+        """
+
+        return self._forward_fields(
+            object_field,
+            diffuser_phase,
+            collect_trace=True,
+        )
+
+    def _forward_fields(
+        self,
+        object_field: torch.Tensor,
+        diffuser_phase: torch.Tensor,
+        *,
+        collect_trace: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        validate_complex_field(object_field, expected_shape=self.config.field_shape)
+        if diffuser_phase.ndim != 3 or tuple(diffuser_phase.shape[-2:]) != self.config.field_shape:
+            raise ValueError("diffuser_phase must have shape (diffusers, height, width)")
+
+        trace: dict[str, torch.Tensor] = {}
+        incident = self.object_to_diffuser.propagate(object_field)
+        phase = diffuser_phase.to(device=object_field.device, dtype=object_field.real.dtype)
+        distorted = incident[:, None] * torch.exp(1j * phase[None])
+        if collect_trace:
+            trace["object_field"] = object_field
+            trace["before_diffuser"] = incident
+            trace["after_diffuser"] = distorted
+
         batch_size, diffuser_count = distorted.shape[:2]
         field = distorted.flatten(0, 1)
         field = self.diffuser_to_first_layer.propagate(field)
-        phase = self.phase.to(device=field.device, dtype=field.real.dtype)
+        if collect_trace:
+            trace["before_layer_1"] = field
+        layer_phase = self.phase.to(device=field.device, dtype=field.real.dtype)
         for layer_index in range(self.config.num_layers):
-            field = field * torch.exp(1j * phase[layer_index])
+            field = field * torch.exp(1j * layer_phase[layer_index])
+            if collect_trace:
+                trace[f"after_layer_{layer_index + 1}"] = field
             if layer_index + 1 < self.config.num_layers:
                 field = self.between_layers.propagate(field)
+                if collect_trace:
+                    trace[f"before_layer_{layer_index + 2}"] = field
         output_field = self.last_layer_to_output.propagate(field)
-        return field_intensity(output_field).reshape(
+        if collect_trace:
+            trace["detector_field"] = output_field
+        output = field_intensity(output_field).reshape(
             batch_size,
             diffuser_count,
             *self.config.field_shape,
         )
+        return output, trace
 
 
 def validate_complex_field(field: torch.Tensor, expected_shape: tuple[int, int] | None = None) -> None:

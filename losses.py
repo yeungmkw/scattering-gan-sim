@@ -68,6 +68,94 @@ def pearson_per_image(prediction: torch.Tensor, target: torch.Tensor, *, eps: fl
     return numerator / denominator
 
 
+def masked_pearson_per_image(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Return one Pearson coefficient per pair over an explicit binary ROI."""
+
+    if prediction.shape != target.shape or prediction.shape != mask.shape:
+        raise ValueError("prediction, target, and mask must have matching shapes")
+    if prediction.ndim < 2:
+        raise ValueError("prediction, target, and mask must include a spatial dimension")
+    weights = mask.to(dtype=prediction.dtype)
+    flat_prediction = prediction.flatten(start_dim=1)
+    flat_target = target.flatten(start_dim=1)
+    flat_weights = weights.flatten(start_dim=1)
+    weight_sum = flat_weights.sum(dim=1, keepdim=True).clamp_min(eps)
+    prediction_mean = (flat_prediction * flat_weights).sum(dim=1, keepdim=True) / weight_sum
+    target_mean = (flat_target * flat_weights).sum(dim=1, keepdim=True) / weight_sum
+    prediction_centered = (flat_prediction - prediction_mean) * flat_weights
+    target_centered = (flat_target - target_mean) * flat_weights
+    numerator = (prediction_centered * target_centered).sum(dim=1)
+    denominator = (
+        prediction_centered.square().sum(dim=1).sqrt()
+        * target_centered.square().sum(dim=1).sqrt()
+    ).clamp_min(eps)
+    return numerator / denominator
+
+
+def _normalize_luo2022_target(
+    output_intensity: torch.Tensor,
+    target_amplitude: torch.Tensor,
+    *,
+    alpha: float,
+    beta: float,
+) -> torch.Tensor:
+    if output_intensity.ndim != 4:
+        raise ValueError("output_intensity must have shape (B, n, H, W)")
+    if target_amplitude.ndim == 4 and target_amplitude.shape[1] == 1:
+        target_amplitude = target_amplitude[:, 0]
+    if target_amplitude.ndim != 3:
+        raise ValueError("target_amplitude must have shape (B, H, W) or (B, 1, H, W)")
+    if output_intensity.shape[0] != target_amplitude.shape[0]:
+        raise ValueError("output and target batch dimensions must match")
+    if output_intensity.shape[-2:] != target_amplitude.shape[-2:]:
+        raise ValueError("output and target spatial dimensions must match")
+    if alpha < 0 or beta < 0:
+        raise ValueError("alpha and beta must be non-negative")
+    return target_amplitude
+
+
+def luo2022_d2nn_energy_breakdown_per_pair(
+    output_intensity: torch.Tensor,
+    target_amplitude: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Return equation (12) terms for each object-diffuser pair.
+
+    This diagnostic helper preserves the historical four-key public result of
+    :func:`luo2022_d2nn_components_per_pair` while making its energy balance
+    inspectable.
+    """
+
+    target_amplitude = _normalize_luo2022_target(
+        output_intensity,
+        target_amplitude,
+        alpha=alpha,
+        beta=beta,
+    )
+    support = (target_amplitude > 0).to(dtype=output_intensity.dtype)
+    support = support[:, None].expand_as(output_intensity)
+    support_pixels = support.sum(dim=(-2, -1)).clamp_min(eps)
+    outside_sum = ((1.0 - support) * output_intensity).sum(dim=(-2, -1))
+    inside_sum = (support * output_intensity).sum(dim=(-2, -1))
+    outside_per_support_pixel = outside_sum / support_pixels
+    inside_per_support_pixel = inside_sum / support_pixels
+    return {
+        "outside_per_support_pixel": outside_per_support_pixel,
+        "inside_per_support_pixel": inside_per_support_pixel,
+        "support_pixels": support_pixels,
+        "energy": (alpha * outside_sum - beta * inside_sum) / support_pixels,
+    }
+
+
 def luo2022_d2nn_loss(
     output_intensity: torch.Tensor,
     target_amplitude: torch.Tensor,
@@ -127,13 +215,13 @@ def luo2022_d2nn_components_per_pair(
     flat_target = expanded_target.reshape_as(flat_output)
     pearson = pearson_per_image(flat_output, flat_target, eps=eps)
 
-    support = (target_amplitude > 0).to(dtype=output_intensity.dtype)
-    support = support[:, None].expand_as(output_intensity)
-    support_pixels = support.sum(dim=(-2, -1)).clamp_min(eps)
-    energy = (
-        alpha * ((1.0 - support) * output_intensity).sum(dim=(-2, -1))
-        - beta * (support * output_intensity).sum(dim=(-2, -1))
-    ) / support_pixels
+    energy = luo2022_d2nn_energy_breakdown_per_pair(
+        output_intensity,
+        target_amplitude,
+        alpha=alpha,
+        beta=beta,
+        eps=eps,
+    )["energy"]
     negative_pearson = -pearson.reshape(batch_size, diffuser_count)
     return {
         "total": negative_pearson + energy,
