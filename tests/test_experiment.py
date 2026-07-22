@@ -837,11 +837,72 @@ def test_luo2022_control_ladder_isolated_resume_and_trained_regression(
     evidence_dir = tmp_path / "independent_control_evidence"
     final_training_bank = diffuser_dir / "training_epoch_002.pt"
     final_training_bank_sha256_before = experiment._sha256_file(final_training_bank)
+    final_training_bank_bytes = final_training_bank.read_bytes()
+    checkpoint_bytes = checkpoint_path.read_bytes()
+    legacy_rows_path = run_dir / "posthoc_evaluation" / "per_diffuser_metrics.jsonl"
+    legacy_rows_bytes = legacy_rows_path.read_bytes()
     original_evaluator = experiment._evaluate_luo2022_forward_per_diffuser
+    original_direct_operator = (
+        experiment.Luo2022FourLayerD2NN.forward_without_diffractive_layers
+    )
+    original_four_layer_operator = experiment.Luo2022FourLayerD2NN.forward
+    operator_calls: set[str] = set()
+    routed_controls: list[str] = []
+
+    def track_direct_operator(
+        optical_model: experiment.Luo2022FourLayerD2NN,
+        object_field: torch.Tensor,
+        diffuser_phase: torch.Tensor,
+    ) -> torch.Tensor:
+        operator_calls.add("direct_free_space_no_d2nn")
+        return original_direct_operator(optical_model, object_field, diffuser_phase)
+
+    def track_four_layer_operator(
+        optical_model: experiment.Luo2022FourLayerD2NN,
+        object_field: torch.Tensor,
+        diffuser_phase: torch.Tensor,
+    ) -> torch.Tensor:
+        operator_calls.add(
+            (
+                "zero_phase_four_layer"
+                if torch.count_nonzero(optical_model.phase).item() == 0
+                else "trained_four_layer"
+            )
+        )
+        return original_four_layer_operator(optical_model, object_field, diffuser_phase)
+
+    monkeypatch.setattr(
+        experiment.Luo2022FourLayerD2NN,
+        "forward_without_diffractive_layers",
+        track_direct_operator,
+    )
+    monkeypatch.setattr(
+        experiment.Luo2022FourLayerD2NN,
+        "forward",
+        track_four_layer_operator,
+    )
+
+    def classify_c0_forward(forward: object) -> str:
+        if getattr(forward, "__func__", None) is track_direct_operator:
+            return "direct_free_space_no_d2nn"
+        phase = getattr(forward, "phase", None)
+        if not isinstance(phase, torch.Tensor):
+            pytest.fail("C0 evaluator received an unrecognized forward operator")
+        return (
+            "zero_phase_four_layer"
+            if torch.count_nonzero(phase).item() == 0
+            else "trained_four_layer"
+        )
+
+    def record_c0_forward_route(args: tuple[object, ...]) -> None:
+        assert args
+        routed_controls.append(classify_c0_forward(args[0]))
+
     evaluation_calls = 0
 
     def interrupt_after_direct_training(*args: object, **kwargs: object) -> object:
         nonlocal evaluation_calls
+        record_c0_forward_route(args)
         evaluation_calls += 1
         if evaluation_calls == 2:
             raise RuntimeError("simulated C0 interruption")
@@ -875,10 +936,85 @@ def test_luo2022_control_ladder_isolated_resume_and_trained_regression(
     assert partial_state["status"] == "running"
     assert experiment._sha256_file(checkpoint_path) == checkpoint_sha256_before
     assert experiment._sha256_file(final_training_bank) == final_training_bank_sha256_before
+
+    tampered_checkpoint = deepcopy(checkpoint)
+    tampered_checkpoint["model"]["phase"] = (
+        tampered_checkpoint["model"]["phase"] + 0.001
+    )
+    torch.save(tampered_checkpoint, checkpoint_path)
+    with pytest.raises(ValueError):
+        experiment.run_luo2022_c0_optical_control_ladder(
+            run_dir=run_dir,
+            control_output_dir=evidence_dir,
+            device_name="cpu",
+            populations=("training", "new", "no_diffuser"),
+            training_epochs=(2,),
+            diffuser_chunk_size=2,
+        )
+    checkpoint_path.write_bytes(checkpoint_bytes)
+
+    torch.save(training_banks[2] + 0.001, final_training_bank)
+    with pytest.raises(ValueError, match="does not match the frozen inputs or request"):
+        experiment.run_luo2022_c0_optical_control_ladder(
+            run_dir=run_dir,
+            control_output_dir=evidence_dir,
+            device_name="cpu",
+            populations=("training", "new", "no_diffuser"),
+            training_epochs=(2,),
+            diffuser_chunk_size=2,
+        )
+    final_training_bank.write_bytes(final_training_bank_bytes)
+
+    tampered_legacy_rows = [
+        json.loads(line)
+        for line in legacy_rows_bytes.decode("utf-8").splitlines()
+        if line.strip()
+    ]
+    tampered_legacy_rows[0]["pearson"] = float(tampered_legacy_rows[0]["pearson"]) + 0.001
+    legacy_rows_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in tampered_legacy_rows),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="does not match the frozen inputs or request"):
+        experiment.run_luo2022_c0_optical_control_ladder(
+            run_dir=run_dir,
+            control_output_dir=evidence_dir,
+            device_name="cpu",
+            populations=("training", "new", "no_diffuser"),
+            training_epochs=(2,),
+            diffuser_chunk_size=2,
+        )
+    legacy_rows_path.write_bytes(legacy_rows_bytes)
+
+    legacy_rows_path.write_text(
+        "".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in tampered_legacy_rows[1:]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing requested C0 diffuser rows"):
+        experiment.run_luo2022_c0_optical_control_ladder(
+            run_dir=run_dir,
+            control_output_dir=evidence_dir,
+            device_name="cpu",
+            populations=("training", "new", "no_diffuser"),
+            training_epochs=(2,),
+            diffuser_chunk_size=2,
+        )
+    legacy_rows_path.write_bytes(legacy_rows_bytes)
+
+    assert experiment._sha256_file(checkpoint_path) == checkpoint_sha256_before
+    assert experiment._sha256_file(final_training_bank) == final_training_bank_sha256_before
+
+    def record_c0_evaluator(*args: object, **kwargs: object) -> object:
+        record_c0_forward_route(args)
+        return original_evaluator(*args, **kwargs)
+
     monkeypatch.setattr(
         experiment,
         "_evaluate_luo2022_forward_per_diffuser",
-        original_evaluator,
+        record_c0_evaluator,
     )
 
     summary = experiment.run_luo2022_c0_optical_control_ladder(
@@ -913,6 +1049,19 @@ def test_luo2022_control_ladder_isolated_resume_and_trained_regression(
         != summary["artifact_integrity"]["zero_phase_before_sha256"]
     )
     assert experiment._sha256_file(checkpoint_path) == checkpoint_sha256_before
+    assert operator_calls == set(experiment.LUO2022_CONTROL_LADDER_IDS)
+    assert routed_controls == [
+        "direct_free_space_no_d2nn",
+        "direct_free_space_no_d2nn",
+        "direct_free_space_no_d2nn",
+        "direct_free_space_no_d2nn",
+        "zero_phase_four_layer",
+        "zero_phase_four_layer",
+        "zero_phase_four_layer",
+        "trained_four_layer",
+        "trained_four_layer",
+        "trained_four_layer",
+    ]
 
     rows = [
         json.loads(line)
