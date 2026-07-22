@@ -108,6 +108,16 @@ METRICS_PROTOCOL_VERSION = 1
 LOWER_IS_BETTER = {"l1", "mse"}
 HIGHER_IS_BETTER = {"psnr", "ssim", "pearson"}
 ORDERED_METRICS = ("l1", "mse", "psnr", "ssim", "pearson")
+LUO2022_ROI_METRIC_FIELDS = (
+    "roi_full_canvas_pearson",
+    "roi_center_input_region_pearson",
+    "roi_target_support_pearson",
+    "roi_full_canvas_output_energy_fraction",
+    "roi_center_input_region_output_energy_fraction",
+    "roi_target_support_output_energy_fraction",
+)
+LUO2022_ROI_METRIC_PROTOCOL = "luo2022_r0_roi_pcc_v1"
+LUO2022_ROI_REGRESSION_TOLERANCE = 1e-6
 
 
 def luo2022_diffuser_seed_schedule(
@@ -371,6 +381,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Frozen diffuser populations to evaluate with --action evaluate.",
     )
     d2nn_parser.add_argument(
+        "--posthoc-training-epochs",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional training epochs to include in post-hoc evaluation. "
+            "Defaults to all epochs when the training population is selected."
+        ),
+    )
+    d2nn_parser.add_argument(
+        "--posthoc-roi-metrics",
+        action="store_true",
+        help=(
+            "Also record full-canvas, centered-input, and target-support PCC/energy "
+            "per diffuser. This read-only mode requires an output directory outside RUN."
+        ),
+    )
+    d2nn_parser.add_argument(
         "--run-dir",
         type=Path,
         default=None,
@@ -485,6 +513,12 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     diffuser_chunk_size=args.diffuser_chunk_size,
                     output_dir=args.posthoc_output_dir,
                     populations=tuple(args.posthoc_populations),
+                    training_epochs=(
+                        tuple(args.posthoc_training_epochs)
+                        if args.posthoc_training_epochs is not None
+                        else None
+                    ),
+                    include_roi_metrics=args.posthoc_roi_metrics,
                 )
             if args.action == "diagnose":
                 return run_luo2022_diagnosis(
@@ -2245,6 +2279,7 @@ def evaluate_luo2022_model_per_diffuser(
     device: torch.device,
     max_batches: int | None = None,
     diffuser_chunk_size: int | None = None,
+    include_roi_metrics: bool = False,
 ) -> list[dict[str, float | int]]:
     """Evaluate object means separately for every diffuser.
 
@@ -2263,6 +2298,12 @@ def evaluate_luo2022_model_per_diffuser(
         name: torch.zeros(int(diffuser_phase.shape[0]), dtype=torch.float64)
         for name in metric_names
     }
+    roi_totals = {
+        name: torch.zeros(int(diffuser_phase.shape[0]), dtype=torch.float64)
+        for name in LUO2022_ROI_METRIC_FIELDS
+    } if include_roi_metrics else {}
+    if include_roi_metrics and resized_shape[0] != resized_shape[1]:
+        raise ValueError("ROI post-hoc metrics require a square resized target")
     object_count = 0
     for batch_index, (image, _label) in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -2284,20 +2325,44 @@ def evaluate_luo2022_model_per_diffuser(
                 totals[name][start:stop] += (
                     components[name].detach().sum(dim=0).to(device="cpu", dtype=torch.float64)
                 )
+            if include_roi_metrics:
+                roi_components = _luo2022_roi_components_per_pair(
+                    output,
+                    target,
+                    input_size=int(resized_shape[0]),
+                    full_canvas_pearson=components["pearson"],
+                )
+                for roi_name, values in roi_components.items():
+                    for metric_name in ("pearson", "output_energy_fraction"):
+                        row_name = f"roi_{roi_name}_{metric_name}"
+                        roi_totals[row_name][start:stop] += (
+                            values[metric_name]
+                            .detach()
+                            .sum(dim=0)
+                            .to(device="cpu", dtype=torch.float64)
+                        )
         object_count += int(image.shape[0])
 
     if object_count == 0:
         raise ValueError("evaluation loader yielded no batches")
-    return [
-        {
+    rows: list[dict[str, float | int]] = []
+    for index in range(int(diffuser_phase.shape[0])):
+        row: dict[str, float | int] = {
             "object_count": object_count,
             **{
                 name: float((totals[name][index] / object_count).item())
                 for name in metric_names
             },
         }
-        for index in range(int(diffuser_phase.shape[0]))
-    ]
+        if include_roi_metrics:
+            row.update(
+                {
+                    name: float((roi_totals[name][index] / object_count).item())
+                    for name in LUO2022_ROI_METRIC_FIELDS
+                }
+            )
+        rows.append(row)
+    return rows
 
 
 def _sha256_file(path: Path) -> str:
@@ -2677,6 +2742,46 @@ def _luo2022_roi_metrics(
     *,
     input_size: int,
 ) -> dict[str, Any]:
+    """Summarize explicit spatial metrics without changing the frozen loss."""
+
+    full_components = luo2022_d2nn_components_per_pair(output_intensity, target_amplitude)
+    per_pair = _luo2022_roi_components_per_pair(
+        output_intensity,
+        target_amplitude,
+        input_size=input_size,
+        full_canvas_pearson=full_components["pearson"],
+    )
+    metrics: dict[str, Any] = {}
+    for name, components in per_pair.items():
+        metrics[name] = {
+            "pcc": _luo2022_tensor_summary(components["pearson"]),
+            "output_energy_fraction": _luo2022_tensor_summary(
+                components["output_energy_fraction"]
+            ),
+            "roi_pixel_count": int(components["roi_pixel_count"]),
+        }
+    metrics["full_canvas"]["pcc_matches_frozen_metric_abs_error"] = float(
+        abs(
+            metrics["full_canvas"]["pcc"]["mean"]
+            - float(full_components["pearson"].mean().detach().cpu())
+        )
+    )
+    return metrics
+
+
+def _luo2022_roi_components_per_pair(
+    output_intensity: torch.Tensor,
+    target_amplitude: torch.Tensor,
+    *,
+    input_size: int,
+    full_canvas_pearson: torch.Tensor | None = None,
+) -> dict[str, dict[str, torch.Tensor | int]]:
+    """Return per-object, per-diffuser ROI metrics for read-only post-hoc use.
+
+    ``full_canvas_pearson`` is accepted from the frozen loss computation so
+    that the full-canvas ROI value remains exactly the metric used by R0.
+    """
+
     if target_amplitude.ndim == 4 and target_amplitude.shape[1] == 1:
         target_amplitude = target_amplitude[:, 0]
     if output_intensity.ndim != 4 or target_amplitude.ndim != 3:
@@ -2690,30 +2795,26 @@ def _luo2022_roi_metrics(
     output_energy = output_intensity.sum(dim=(-2, -1)).clamp_min(
         torch.finfo(output_intensity.dtype).eps
     )
-    metrics: dict[str, Any] = {}
+    metrics: dict[str, dict[str, torch.Tensor | int]] = {}
     for name, mask in masks.items():
         expanded_mask = mask[:, None].expand_as(output_intensity)
-        flat_output = output_intensity.reshape(-1, *output_intensity.shape[-2:])
-        flat_target = expanded_target.reshape_as(flat_output)
-        flat_mask = expanded_mask.reshape_as(flat_output)
-        pcc = masked_pearson_per_image(flat_output, flat_target, flat_mask).reshape(
-            output_intensity.shape[:2]
-        )
+        if name == "full_canvas" and full_canvas_pearson is not None:
+            pcc = full_canvas_pearson
+        else:
+            flat_output = output_intensity.reshape(-1, *output_intensity.shape[-2:])
+            flat_target = expanded_target.reshape_as(flat_output)
+            flat_mask = expanded_mask.reshape_as(flat_output)
+            pcc = masked_pearson_per_image(flat_output, flat_target, flat_mask).reshape(
+                output_intensity.shape[:2]
+            )
         energy_fraction = (
             (output_intensity * expanded_mask).sum(dim=(-2, -1)) / output_energy
         )
         metrics[name] = {
-            "pcc": _luo2022_tensor_summary(pcc),
-            "output_energy_fraction": _luo2022_tensor_summary(energy_fraction),
+            "pearson": pcc,
+            "output_energy_fraction": energy_fraction,
             "roi_pixel_count": int(mask[0].sum().item()),
         }
-    full_components = luo2022_d2nn_components_per_pair(output_intensity, target_amplitude)
-    metrics["full_canvas"]["pcc_matches_frozen_metric_abs_error"] = float(
-        abs(
-            metrics["full_canvas"]["pcc"]["mean"]
-            - float(full_components["pearson"].mean().detach().cpu())
-        )
-    )
     return metrics
 
 
@@ -3483,6 +3584,7 @@ def _load_luo2022_posthoc_rows(
     path: Path,
     *,
     checkpoint_sha256: str,
+    metric_protocol: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
@@ -3496,6 +3598,10 @@ def _load_luo2022_posthoc_rows(
             if row.get("checkpoint_sha256") != checkpoint_sha256:
                 raise ValueError(
                     f"post-hoc row {line_number} was produced by a different checkpoint"
+                )
+            if metric_protocol is not None and row.get("metric_protocol") != metric_protocol:
+                raise ValueError(
+                    f"post-hoc row {line_number} does not use metric protocol {metric_protocol!r}"
                 )
             if diffuser_id in rows:
                 raise ValueError(f"duplicate post-hoc diffuser_id: {diffuser_id}")
@@ -3512,8 +3618,11 @@ def _append_luo2022_posthoc_rows(path: Path, rows: list[dict[str, Any]]) -> None
         handle.flush()
 
 
-def _luo2022_metric_distribution(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    metric_names = ("total", "negative_pearson", "energy", "pearson")
+def _luo2022_metric_distribution(
+    rows: list[dict[str, Any]],
+    *,
+    metric_names: tuple[str, ...] = ("total", "negative_pearson", "energy", "pearson"),
+) -> dict[str, Any]:
     summary: dict[str, Any] = {"diffuser_count": len(rows)}
     if not rows:
         return summary
@@ -3523,6 +3632,8 @@ def _luo2022_metric_distribution(rows: list[dict[str, Any]]) -> dict[str, Any]:
     summary["objects_per_diffuser"] = object_counts.pop()
     summary["metrics"] = {}
     for name in metric_names:
+        if any(name not in row for row in rows):
+            raise ValueError(f"post-hoc rows do not all contain metric {name!r}")
         values = np.asarray([float(row[name]) for row in rows], dtype=np.float64)
         mean = float(values.mean())
         sample_std = float(values.std(ddof=1)) if len(values) > 1 else None
@@ -3542,15 +3653,13 @@ def _luo2022_metric_distribution(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def summarize_luo2022_posthoc_rows(
+def _luo2022_posthoc_population_groups(
     rows: list[dict[str, Any]],
     *,
     target_epochs: int,
-) -> dict[str, Any]:
-    """Summarize the paper's known and unseen diffuser populations."""
-
+) -> dict[str, list[dict[str, Any]]]:
     training_rows = [row for row in rows if row["population"] == "training"]
-    groups = {
+    return {
         "all_training_diffusers": training_rows,
         "epochs_1_to_penultimate_training_diffusers": [
             row for row in training_rows if int(row["training_epoch"]) < target_epochs
@@ -3566,10 +3675,25 @@ def summarize_luo2022_posthoc_rows(
         "new_unseen_diffusers": [row for row in rows if row["population"] == "new"],
         "no_diffuser_control": [row for row in rows if row["population"] == "no_diffuser"],
     }
+
+
+def summarize_luo2022_posthoc_rows(
+    rows: list[dict[str, Any]],
+    *,
+    target_epochs: int,
+) -> dict[str, Any]:
+    """Summarize the paper's known and unseen diffuser populations."""
+
+    groups = _luo2022_posthoc_population_groups(rows, target_epochs=target_epochs)
     return {name: _luo2022_metric_distribution(group_rows) for name, group_rows in groups.items()}
 
 
-def _write_luo2022_posthoc_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_luo2022_posthoc_csv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    include_roi_metrics: bool = False,
+) -> None:
     fieldnames = (
         "diffuser_id",
         "population",
@@ -3583,6 +3707,13 @@ def _write_luo2022_posthoc_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "checkpoint_sha256",
         "source_freeze_version",
     )
+    if include_roi_metrics:
+        fieldnames += (
+            *LUO2022_ROI_METRIC_FIELDS,
+            "metric_protocol",
+            "roi_full_canvas_metric_abs_error",
+            "legacy_pearson_abs_error",
+        )
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -3599,8 +3730,24 @@ def run_luo2022_posthoc_evaluation(
     diffuser_chunk_size: int | None = None,
     output_dir: Path | None = None,
     populations: tuple[str, ...] = ("training", "new", "no_diffuser"),
+    training_epochs: tuple[int, ...] | None = None,
+    include_roi_metrics: bool = False,
 ) -> dict[str, Any]:
     """Collect resumable per-diffuser evidence from a frozen R0 checkpoint."""
+
+    if include_roi_metrics:
+        return run_luo2022_roi_posthoc_evaluation(
+            run_dir=run_dir,
+            config_path=config_path,
+            download=download,
+            device_name=device_name,
+            diffuser_chunk_size=diffuser_chunk_size,
+            output_dir=output_dir,
+            populations=populations,
+            training_epochs=training_epochs,
+        )
+    if training_epochs is not None:
+        raise ValueError("--posthoc-training-epochs requires --posthoc-roi-metrics")
 
     allowed_populations = {"training", "new", "no_diffuser"}
     requested_populations = tuple(dict.fromkeys(populations))
@@ -3886,6 +4033,496 @@ def run_luo2022_posthoc_evaluation(
             "summary": "posthoc_summary.json",
         },
     )
+    return summary
+
+
+def run_luo2022_roi_posthoc_evaluation(
+    *,
+    run_dir: Path,
+    config_path: Path = DEFAULT_LUO2022_CONFIG,
+    download: bool = False,
+    device_name: str = "cpu",
+    diffuser_chunk_size: int | None = None,
+    output_dir: Path | None,
+    populations: tuple[str, ...] = ("training", "new", "no_diffuser"),
+    training_epochs: tuple[int, ...] | None = None,
+) -> dict[str, Any]:
+    """Collect independent spatial-ROI evidence from a completed frozen R0 run.
+
+    This is deliberately a separate evidence protocol from the original
+    full-canvas post-hoc evaluator. It never writes under ``run_dir`` and
+    validates every ROI full-canvas value against both the frozen loss and the
+    already-completed full-population post-hoc evidence.
+    """
+
+    if output_dir is None:
+        raise ValueError("ROI post-hoc evaluation requires --posthoc-output-dir")
+    run_resolved = run_dir.resolve()
+    evidence_resolved = output_dir.resolve()
+    if evidence_resolved == run_resolved or run_resolved in evidence_resolved.parents:
+        raise ValueError("ROI post-hoc output directory must be outside the frozen run directory")
+
+    allowed_populations = {"training", "new", "no_diffuser"}
+    requested_populations = tuple(dict.fromkeys(populations))
+    if not requested_populations or not set(requested_populations) <= allowed_populations:
+        raise ValueError("post-hoc populations must be training, new, or no_diffuser")
+    if training_epochs is not None and "training" not in requested_populations:
+        raise ValueError("training epoch selection requires the training population")
+
+    device = select_device(device_name)
+    frozen = _load_luo2022_frozen_run_artifacts(
+        run_dir=run_dir,
+        config_path=config_path,
+        device=device,
+    )
+    values = frozen.runtime_config["runtime"]
+    target_epochs = int(values["epochs"])
+    if training_epochs is None:
+        selected_training_epochs = tuple(range(1, target_epochs + 1))
+    else:
+        selected_training_epochs = tuple(sorted(set(int(epoch) for epoch in training_epochs)))
+        if not selected_training_epochs:
+            raise ValueError("training epoch selection must not be empty")
+        if any(epoch < 1 or epoch > target_epochs for epoch in selected_training_epochs):
+            raise ValueError("selected training epochs must lie within the frozen run")
+    if "training" not in requested_populations:
+        selected_training_epochs = ()
+
+    optics_config = _luo2022_optics_config_from_frozen_run(
+        frozen.runtime_config,
+        frozen.contract,
+    )
+    expected_training_count = int(values["diffusers_per_epoch"])
+    final_training_banks: dict[int, Path] = {}
+    selected_training_bank_sha256: dict[str, str] = {}
+    for epoch in selected_training_epochs:
+        phase_path = run_dir / "diffusers" / f"training_epoch_{epoch:03d}.pt"
+        if not phase_path.is_file():
+            raise FileNotFoundError(f"saved training diffuser bank is missing for epoch {epoch}")
+        final_training_banks[epoch] = phase_path
+        selected_training_bank_sha256[str(epoch)] = _sha256_file(phase_path)
+
+    diffuser_kwargs = _luo2022_diffuser_kwargs(optics_config, frozen.contract)
+    seed_schedule, seed_schedule_provenance = _luo2022_frozen_diffuser_seed_schedule(
+        frozen.runtime_config,
+        frozen.contract,
+    )
+    new_diffusers: torch.Tensor | None = None
+    new_diffusers_sha256: str | None = None
+    if "new" in requested_populations:
+        uniqueness = frozen.contract["diffuser"]["uniqueness"]
+        new_diffusers = make_unique_correlated_diffusers(
+            int(values["eval_diffusers"]),
+            field_shape=optics_config.field_shape,
+            base_seed=int(seed_schedule["evaluation_base_seed"]),
+            minimum_difference_radians=float(uniqueness["minimum_radians"]),
+            phase_representation=str(uniqueness["phase_representation"]),
+            **diffuser_kwargs,
+        )
+        new_diffusers_sha256 = _sha256_tensor(new_diffusers)
+    no_diffuser = torch.zeros((1, *optics_config.field_shape), dtype=torch.float32)
+
+    expected_metadata: dict[str, dict[str, Any]] = {}
+    if "training" in requested_populations:
+        for epoch in selected_training_epochs:
+            for index in range(expected_training_count):
+                metadata = {
+                    "diffuser_id": f"training:e{epoch:03d}:i{index:02d}",
+                    "population": "training",
+                    "training_epoch": epoch,
+                    "within_epoch_index": index,
+                }
+                expected_metadata[str(metadata["diffuser_id"])] = metadata
+    if "new" in requested_populations:
+        for index in range(int(values["eval_diffusers"])):
+            metadata = {
+                "diffuser_id": f"new:i{index:02d}",
+                "population": "new",
+                "training_epoch": None,
+                "within_epoch_index": index,
+            }
+            expected_metadata[str(metadata["diffuser_id"])] = metadata
+    if "no_diffuser" in requested_populations:
+        expected_metadata["no_diffuser"] = {
+            "diffuser_id": "no_diffuser",
+            "population": "no_diffuser",
+            "training_epoch": None,
+            "within_epoch_index": 0,
+        }
+
+    expected_counts = {
+        "training": len(selected_training_epochs) * expected_training_count
+        if "training" in requested_populations
+        else 0,
+        "new": int(values["eval_diffusers"]) if "new" in requested_populations else 0,
+        "no_diffuser": 1 if "no_diffuser" in requested_populations else 0,
+    }
+    if sum(expected_counts.values()) != len(expected_metadata):
+        raise RuntimeError("ROI post-hoc metadata count does not match the requested scope")
+
+    legacy_rows_path = run_dir / "posthoc_evaluation" / "per_diffuser_metrics.jsonl"
+    legacy_rows_by_id = _load_luo2022_posthoc_rows(
+        legacy_rows_path,
+        checkpoint_sha256=frozen.checkpoint_sha256,
+    )
+    missing_legacy_rows = sorted(set(expected_metadata) - set(legacy_rows_by_id))
+    if missing_legacy_rows:
+        raise ValueError(
+            "completed full-canvas post-hoc evidence is missing requested diffuser rows"
+        )
+
+    evidence_spec = {
+        "schema_version": 1,
+        "implementation_version": LUO2022_ROI_METRIC_PROTOCOL,
+        "read_only": True,
+        "requested_populations": list(requested_populations),
+        "requested_training_epochs": list(selected_training_epochs),
+        "roi_definitions": {
+            "full_canvas": (
+                f"all {optics_config.field_shape[0]}x{optics_config.field_shape[1]} detector pixels"
+            ),
+            "center_input_region": (
+                f"centered {int(values['input_size'])}x{int(values['input_size'])} input footprint"
+            ),
+            "target_support": "prepared target amplitude strictly greater than zero per object",
+        },
+        "aggregation_protocol": (
+            "per-object PCC or energy fraction, then mean over test objects per diffuser, "
+            "then distribution across diffusers"
+        ),
+        "regression_tolerance": LUO2022_ROI_REGRESSION_TOLERANCE,
+    }
+    fingerprint = {
+        "metric_protocol": LUO2022_ROI_METRIC_PROTOCOL,
+        "evidence_spec": evidence_spec,
+        "checkpoint_sha256": frozen.checkpoint_sha256,
+        "runtime_config_sha256": frozen.runtime_config_sha256,
+        "source_config_sha256": frozen.source_config_sha256,
+        "manifest_sha256": frozen.manifest_sha256,
+        "run_state_sha256": frozen.run_state_sha256,
+        "selected_training_diffuser_banks_sha256": selected_training_bank_sha256,
+        "evaluation_seed_diffusers_sha256": new_diffusers_sha256,
+        "no_diffuser_phase_sha256": _sha256_tensor(no_diffuser),
+        "diffuser_seed_schedule": seed_schedule,
+        "diffuser_seed_schedule_provenance": seed_schedule_provenance,
+        "evaluation_object_count": int(values["eval_limit"]),
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows_path = output_dir / "roi_per_diffuser_metrics.jsonl"
+    state_path = output_dir / "posthoc_roi_state.json"
+    summary_path = output_dir / "posthoc_roi_summary.json"
+    if state_path.is_file():
+        saved_state = load_config(state_path)
+        if saved_state.get("evidence_fingerprint") != fingerprint:
+            raise ValueError("ROI post-hoc state does not match the frozen evidence inputs")
+        if saved_state.get("metric_protocol") != LUO2022_ROI_METRIC_PROTOCOL:
+            raise ValueError("ROI post-hoc state uses a different metric protocol")
+        if saved_state.get("status") not in {"running", "completed", "incomplete"}:
+            raise ValueError("ROI post-hoc state has an unsupported status")
+    rows_by_id = _load_luo2022_posthoc_rows(
+        rows_path,
+        checkpoint_sha256=frozen.checkpoint_sha256,
+        metric_protocol=LUO2022_ROI_METRIC_PROTOCOL,
+    )
+    unexpected_rows = sorted(set(rows_by_id) - set(expected_metadata))
+    if unexpected_rows:
+        raise ValueError("ROI post-hoc evidence contains diffuser rows outside its frozen scope")
+
+    seed_everything(int(values["seed"]))
+    eval_base = build_torchvision_dataset(
+        name="MNIST",
+        root=DEFAULT_DATA_ROOT,
+        train=False,
+        image_size=int(frozen.contract["input"]["original_shape"][0]),
+        download=download,
+    )
+    eval_dataset = Subset(eval_base, range(min(int(values["eval_limit"]), len(eval_base))))
+    if len(eval_dataset) != int(values["eval_limit"]):
+        raise ValueError("frozen evaluation object count is unavailable from the requested dataset")
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=int(values["batch_size"]),
+        shuffle=False,
+    )
+
+    model = Luo2022FourLayerD2NN(optics_config).to(device)
+    model.load_state_dict(frozen.checkpoint["model"], strict=True)
+    phase_before = model.phase.detach().clone()
+    phase_before_sha256 = _sha256_tensor(phase_before)
+    effective_chunk_size = int(
+        diffuser_chunk_size or values["diffuser_chunk_size"] or expected_training_count
+    )
+    if effective_chunk_size <= 0:
+        raise ValueError("diffuser chunk size must be positive")
+    resized_shape = (int(values["input_size"]), int(values["input_size"]))
+
+    def completed_counts() -> dict[str, int]:
+        return {
+            population: sum(
+                row["population"] == population for row in rows_by_id.values()
+            )
+            for population in sorted(allowed_populations)
+        }
+
+    def save_progress(stage: str, *, status: str = "running") -> None:
+        write_json(
+            state_path,
+            {
+                "schema_version": 1,
+                "status": status,
+                "stage": stage,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+                "read_only": True,
+                "metric_protocol": LUO2022_ROI_METRIC_PROTOCOL,
+                "requested_populations": list(requested_populations),
+                "requested_training_epochs": list(selected_training_epochs),
+                "completed_population_counts": completed_counts(),
+                "expected_population_counts": expected_counts,
+                "objects_per_diffuser": len(eval_dataset),
+                "evidence_fingerprint": fingerprint,
+            },
+        )
+
+    def validate_roi_row(row: dict[str, Any]) -> None:
+        diffuser_id = str(row["diffuser_id"])
+        full_canvas_error = abs(
+            float(row["roi_full_canvas_pearson"]) - float(row["pearson"])
+        )
+        if full_canvas_error > LUO2022_ROI_REGRESSION_TOLERANCE:
+            raise ValueError(
+                f"ROI full-canvas PCC does not reproduce frozen PCC for {diffuser_id}"
+            )
+        legacy_row = legacy_rows_by_id[diffuser_id]
+        if int(legacy_row["object_count"]) != int(row["object_count"]):
+            raise ValueError(
+                f"ROI object count does not match legacy post-hoc evidence for {diffuser_id}"
+            )
+        legacy_error = abs(float(row["pearson"]) - float(legacy_row["pearson"]))
+        if legacy_error > LUO2022_ROI_REGRESSION_TOLERANCE:
+            raise ValueError(
+                f"ROI PCC does not reproduce legacy post-hoc evidence for {diffuser_id}"
+            )
+        if str(row["population"]) != str(legacy_row["population"]):
+            raise ValueError(f"ROI population does not match legacy evidence for {diffuser_id}")
+        if row.get("training_epoch") != legacy_row.get("training_epoch"):
+            raise ValueError(f"ROI epoch does not match legacy evidence for {diffuser_id}")
+
+    for existing_row in rows_by_id.values():
+        validate_roi_row(existing_row)
+
+    def evaluate_and_record(
+        phases_cpu: torch.Tensor,
+        row_metadata: list[dict[str, Any]],
+        *,
+        stage: str,
+    ) -> None:
+        missing = [
+            (index, metadata)
+            for index, metadata in enumerate(row_metadata)
+            if str(metadata["diffuser_id"]) not in rows_by_id
+        ]
+        if not missing:
+            save_progress(stage)
+            return
+        missing_indices = [index for index, _metadata in missing]
+        metrics = evaluate_luo2022_model_per_diffuser(
+            model,
+            eval_loader,
+            phases_cpu[missing_indices].to(device),
+            resized_shape=resized_shape,
+            canvas_shape=optics_config.field_shape,
+            device=device,
+            max_batches=values["max_eval_batches"],
+            diffuser_chunk_size=effective_chunk_size,
+            include_roi_metrics=True,
+        )
+        new_rows: list[dict[str, Any]] = []
+        for (_index, metadata), metric in zip(missing, metrics, strict=True):
+            row = {
+                **metadata,
+                **metric,
+                "checkpoint_sha256": frozen.checkpoint_sha256,
+                "source_freeze_version": str(frozen.contract["freeze_version"]),
+                "metric_protocol": LUO2022_ROI_METRIC_PROTOCOL,
+            }
+            row["roi_full_canvas_metric_abs_error"] = abs(
+                float(row["roi_full_canvas_pearson"]) - float(row["pearson"])
+            )
+            row["legacy_pearson_abs_error"] = abs(
+                float(row["pearson"])
+                - float(legacy_rows_by_id[str(row["diffuser_id"])]["pearson"])
+            )
+            validate_roi_row(row)
+            new_rows.append(row)
+        _append_luo2022_posthoc_rows(rows_path, new_rows)
+        for row in new_rows:
+            rows_by_id[str(row["diffuser_id"])] = row
+        save_progress(stage)
+
+    save_progress("initializing")
+    if "training" in requested_populations:
+        for epoch in selected_training_epochs:
+            phases_cpu = torch.load(
+                final_training_banks[epoch],
+                map_location="cpu",
+                weights_only=True,
+            )
+            expected_shape = (expected_training_count, *optics_config.field_shape)
+            if tuple(phases_cpu.shape) != expected_shape:
+                raise ValueError(
+                    f"training diffuser bank shape does not match frozen runtime for epoch {epoch}"
+                )
+            evaluate_and_record(
+                phases_cpu,
+                [
+                    expected_metadata[f"training:e{epoch:03d}:i{index:02d}"]
+                    for index in range(expected_training_count)
+                ],
+                stage=f"training_epoch_{epoch:03d}",
+            )
+    if "new" in requested_populations:
+        if new_diffusers is None:
+            raise RuntimeError("new diffuser population was requested but not generated")
+        evaluate_and_record(
+            new_diffusers,
+            [
+                expected_metadata[f"new:i{index:02d}"]
+                for index in range(int(new_diffusers.shape[0]))
+            ],
+            stage="new_unseen_diffusers",
+        )
+    if "no_diffuser" in requested_populations:
+        evaluate_and_record(
+            no_diffuser,
+            [expected_metadata["no_diffuser"]],
+            stage="no_diffuser_control",
+        )
+
+    if set(rows_by_id) != set(expected_metadata):
+        raise RuntimeError("ROI post-hoc evidence is incomplete after evaluation")
+    phase_after = model.phase.detach().clone()
+    model_phase_unchanged = bool(torch.equal(phase_after, phase_before))
+    if not model_phase_unchanged:
+        raise RuntimeError("read-only ROI post-hoc evaluation changed the frozen model phase")
+    frozen_hashes_after = {
+        "checkpoint_sha256": _sha256_file(frozen.checkpoint_path),
+        "runtime_config_sha256": _sha256_file(run_dir / "config.json"),
+        "source_config_sha256": _sha256_file(run_dir / "source_config.json"),
+        "manifest_sha256": _sha256_file(run_dir / "manifest.json"),
+        "run_state_sha256": _sha256_file(run_dir / "run_state.json"),
+        "selected_training_diffuser_banks_sha256": {
+            str(epoch): _sha256_file(path)
+            for epoch, path in final_training_banks.items()
+        },
+    }
+    frozen_hashes_before = {
+        "checkpoint_sha256": frozen.checkpoint_sha256,
+        "runtime_config_sha256": frozen.runtime_config_sha256,
+        "source_config_sha256": frozen.source_config_sha256,
+        "manifest_sha256": frozen.manifest_sha256,
+        "run_state_sha256": frozen.run_state_sha256,
+        "selected_training_diffuser_banks_sha256": selected_training_bank_sha256,
+    }
+    if frozen_hashes_after != frozen_hashes_before:
+        raise RuntimeError("frozen R0 inputs changed during ROI post-hoc evaluation")
+
+    rows = sorted(
+        rows_by_id.values(),
+        key=lambda row: (
+            {"training": 0, "new": 1, "no_diffuser": 2}[str(row["population"])],
+            int(row["training_epoch"] or 0),
+            int(row["within_epoch_index"]),
+        ),
+    )
+    population_groups = _luo2022_posthoc_population_groups(rows, target_epochs=target_epochs)
+    roi_groups = {
+        name: _luo2022_metric_distribution(
+            group_rows,
+            metric_names=LUO2022_ROI_METRIC_FIELDS,
+        )
+        for name, group_rows in population_groups.items()
+    }
+    pearson_groups = {
+        name: _luo2022_metric_distribution(group_rows, metric_names=("pearson",))
+        for name, group_rows in population_groups.items()
+    }
+    max_full_canvas_error = max(
+        float(row["roi_full_canvas_metric_abs_error"]) for row in rows
+    )
+    max_legacy_error = max(float(row["legacy_pearson_abs_error"]) for row in rows)
+    legacy_group_means = {
+        name: (
+            float(np.mean([float(legacy_rows_by_id[str(row["diffuser_id"])]["pearson"]) for row in group_rows]))
+            if group_rows
+            else None
+        )
+        for name, group_rows in population_groups.items()
+    }
+    completed_population_counts = completed_counts()
+    requested_complete = all(
+        completed_population_counts[population] == expected_counts[population]
+        for population in requested_populations
+    )
+    if not requested_complete:
+        raise RuntimeError("ROI post-hoc evaluation did not complete its requested diffuser scope")
+
+    _write_luo2022_posthoc_csv(
+        output_dir / "roi_per_diffuser_metrics.csv",
+        rows,
+        include_roi_metrics=True,
+    )
+    summary = {
+        "schema_version": 1,
+        "status": "completed",
+        "completed_at_utc": datetime.now(UTC).isoformat(),
+        "read_only": True,
+        "metric_protocol": LUO2022_ROI_METRIC_PROTOCOL,
+        "requested_populations": list(requested_populations),
+        "requested_training_epochs": list(selected_training_epochs),
+        "completed_population_counts": completed_population_counts,
+        "expected_population_counts": expected_counts,
+        "objects_per_diffuser": len(eval_dataset),
+        "evidence_spec": evidence_spec,
+        "groups": pearson_groups,
+        "roi_groups": roi_groups,
+        "full_canvas_regression": {
+            "tolerance": LUO2022_ROI_REGRESSION_TOLERANCE,
+            "max_abs_roi_full_canvas_minus_frozen_pearson": max_full_canvas_error,
+            "max_abs_roi_pearson_minus_legacy_pearson": max_legacy_error,
+            "legacy_group_pearson_means": legacy_group_means,
+        },
+        "evidence_fingerprint": fingerprint,
+        "source_run": {
+            "profile_id": frozen.manifest["profile_id"],
+            "source_freeze_version": frozen.contract["freeze_version"],
+            "checkpoint": "checkpoints/luo2022_d2nn.pt",
+            "git": frozen.manifest.get("runtime", {}).get("git"),
+        },
+        "artifact_integrity": {
+            **frozen_hashes_before,
+            "source_config_integrity": frozen.source_config_integrity,
+            "evaluation_seed_diffusers_sha256": new_diffusers_sha256,
+            "no_diffuser_phase_sha256": _sha256_tensor(no_diffuser),
+            "model_phase_before_sha256": phase_before_sha256,
+            "model_phase_after_sha256": _sha256_tensor(phase_after),
+            "model_phase_unchanged": model_phase_unchanged,
+            "frozen_input_hashes_unchanged": True,
+        },
+        "artifacts": {
+            "per_diffuser_jsonl": "roi_per_diffuser_metrics.jsonl",
+            "per_diffuser_csv": "roi_per_diffuser_metrics.csv",
+            "state": "posthoc_roi_state.json",
+            "summary": "posthoc_roi_summary.json",
+        },
+        "claim_boundary": (
+            "Read-only ROI sensitivity evidence for the frozen digital R0 checkpoint. "
+            "Only full-canvas PCC is the frozen R0 metric; the centered and target-support "
+            "ROIs are implementation diagnostics, not paper-published acceptance domains."
+        ),
+    }
+    write_json(summary_path, summary)
+    save_progress("completed", status="completed")
     return summary
 
 

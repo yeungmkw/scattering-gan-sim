@@ -120,6 +120,9 @@ def test_d2nn_cli_exposes_luo2022_posthoc_evaluation() -> None:
             "--posthoc-populations",
             "new",
             "no_diffuser",
+            "--posthoc-training-epochs",
+            "100",
+            "--posthoc-roi-metrics",
             "--diffuser-chunk-size",
             "2",
         ]
@@ -129,6 +132,8 @@ def test_d2nn_cli_exposes_luo2022_posthoc_evaluation() -> None:
     assert args.output_dir == "outputs/frozen_run"
     assert args.posthoc_output_dir == Path("outputs/evidence")
     assert args.posthoc_populations == ["new", "no_diffuser"]
+    assert args.posthoc_training_epochs == [100]
+    assert args.posthoc_roi_metrics is True
     assert args.diffuser_chunk_size == 2
 
 
@@ -171,6 +176,16 @@ def test_luo2022_diagnosis_rejects_output_inside_frozen_run(tmp_path: Path) -> N
         experiment.run_luo2022_diagnosis(
             run_dir=run_dir,
             diagnostic_output_dir=run_dir / "diagnosis",
+        )
+
+
+def test_luo2022_roi_posthoc_rejects_output_inside_frozen_run(tmp_path: Path) -> None:
+    run_dir = tmp_path / "frozen"
+
+    with pytest.raises(ValueError, match="outside the frozen run"):
+        experiment.run_luo2022_roi_posthoc_evaluation(
+            run_dir=run_dir,
+            output_dir=run_dir / "roi_evidence",
         )
 
 
@@ -410,6 +425,167 @@ def test_luo2022_diagnosis_rejects_invalid_checkpoint_before_writing_state(tmp_p
     assert not diagnostic_output_dir.exists()
 
 
+def test_luo2022_roi_posthoc_isolated_resume_and_full_canvas_regression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "completed"
+    contract, runtime_config = _write_completed_luo2022_run_fixture(run_dir)
+    values = runtime_config["runtime"]
+    generator = torch.Generator().manual_seed(37)
+    dataset = TensorDataset(
+        torch.rand(int(values["eval_limit"]), 1, 28, 28, generator=generator),
+        torch.zeros(int(values["eval_limit"]), dtype=torch.long),
+    )
+    monkeypatch.setattr(experiment, "build_torchvision_dataset", lambda **_kwargs: dataset)
+
+    optics_config = experiment._luo2022_optics_config_from_frozen_run(runtime_config, contract)
+    checkpoint_path = run_dir / "checkpoints" / "luo2022_d2nn.pt"
+    checkpoint_sha256_before = experiment._sha256_file(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    model = experiment.Luo2022FourLayerD2NN(optics_config)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    eval_loader = DataLoader(dataset, batch_size=int(values["batch_size"]), shuffle=False)
+    diffuser_dir = run_dir / "diffusers"
+    diffuser_dir.mkdir()
+    training_banks = {
+        epoch: torch.rand(
+            int(values["diffusers_per_epoch"]),
+            *optics_config.field_shape,
+            generator=generator,
+        )
+        for epoch in range(1, int(values["epochs"]) + 1)
+    }
+    for epoch, phases in training_banks.items():
+        torch.save(phases, diffuser_dir / f"training_epoch_{epoch:03d}.pt")
+
+    diffuser_kwargs = experiment._luo2022_diffuser_kwargs(optics_config, contract)
+    seed_schedule, _ = experiment._luo2022_frozen_diffuser_seed_schedule(
+        runtime_config,
+        contract,
+    )
+    uniqueness = contract["diffuser"]["uniqueness"]
+    new_diffusers = experiment.make_unique_correlated_diffusers(
+        int(values["eval_diffusers"]),
+        field_shape=optics_config.field_shape,
+        base_seed=int(seed_schedule["evaluation_base_seed"]),
+        minimum_difference_radians=float(uniqueness["minimum_radians"]),
+        phase_representation=str(uniqueness["phase_representation"]),
+        **diffuser_kwargs,
+    )
+    checkpoint_sha256 = experiment._sha256_file(checkpoint_path)
+    legacy_rows: list[dict] = []
+
+    def append_legacy_rows(
+        phases: torch.Tensor,
+        metadata: list[dict],
+    ) -> None:
+        metrics = experiment.evaluate_luo2022_model_per_diffuser(
+            model,
+            eval_loader,
+            phases,
+            resized_shape=(int(values["input_size"]), int(values["input_size"])),
+            canvas_shape=optics_config.field_shape,
+            device=torch.device("cpu"),
+            diffuser_chunk_size=1,
+        )
+        legacy_rows.extend(
+            {
+                **row_metadata,
+                **metric,
+                "checkpoint_sha256": checkpoint_sha256,
+                "source_freeze_version": contract["freeze_version"],
+            }
+            for row_metadata, metric in zip(metadata, metrics, strict=True)
+        )
+
+    append_legacy_rows(
+        training_banks[2],
+        [
+            {
+                "diffuser_id": f"training:e002:i{index:02d}",
+                "population": "training",
+                "training_epoch": 2,
+                "within_epoch_index": index,
+            }
+            for index in range(int(values["diffusers_per_epoch"]))
+        ],
+    )
+    append_legacy_rows(
+        new_diffusers,
+        [
+            {
+                "diffuser_id": f"new:i{index:02d}",
+                "population": "new",
+                "training_epoch": None,
+                "within_epoch_index": index,
+            }
+            for index in range(int(values["eval_diffusers"]))
+        ],
+    )
+    append_legacy_rows(
+        torch.zeros((1, *optics_config.field_shape)),
+        [
+            {
+                "diffuser_id": "no_diffuser",
+                "population": "no_diffuser",
+                "training_epoch": None,
+                "within_epoch_index": 0,
+            }
+        ],
+    )
+    experiment._append_luo2022_posthoc_rows(
+        run_dir / "posthoc_evaluation" / "per_diffuser_metrics.jsonl",
+        legacy_rows,
+    )
+
+    evidence_dir = tmp_path / "independent_roi_evidence"
+    summary = experiment.run_luo2022_roi_posthoc_evaluation(
+        run_dir=run_dir,
+        output_dir=evidence_dir,
+        device_name="cpu",
+        populations=("training", "new", "no_diffuser"),
+        training_epochs=(2,),
+        diffuser_chunk_size=2,
+    )
+
+    assert summary["status"] == "completed"
+    assert summary["read_only"] is True
+    assert summary["completed_population_counts"] == {
+        "training": 2,
+        "new": 2,
+        "no_diffuser": 1,
+    }
+    assert (
+        summary["full_canvas_regression"][
+            "max_abs_roi_full_canvas_minus_frozen_pearson"
+        ]
+        <= experiment.LUO2022_ROI_REGRESSION_TOLERANCE
+    )
+    assert (
+        summary["full_canvas_regression"][
+            "max_abs_roi_pearson_minus_legacy_pearson"
+        ]
+        <= experiment.LUO2022_ROI_REGRESSION_TOLERANCE
+    )
+    assert summary["artifact_integrity"]["model_phase_unchanged"] is True
+    assert experiment._sha256_file(checkpoint_path) == checkpoint_sha256_before
+    rows_path = evidence_dir / "roi_per_diffuser_metrics.jsonl"
+    assert len(rows_path.read_text(encoding="utf-8").splitlines()) == 5
+
+    resumed = experiment.run_luo2022_roi_posthoc_evaluation(
+        run_dir=run_dir,
+        output_dir=evidence_dir,
+        device_name="cpu",
+        populations=("training", "new", "no_diffuser"),
+        training_epochs=(2,),
+        diffuser_chunk_size=1,
+    )
+
+    assert resumed["status"] == "completed"
+    assert len(rows_path.read_text(encoding="utf-8").splitlines()) == 5
+
+
 def test_luo2022_diffuser_chunking_preserves_one_optimizer_update() -> None:
     generator = torch.Generator().manual_seed(19)
     images = torch.rand(2, 1, 28, 28, generator=generator)
@@ -475,6 +651,16 @@ def test_luo2022_per_diffuser_metrics_preserve_global_mean() -> None:
         device=torch.device("cpu"),
         diffuser_chunk_size=1,
     )
+    per_diffuser_with_roi = experiment.evaluate_luo2022_model_per_diffuser(
+        model,
+        loader,
+        diffusers,
+        resized_shape=(32, 32),
+        canvas_shape=(48, 48),
+        device=torch.device("cpu"),
+        diffuser_chunk_size=2,
+        include_roi_metrics=True,
+    )
 
     assert len(per_diffuser) == 3
     assert all(row["object_count"] == 4 for row in per_diffuser)
@@ -483,6 +669,17 @@ def test_luo2022_per_diffuser_metrics_preserve_global_mean() -> None:
             aggregate[metric],
             abs=1e-6,
         )
+    assert len(per_diffuser_with_roi) == len(per_diffuser)
+    for plain_row, roi_row in zip(per_diffuser, per_diffuser_with_roi, strict=True):
+        for metric in ("total", "negative_pearson", "energy", "pearson"):
+            assert roi_row[metric] == pytest.approx(plain_row[metric], abs=1e-6)
+        assert roi_row["roi_full_canvas_pearson"] == pytest.approx(
+            roi_row["pearson"],
+            abs=1e-6,
+        )
+        for metric in experiment.LUO2022_ROI_METRIC_FIELDS:
+            assert metric in roi_row
+
 
 
 def test_luo2022_posthoc_summary_recreates_paper_populations() -> None:
