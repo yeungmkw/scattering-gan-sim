@@ -856,6 +856,15 @@ class Luo2022FourLayerD2NN(nn.Module):
             **propagation_kwargs,
             distance=config.output_distance,
         )
+        post_diffuser_to_output_distance = (
+            config.diffuser_to_first_layer_distance
+            + (config.num_layers - 1) * config.layer_distance
+            + config.output_distance
+        )
+        self.post_diffuser_to_output_direct = RayleighSommerfeldPropagator(
+            **propagation_kwargs,
+            distance=post_diffuser_to_output_distance,
+        )
 
     def distort(self, object_field: torch.Tensor, diffuser_phase: torch.Tensor) -> torch.Tensor:
         """Apply equation (6) and return fields immediately after the diffuser."""
@@ -876,6 +885,32 @@ class Luo2022FourLayerD2NN(nn.Module):
             collect_trace=False,
         )
         return output
+
+    def forward_without_diffractive_layers(
+        self,
+        object_field: torch.Tensor,
+        diffuser_phase: torch.Tensor,
+    ) -> torch.Tensor:
+        """Propagate directly from the diffuser to the detector without D2NN layers.
+
+        This is a numerical control for the Luo et al. supplementary
+        no-diffractive-layer condition. It retains the object-to-diffuser path,
+        phase diffuser, detector sampling, and total post-diffuser distance,
+        while replacing the finite-window sequence of layer planes with one
+        direct propagation. It is intentionally distinct from a zero-phase
+        four-layer model, which still has intermediate sampled propagations.
+        """
+
+        distorted = self.distort(object_field, diffuser_phase)
+        batch_size, diffuser_count = distorted.shape[:2]
+        output_field = self.post_diffuser_to_output_direct.propagate(
+            distorted.flatten(0, 1)
+        )
+        return field_intensity(output_field).reshape(
+            batch_size,
+            diffuser_count,
+            *self.config.field_shape,
+        )
 
     def forward_with_trace(
         self,

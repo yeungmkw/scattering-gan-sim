@@ -16,15 +16,19 @@ import argparse
 import csv
 import hashlib
 import json
+import math
+import os
 import platform
 import shutil
+import tempfile
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from io import StringIO
 from itertools import combinations
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     import resource
@@ -119,6 +123,12 @@ LUO2022_ROI_METRIC_FIELDS = (
 )
 LUO2022_ROI_METRIC_PROTOCOL = "luo2022_r0_roi_pcc_v1"
 LUO2022_ROI_REGRESSION_TOLERANCE = 1e-6
+LUO2022_CONTROL_LADDER_METRIC_PROTOCOL = "luo2022_r0_optical_control_ladder_v1"
+LUO2022_CONTROL_LADDER_IDS = (
+    "direct_free_space_no_d2nn",
+    "zero_phase_four_layer",
+    "trained_four_layer",
+)
 
 
 def luo2022_diffuser_seed_schedule(
@@ -327,7 +337,15 @@ def build_parser() -> argparse.ArgumentParser:
     d2nn_parser.add_argument("--profile", choices=("legacy", "luo2022_r0"), default="legacy")
     d2nn_parser.add_argument(
         "--action",
-        choices=("inspect", "train", "assess", "scatter-audit", "evaluate", "diagnose"),
+        choices=(
+            "inspect",
+            "train",
+            "assess",
+            "scatter-audit",
+            "evaluate",
+            "diagnose",
+            "control-ladder",
+        ),
         default="inspect",
     )
     d2nn_parser.add_argument("--config-path", type=Path, default=DEFAULT_LUO2022_CONFIG)
@@ -403,7 +421,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--run-dir",
         type=Path,
         default=None,
-        help="Completed frozen R0 run directory for --action diagnose; defaults to --output-dir.",
+        help=(
+            "Completed frozen R0 run directory for --action diagnose or control-ladder; "
+            "defaults to --output-dir."
+        ),
     )
     d2nn_parser.add_argument(
         "--diagnostic-output-dir",
@@ -443,6 +464,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("outputs/luo2022_r0_scatter_audit"),
         help="Independent JSON evidence directory for --action scatter-audit.",
+    )
+    d2nn_parser.add_argument(
+        "--control-output-dir",
+        type=Path,
+        default=Path("outputs/luo2022_r0_optical_control_ladder"),
+        help=(
+            "Independent evidence directory for --action control-ladder. It must be "
+            "outside the completed frozen run directory."
+        ),
+    )
+    d2nn_parser.add_argument(
+        "--control-populations",
+        choices=("training", "new", "no_diffuser"),
+        nargs="+",
+        default=("training", "new", "no_diffuser"),
+        help=(
+            "Frozen diffuser populations for --action control-ladder. The default "
+            "evaluates final known, new, and no-diffuser controls."
+        ),
+    )
+    d2nn_parser.add_argument(
+        "--control-training-epochs",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional known-diffuser epochs for --action control-ladder. Defaults "
+            "to the final frozen epoch."
+        ),
     )
 
     unet_parser = subparsers.add_parser("unet", help="Train the coherent U-Net reconstructor.")
@@ -538,6 +588,21 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     diagnostic_diffusers=args.diagnostic_diffusers,
                     diagnostic_pad_factors=tuple(args.diagnostic_pad_factors),
                     cross_bank_audit=args.diagnostic_cross_bank_audit,
+                )
+            if args.action == "control-ladder":
+                return run_luo2022_c0_optical_control_ladder(
+                    run_dir=args.run_dir or Path(args.output_dir),
+                    control_output_dir=args.control_output_dir,
+                    config_path=args.config_path,
+                    download=args.download,
+                    device_name=args.device,
+                    diffuser_chunk_size=args.diffuser_chunk_size,
+                    populations=tuple(args.control_populations),
+                    training_epochs=(
+                        tuple(args.control_training_epochs)
+                        if args.control_training_epochs is not None
+                        else None
+                    ),
                 )
             if args.action == "assess":
                 return run_luo2022_readiness_assessment(
@@ -2520,8 +2585,8 @@ def evaluate_luo2022_model(
 
 
 @torch.no_grad()
-def evaluate_luo2022_model_per_diffuser(
-    model: Luo2022FourLayerD2NN,
+def _evaluate_luo2022_forward_per_diffuser(
+    forward: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     loader: DataLoader,
     diffuser_phase: torch.Tensor,
     *,
@@ -2532,7 +2597,7 @@ def evaluate_luo2022_model_per_diffuser(
     diffuser_chunk_size: int | None = None,
     include_roi_metrics: bool = False,
 ) -> list[dict[str, float | int]]:
-    """Evaluate object means separately for every diffuser.
+    """Evaluate a frozen forward operator separately for every diffuser.
 
     Luo et al. first average PCC over the test objects for each diffuser and
     then summarize the diffuser distribution. The ordinary evaluator returns
@@ -2543,7 +2608,6 @@ def evaluate_luo2022_model_per_diffuser(
     if diffuser_phase.ndim != 3 or diffuser_phase.shape[0] == 0:
         raise ValueError("diffuser_phase must have shape (n, H, W) with n > 0")
 
-    model.eval()
     metric_names = ("total", "negative_pearson", "energy", "pearson")
     totals = {
         name: torch.zeros(int(diffuser_phase.shape[0]), dtype=torch.float64)
@@ -2570,7 +2634,7 @@ def evaluate_luo2022_model_per_diffuser(
         total_diffusers = int(diffuser_phase.shape[0])
         for start in range(0, total_diffusers, chunk_size):
             stop = min(start + chunk_size, total_diffusers)
-            output = model(field, diffuser_phase[start:stop])
+            output = forward(field, diffuser_phase[start:stop])
             components = luo2022_d2nn_components_per_pair(output, target)
             for name in metric_names:
                 totals[name][start:stop] += (
@@ -2614,6 +2678,35 @@ def evaluate_luo2022_model_per_diffuser(
             )
         rows.append(row)
     return rows
+
+
+@torch.no_grad()
+def evaluate_luo2022_model_per_diffuser(
+    model: Luo2022FourLayerD2NN,
+    loader: DataLoader,
+    diffuser_phase: torch.Tensor,
+    *,
+    resized_shape: tuple[int, int],
+    canvas_shape: tuple[int, int],
+    device: torch.device,
+    max_batches: int | None = None,
+    diffuser_chunk_size: int | None = None,
+    include_roi_metrics: bool = False,
+) -> list[dict[str, float | int]]:
+    """Evaluate the standard Luo 2022 model separately for every diffuser."""
+
+    model.eval()
+    return _evaluate_luo2022_forward_per_diffuser(
+        model,
+        loader,
+        diffuser_phase,
+        resized_shape=resized_shape,
+        canvas_shape=canvas_shape,
+        device=device,
+        max_batches=max_batches,
+        diffuser_chunk_size=diffuser_chunk_size,
+        include_roi_metrics=include_roi_metrics,
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -4773,6 +4866,1074 @@ def run_luo2022_roi_posthoc_evaluation(
         ),
     }
     write_json(summary_path, summary)
+    save_progress("completed", status="completed")
+    return summary
+
+
+def _write_luo2022_control_ladder_text_atomically(path: Path, contents: str) -> None:
+    """Atomically replace a C0 evidence text artifact on the same filesystem."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _write_luo2022_control_ladder_json(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write a C0 state or summary after fully serializing it."""
+
+    _write_luo2022_control_ladder_text_atomically(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def _append_luo2022_control_ladder_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Durably append complete C0 JSONL rows so an interrupted row can be retried."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _load_luo2022_control_ladder_rows(
+    path: Path,
+    *,
+    checkpoint_sha256: str,
+    metric_protocol: str,
+) -> dict[str, dict[str, Any]]:
+    """Load resumable C0 records keyed by their control-plus-diffuser identity."""
+
+    if not path.exists():
+        return {}
+    rows: dict[str, dict[str, Any]] = {}
+    valid_lines: list[str] = []
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            valid_lines.append(line)
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            if line_number == len(lines) and not line.endswith("\n"):
+                _write_luo2022_control_ladder_text_atomically(path, "".join(valid_lines))
+                break
+            raise ValueError(
+                f"control-ladder row {line_number} is not valid JSON evidence"
+            ) from exc
+        valid_lines.append(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"control-ladder row {line_number} must be a JSON object")
+        try:
+            record_id = str(row.get("record_id", ""))
+            control_id = str(row.get("control_id", ""))
+            diffuser_id = str(row.get("diffuser_id", ""))
+            if not record_id or not control_id or not diffuser_id:
+                raise ValueError(f"control-ladder row {line_number} lacks a stable identity")
+            if control_id not in LUO2022_CONTROL_LADDER_IDS:
+                raise ValueError(f"control-ladder row {line_number} has an unknown control")
+            if row.get("checkpoint_sha256") != checkpoint_sha256:
+                raise ValueError(
+                    f"control-ladder row {line_number} was produced by a different checkpoint"
+                )
+            if row.get("metric_protocol") != metric_protocol:
+                raise ValueError(
+                    f"control-ladder row {line_number} uses a different metric protocol"
+                )
+            if record_id != f"{control_id}:{diffuser_id}":
+                raise ValueError(
+                    f"control-ladder row {line_number} record_id does not match its control "
+                    "and diffuser"
+                )
+            if record_id in rows:
+                raise ValueError(f"duplicate control-ladder record_id: {record_id}")
+            rows[record_id] = row
+        except (TypeError, ValueError):
+            raise
+    if valid_lines and not valid_lines[-1].endswith("\n"):
+        _write_luo2022_control_ladder_text_atomically(path, "".join(valid_lines) + "\n")
+    return rows
+
+
+def _write_luo2022_control_ladder_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write the C0 records in a table that preserves the control axis."""
+
+    fieldnames = (
+        "record_id",
+        "control_id",
+        "operator",
+        "phase_dependency",
+        "control_phase_sha256",
+        "post_diffuser_distance_m",
+        "explicit_physical_aperture",
+        "finite_numerical_window",
+        "post_diffuser_window_applications",
+        "diffuser_id",
+        "population",
+        "training_epoch",
+        "within_epoch_index",
+        "object_count",
+        "pearson",
+        "negative_pearson",
+        "energy",
+        "total",
+        *LUO2022_ROI_METRIC_FIELDS,
+        "roi_full_canvas_metric_abs_error",
+        "legacy_pearson_abs_error",
+        "checkpoint_sha256",
+        "source_freeze_version",
+        "metric_protocol",
+    )
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: row.get(name) for name in fieldnames})
+    _write_luo2022_control_ladder_text_atomically(path, buffer.getvalue())
+
+
+def _luo2022_scalar_distribution(values: list[float]) -> dict[str, float | int | list[float] | None]:
+    """Summarize paired control differences without assuming multiple samples."""
+
+    array = np.asarray(values, dtype=np.float64)
+    if array.size == 0:
+        raise ValueError("cannot summarize an empty control-ladder metric distribution")
+    mean = float(array.mean())
+    sample_std = float(array.std(ddof=1)) if array.size > 1 else None
+    standard_error = (
+        sample_std / float(np.sqrt(array.size))
+        if sample_std is not None
+        else None
+    )
+    return {
+        "diffuser_count": int(array.size),
+        "mean": mean,
+        "sample_std": sample_std,
+        "standard_error": standard_error,
+        "ci95_normal": (
+            [mean - 1.96 * standard_error, mean + 1.96 * standard_error]
+            if standard_error is not None
+            else None
+        ),
+        "minimum": float(array.min()),
+        "maximum": float(array.max()),
+    }
+
+
+def _summarize_luo2022_control_ladder_rows(
+    rows: list[dict[str, Any]],
+    *,
+    requested_populations: tuple[str, ...],
+) -> dict[str, Any]:
+    """Group C0 evidence by optical operator and matched diffuser population."""
+
+    metric_names = (
+        "total",
+        "negative_pearson",
+        "energy",
+        "pearson",
+        *LUO2022_ROI_METRIC_FIELDS,
+    )
+    population_names = {
+        "training": "selected_known_diffusers",
+        "new": "new_unseen_diffusers",
+        "no_diffuser": "no_diffuser_control",
+    }
+    by_control = {
+        control_id: [row for row in rows if row["control_id"] == control_id]
+        for control_id in LUO2022_CONTROL_LADDER_IDS
+    }
+    groups = {
+        control_id: {
+            population_names[population]: _luo2022_metric_distribution(
+                [
+                    row
+                    for row in control_rows
+                    if row["population"] == population
+                ],
+                metric_names=metric_names,
+            )
+            for population in requested_populations
+        }
+        for control_id, control_rows in by_control.items()
+    }
+    pairwise: dict[str, dict[str, Any]] = {}
+    comparisons = (
+        ("zero_phase_four_layer", "direct_free_space_no_d2nn"),
+        ("trained_four_layer", "zero_phase_four_layer"),
+        ("trained_four_layer", "direct_free_space_no_d2nn"),
+    )
+    for minuend_control, subtrahend_control in comparisons:
+        comparison_id = f"{minuend_control}_minus_{subtrahend_control}"
+        by_population: dict[str, Any] = {}
+        for population in requested_populations:
+            minuend_rows = {
+                str(row["diffuser_id"]): row
+                for row in by_control[minuend_control]
+                if row["population"] == population
+            }
+            subtrahend_rows = {
+                str(row["diffuser_id"]): row
+                for row in by_control[subtrahend_control]
+                if row["population"] == population
+            }
+            if set(minuend_rows) != set(subtrahend_rows):
+                raise ValueError(
+                    "control-ladder controls do not share an identical diffuser set for "
+                    f"{population}"
+                )
+            by_population[population_names[population]] = {
+                "metrics": {
+                    metric: _luo2022_scalar_distribution(
+                        [
+                            float(minuend_rows[diffuser_id][metric])
+                            - float(subtrahend_rows[diffuser_id][metric])
+                            for diffuser_id in sorted(minuend_rows)
+                        ]
+                    )
+                    for metric in metric_names
+                }
+            }
+        pairwise[comparison_id] = by_population
+    return {
+        "by_control": groups,
+        "paired_differences": pairwise,
+    }
+
+
+def run_luo2022_c0_optical_control_ladder(
+    *,
+    run_dir: Path,
+    control_output_dir: Path,
+    config_path: Path = DEFAULT_LUO2022_CONFIG,
+    download: bool = False,
+    device_name: str = "cpu",
+    diffuser_chunk_size: int | None = None,
+    populations: tuple[str, ...] = ("training", "new", "no_diffuser"),
+    training_epochs: tuple[int, ...] | None = None,
+) -> dict[str, Any]:
+    """Evaluate direct, zero-phase, and frozen four-layer optical controls.
+
+    The routine is read-only with respect to ``run_dir``. It evaluates the
+    same frozen diffuser populations under three operators: a single direct
+    post-diffuser propagation with no D2NN layers, the sampled four-layer
+    geometry with zero phase plates, and the exact trained checkpoint.
+    """
+
+    allowed_populations = {"training", "new", "no_diffuser"}
+    requested_populations = tuple(dict.fromkeys(populations))
+    if not requested_populations or not set(requested_populations) <= allowed_populations:
+        raise ValueError("control-ladder populations must be training, new, or no_diffuser")
+    if training_epochs is not None and "training" not in requested_populations:
+        raise ValueError("control training epoch selection requires the training population")
+    run_resolved = run_dir.resolve()
+    evidence_resolved = control_output_dir.resolve()
+    if evidence_resolved == run_resolved or run_resolved in evidence_resolved.parents:
+        raise ValueError("control-ladder output directory must be outside the frozen run directory")
+
+    device = select_device(device_name)
+    frozen = _load_luo2022_frozen_run_artifacts(
+        run_dir=run_dir,
+        config_path=config_path,
+        device=device,
+    )
+    values = frozen.runtime_config["runtime"]
+    if values.get("max_eval_batches") is not None:
+        raise ValueError(
+            "control-ladder requires full frozen evaluation; max_eval_batches must be null"
+        )
+    target_epochs = int(values["epochs"])
+    if training_epochs is None:
+        selected_training_epochs = (target_epochs,)
+    else:
+        selected_training_epochs = tuple(sorted(set(int(epoch) for epoch in training_epochs)))
+        if not selected_training_epochs:
+            raise ValueError("control training epoch selection must not be empty")
+        if any(epoch < 1 or epoch > target_epochs for epoch in selected_training_epochs):
+            raise ValueError("control training epochs must lie within the frozen run")
+    if "training" not in requested_populations:
+        selected_training_epochs = ()
+
+    optics_config = _luo2022_optics_config_from_frozen_run(
+        frozen.runtime_config,
+        frozen.contract,
+    )
+    expected_training_count = int(values["diffusers_per_epoch"])
+    selected_training_banks: dict[int, Path] = {}
+    selected_training_bank_sha256: dict[str, str] = {}
+    phase_groups: list[tuple[str, torch.Tensor, list[dict[str, Any]]]] = []
+    if "training" in requested_populations:
+        for epoch in selected_training_epochs:
+            bank_path = run_dir / "diffusers" / f"training_epoch_{epoch:03d}.pt"
+            if not bank_path.is_file():
+                raise FileNotFoundError(
+                    f"saved training diffuser bank is missing for epoch {epoch}"
+                )
+            phases = torch.load(bank_path, map_location="cpu", weights_only=True)
+            expected_shape = (expected_training_count, *optics_config.field_shape)
+            if tuple(phases.shape) != expected_shape:
+                raise ValueError(
+                    f"training diffuser bank shape does not match frozen runtime for epoch {epoch}"
+                )
+            selected_training_banks[epoch] = bank_path
+            selected_training_bank_sha256[str(epoch)] = _sha256_file(bank_path)
+            phase_groups.append(
+                (
+                    "training",
+                    phases,
+                    [
+                        {
+                            "diffuser_id": f"training:e{epoch:03d}:i{index:02d}",
+                            "population": "training",
+                            "training_epoch": epoch,
+                            "within_epoch_index": index,
+                        }
+                        for index in range(expected_training_count)
+                    ],
+                )
+            )
+
+    new_diffusers: torch.Tensor | None = None
+    new_diffusers_sha256: str | None = None
+    seed_schedule: dict[str, Any] | None = None
+    seed_schedule_provenance: str | None = None
+    if "new" in requested_populations:
+        diffuser_kwargs = _luo2022_diffuser_kwargs(optics_config, frozen.contract)
+        uniqueness = frozen.contract["diffuser"]["uniqueness"]
+        seed_schedule, seed_schedule_provenance = _luo2022_frozen_diffuser_seed_schedule(
+            frozen.runtime_config,
+            frozen.contract,
+        )
+        new_diffusers = make_unique_correlated_diffusers(
+            int(values["eval_diffusers"]),
+            field_shape=optics_config.field_shape,
+            base_seed=int(seed_schedule["evaluation_base_seed"]),
+            minimum_difference_radians=float(uniqueness["minimum_radians"]),
+            phase_representation=str(uniqueness["phase_representation"]),
+            **diffuser_kwargs,
+        )
+        new_diffusers_sha256 = _sha256_tensor(new_diffusers)
+        phase_groups.append(
+            (
+                "new",
+                new_diffusers,
+                [
+                    {
+                        "diffuser_id": f"new:i{index:02d}",
+                        "population": "new",
+                        "training_epoch": None,
+                        "within_epoch_index": index,
+                    }
+                    for index in range(int(new_diffusers.shape[0]))
+                ],
+            )
+        )
+
+    no_diffuser: torch.Tensor | None = None
+    no_diffuser_phase_sha256: str | None = None
+    if "no_diffuser" in requested_populations:
+        no_diffuser = torch.zeros((1, *optics_config.field_shape), dtype=torch.float32)
+        no_diffuser_phase_sha256 = _sha256_tensor(no_diffuser)
+        phase_groups.append(
+            (
+                "no_diffuser",
+                no_diffuser,
+                [
+                    {
+                        "diffuser_id": "no_diffuser",
+                        "population": "no_diffuser",
+                        "training_epoch": None,
+                        "within_epoch_index": 0,
+                    }
+                ],
+            )
+        )
+
+    expected_population_counts = {
+        "training": (
+            len(selected_training_epochs) * expected_training_count
+            if "training" in requested_populations
+            else 0
+        ),
+        "new": int(values["eval_diffusers"]) if "new" in requested_populations else 0,
+        "no_diffuser": 1 if "no_diffuser" in requested_populations else 0,
+    }
+    source_metadata = {
+        str(metadata["diffuser_id"]): metadata
+        for _population, _phases, rows in phase_groups
+        for metadata in rows
+    }
+    if len(source_metadata) != sum(expected_population_counts.values()):
+        raise RuntimeError("control-ladder diffuser metadata count does not match requested scope")
+
+    legacy_rows_path = run_dir / "posthoc_evaluation" / "per_diffuser_metrics.jsonl"
+    legacy_rows_by_id: dict[str, dict[str, Any]] | None = None
+    legacy_posthoc_per_diffuser_sha256: str | None = None
+    if legacy_rows_path.is_file():
+        candidate_legacy_rows = _load_luo2022_posthoc_rows(
+            legacy_rows_path,
+            checkpoint_sha256=frozen.checkpoint_sha256,
+        )
+        missing_legacy_rows = sorted(set(source_metadata) - set(candidate_legacy_rows))
+        if missing_legacy_rows:
+            raise ValueError(
+                "existing full-canvas post-hoc evidence is missing requested C0 diffuser rows"
+            )
+        legacy_rows_by_id = candidate_legacy_rows
+        legacy_posthoc_per_diffuser_sha256 = _sha256_file(legacy_rows_path)
+
+    trained_model = Luo2022FourLayerD2NN(optics_config).to(device).eval()
+    trained_model.load_state_dict(frozen.checkpoint["model"], strict=True)
+    trained_phase_before = trained_model.phase.detach().clone()
+    trained_phase_sha256 = _sha256_tensor(trained_phase_before)
+    zero_phase_model = Luo2022FourLayerD2NN(optics_config).to(device).eval()
+    zero_phase_before = zero_phase_model.phase.detach().clone()
+    if not torch.equal(zero_phase_before, torch.zeros_like(zero_phase_before)):
+        raise RuntimeError("zero-phase C0 control did not initialize with zero phase plates")
+    zero_phase_sha256 = _sha256_tensor(zero_phase_before)
+    post_diffuser_distance_m = (
+        optics_config.diffuser_to_first_layer_distance
+        + (optics_config.num_layers - 1) * optics_config.layer_distance
+        + optics_config.output_distance
+    )
+    sampled_post_diffuser_window_applications = optics_config.num_layers + 1
+    control_definitions = {
+        "direct_free_space_no_d2nn": {
+            "operator": "single_direct_propagation",
+            "phase_dependency": "none",
+            "control_phase_sha256": None,
+            "post_diffuser_distance_m": post_diffuser_distance_m,
+            "explicit_physical_aperture": "none",
+            "finite_numerical_window": (
+                "one center-cropped finite Rayleigh-Sommerfeld propagation grid"
+            ),
+            "post_diffuser_window_applications": 1,
+            "description": (
+                "One Rayleigh-Sommerfeld propagation from the field immediately after the "
+                "diffuser to the unchanged detector plane; no diffractive layer plane is kept. "
+                "The direct control applies one finite numerical propagation window."
+            ),
+        },
+        "zero_phase_four_layer": {
+            "operator": "four_layer_zero_phase",
+            "phase_dependency": "zero_phase_plates",
+            "control_phase_sha256": zero_phase_sha256,
+            "post_diffuser_distance_m": post_diffuser_distance_m,
+            "explicit_physical_aperture": "none",
+            "finite_numerical_window": (
+                "center-cropped finite Rayleigh-Sommerfeld grid after every post-diffuser "
+                "propagation segment"
+            ),
+            "post_diffuser_window_applications": sampled_post_diffuser_window_applications,
+            "description": (
+                "The frozen sampled four-layer geometry with four phase plates fixed to zero; "
+                "it applies a finite numerical propagation window at each sampled plane."
+            ),
+        },
+        "trained_four_layer": {
+            "operator": "four_layer_checkpoint_phase",
+            "phase_dependency": "frozen_checkpoint_phase_plates",
+            "control_phase_sha256": trained_phase_sha256,
+            "post_diffuser_distance_m": post_diffuser_distance_m,
+            "explicit_physical_aperture": "none",
+            "finite_numerical_window": (
+                "center-cropped finite Rayleigh-Sommerfeld grid after every post-diffuser "
+                "propagation segment"
+            ),
+            "post_diffuser_window_applications": sampled_post_diffuser_window_applications,
+            "description": (
+                "The exact frozen four-layer checkpoint with no parameter or optimizer update; "
+                "it applies a finite numerical propagation window at each sampled plane."
+            ),
+        },
+    }
+    evidence_spec = {
+        "schema_version": 1,
+        "implementation_version": LUO2022_CONTROL_LADDER_METRIC_PROTOCOL,
+        "read_only": True,
+        "requested_populations": list(requested_populations),
+        "requested_training_epochs": list(selected_training_epochs),
+        "controls": control_definitions,
+        "dataset": {
+            "name": "MNIST",
+            "split": "test",
+            "object_indices": [0, int(values["eval_limit"]) - 1],
+            "objects_per_diffuser": int(values["eval_limit"]),
+        },
+        "roi_definitions": {
+            "full_canvas": (
+                f"all {optics_config.field_shape[0]}x{optics_config.field_shape[1]} detector pixels"
+            ),
+            "center_input_region": (
+                f"centered {int(values['input_size'])}x{int(values['input_size'])} input footprint"
+            ),
+            "target_support": "prepared target amplitude strictly greater than zero per object",
+        },
+        "aggregation_protocol": (
+            "per-object metrics, then mean over test objects per diffuser; controls are "
+            "compared by matched diffuser identities"
+        ),
+        "padding_factor": int(optics_config.pad_factor),
+        "dtype": str(trained_model.phase.dtype),
+    }
+    fingerprint = {
+        "profile_id": frozen.contract["profile_id"],
+        "source_freeze_version": frozen.contract["freeze_version"],
+        "checkpoint_sha256": frozen.checkpoint_sha256,
+        "runtime_config_sha256": frozen.runtime_config_sha256,
+        "source_config_sha256": frozen.source_config_sha256,
+        "manifest_sha256": frozen.manifest_sha256,
+        "run_state_sha256": frozen.run_state_sha256,
+        "selected_training_diffuser_banks_sha256": selected_training_bank_sha256,
+        "evaluation_seed_diffusers_sha256": new_diffusers_sha256,
+        "no_diffuser_phase_sha256": no_diffuser_phase_sha256,
+        "legacy_posthoc_per_diffuser_sha256": legacy_posthoc_per_diffuser_sha256,
+        "legacy_posthoc_regression_required": legacy_rows_by_id is not None,
+        "diffuser_seed_schedule": seed_schedule,
+        "diffuser_seed_schedule_provenance": seed_schedule_provenance,
+        "trained_phase_sha256": trained_phase_sha256,
+        "zero_phase_sha256": zero_phase_sha256,
+        "implementation_source_sha256": {
+            "experiment": _sha256_file(Path(__file__)),
+            "d2nn": _sha256_file(Path(__file__).with_name("d2nn.py")),
+        },
+        "evidence_spec": evidence_spec,
+    }
+
+    rows_path = control_output_dir / "control_ladder_per_diffuser_metrics.jsonl"
+    csv_path = control_output_dir / "control_ladder_per_diffuser_metrics.csv"
+    state_path = control_output_dir / "control_ladder_state.json"
+    summary_path = control_output_dir / "control_ladder_summary.json"
+    if not state_path.is_file() and (
+        rows_path.is_file() or csv_path.is_file() or summary_path.is_file()
+    ):
+        raise ValueError("control-ladder evidence exists without a matching state")
+    saved_state = load_config(state_path) if state_path.is_file() else None
+    if saved_state is not None:
+        if saved_state.get("evidence_fingerprint") != fingerprint:
+            raise ValueError("control-ladder state does not match the frozen inputs or request")
+        if saved_state.get("metric_protocol") != LUO2022_CONTROL_LADDER_METRIC_PROTOCOL:
+            raise ValueError("control-ladder state uses a different metric protocol")
+        if saved_state.get("status") not in {
+            "running",
+            "finalizing",
+            "completed",
+            "incomplete",
+        }:
+            raise ValueError("control-ladder state has an unsupported status")
+    rows_by_id = _load_luo2022_control_ladder_rows(
+        rows_path,
+        checkpoint_sha256=frozen.checkpoint_sha256,
+        metric_protocol=LUO2022_CONTROL_LADDER_METRIC_PROTOCOL,
+    )
+    expected_rows = {
+        f"{control_id}:{diffuser_id}": {
+            "record_id": f"{control_id}:{diffuser_id}",
+            "control_id": control_id,
+            **metadata,
+        }
+        for control_id in LUO2022_CONTROL_LADDER_IDS
+        for diffuser_id, metadata in source_metadata.items()
+    }
+    unexpected_rows = sorted(set(rows_by_id) - set(expected_rows))
+    if unexpected_rows:
+        raise ValueError("control-ladder evidence contains rows outside its frozen scope")
+
+    def completed_counts() -> dict[str, dict[str, int]]:
+        return {
+            control_id: {
+                population: sum(
+                    row["control_id"] == control_id and row["population"] == population
+                    for row in rows_by_id.values()
+                )
+                for population in sorted(allowed_populations)
+            }
+            for control_id in LUO2022_CONTROL_LADDER_IDS
+        }
+
+    metric_names = (
+        "total",
+        "negative_pearson",
+        "energy",
+        "pearson",
+        *LUO2022_ROI_METRIC_FIELDS,
+    )
+
+    def finite_row_value(row: dict[str, Any], name: str, record_id: str) -> float:
+        try:
+            value = float(row[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"control-ladder row has no numeric {name!r} value for {record_id}"
+            ) from exc
+        if not math.isfinite(value):
+            raise ValueError(
+                f"control-ladder row has a non-finite {name!r} value for {record_id}"
+            )
+        return value
+
+    def validate_control_row(row: dict[str, Any]) -> None:
+        record_id = str(row["record_id"])
+        expected = expected_rows.get(record_id)
+        if expected is None:
+            raise ValueError(f"control-ladder row is outside its frozen scope: {record_id}")
+        for name in (
+            "control_id",
+            "diffuser_id",
+            "population",
+            "training_epoch",
+            "within_epoch_index",
+        ):
+            if row.get(name) != expected.get(name):
+                raise ValueError(f"control-ladder row metadata mismatch for {record_id}: {name}")
+        try:
+            object_count = int(row["object_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"control-ladder object count is invalid for {record_id}"
+            ) from exc
+        if object_count != int(values["eval_limit"]):
+            raise ValueError(f"control-ladder object count mismatch for {record_id}")
+        values_by_name = {
+            name: finite_row_value(row, name, record_id)
+            for name in metric_names
+        }
+        full_canvas_error = abs(
+            values_by_name["roi_full_canvas_pearson"] - values_by_name["pearson"]
+        )
+        reported_full_canvas_error = finite_row_value(
+            row,
+            "roi_full_canvas_metric_abs_error",
+            record_id,
+        )
+        if (
+            abs(reported_full_canvas_error - full_canvas_error)
+            > LUO2022_ROI_REGRESSION_TOLERANCE
+        ):
+            raise ValueError(
+                f"control-ladder full-canvas PCC error provenance mismatch for {record_id}"
+            )
+        if full_canvas_error > LUO2022_ROI_REGRESSION_TOLERANCE:
+            raise ValueError(f"control-ladder full-canvas PCC mismatch for {record_id}")
+        control_id = str(row["control_id"])
+        definition = control_definitions[control_id]
+        for name in (
+            "operator",
+            "phase_dependency",
+            "control_phase_sha256",
+            "explicit_physical_aperture",
+            "finite_numerical_window",
+            "post_diffuser_window_applications",
+        ):
+            if row.get(name) != definition[name]:
+                raise ValueError(
+                    f"control-ladder control provenance mismatch for {record_id}: {name}"
+                )
+        try:
+            post_diffuser_distance = float(row["post_diffuser_distance_m"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"control-ladder post-diffuser distance is invalid for {record_id}"
+            ) from exc
+        if not math.isfinite(post_diffuser_distance) or not math.isclose(
+            post_diffuser_distance,
+            float(definition["post_diffuser_distance_m"]),
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        ):
+            raise ValueError(f"control-ladder post-diffuser distance mismatch for {record_id}")
+        if row.get("source_freeze_version") != frozen.contract["freeze_version"]:
+            raise ValueError(f"control-ladder freeze version mismatch for {record_id}")
+        if row.get("metric_protocol") != LUO2022_CONTROL_LADDER_METRIC_PROTOCOL:
+            raise ValueError(f"control-ladder metric protocol mismatch for {record_id}")
+        if row.get("checkpoint_sha256") != frozen.checkpoint_sha256:
+            raise ValueError(f"control-ladder checkpoint mismatch for {record_id}")
+
+        reported_legacy_error = row.get("legacy_pearson_abs_error")
+        if control_id != "trained_four_layer":
+            if reported_legacy_error is not None:
+                raise ValueError(
+                    f"non-trained control has legacy regression evidence for {record_id}"
+                )
+            return
+        if legacy_rows_by_id is None:
+            if reported_legacy_error is not None:
+                raise ValueError(
+                    f"trained control has unexpected legacy regression evidence for {record_id}"
+                )
+            return
+        legacy_row = legacy_rows_by_id[str(row["diffuser_id"])]
+        if int(legacy_row["object_count"]) != object_count:
+            raise ValueError(
+                f"trained control object count does not match legacy evidence for {record_id}"
+            )
+        for name in ("population", "training_epoch", "within_epoch_index"):
+            if legacy_row.get(name) != row.get(name):
+                raise ValueError(
+                    f"trained control metadata does not match legacy evidence for "
+                    f"{record_id}: {name}"
+                )
+        legacy_pearson = finite_row_value(
+            legacy_row,
+            "pearson",
+            f"legacy:{row['diffuser_id']}",
+        )
+        expected_legacy_error = abs(values_by_name["pearson"] - legacy_pearson)
+        actual_legacy_error = finite_row_value(
+            row,
+            "legacy_pearson_abs_error",
+            record_id,
+        )
+        if (
+            abs(actual_legacy_error - expected_legacy_error)
+            > LUO2022_ROI_REGRESSION_TOLERANCE
+        ):
+            raise ValueError(
+                f"trained control legacy PCC error provenance mismatch for {record_id}"
+            )
+        if expected_legacy_error > LUO2022_ROI_REGRESSION_TOLERANCE:
+            raise ValueError(
+                f"trained control PCC does not reproduce legacy post-hoc evidence for "
+                f"{record_id}"
+            )
+
+    for existing_row in rows_by_id.values():
+        validate_control_row(existing_row)
+
+    def validate_completed_summary(summary: dict[str, Any]) -> None:
+        if (
+            summary.get("status") != "completed"
+            or summary.get("read_only") is not True
+            or summary.get("metric_protocol") != LUO2022_CONTROL_LADDER_METRIC_PROTOCOL
+            or summary.get("evidence_fingerprint") != fingerprint
+        ):
+            raise ValueError("completed control-ladder summary does not match its saved state")
+        if summary.get("expected_record_count") != len(expected_rows):
+            raise ValueError("completed control-ladder summary has an incorrect record count")
+        if summary.get("objects_per_diffuser") != int(values["eval_limit"]):
+            raise ValueError("completed control-ladder summary has an incorrect object count")
+        if summary.get("completed_population_counts") != completed_counts():
+            raise ValueError("completed control-ladder summary has incorrect group counts")
+        expected_groups = _summarize_luo2022_control_ladder_rows(
+            list(rows_by_id.values()),
+            requested_populations=requested_populations,
+        )
+        if summary.get("groups") != expected_groups:
+            raise ValueError("completed control-ladder summary does not match its evidence rows")
+        legacy_errors = [
+            float(row["legacy_pearson_abs_error"])
+            for row in rows_by_id.values()
+            if row["control_id"] == "trained_four_layer"
+            and row["legacy_pearson_abs_error"] is not None
+        ]
+        expected_regression = {
+            "status": (
+                "verified_against_run_local_posthoc"
+                if legacy_rows_by_id is not None
+                else "not_available_run_local_posthoc_absent"
+            ),
+            "tolerance": LUO2022_ROI_REGRESSION_TOLERANCE,
+            "max_abs_error": max(legacy_errors) if legacy_errors else None,
+        }
+        if summary.get("trained_four_layer_legacy_full_canvas_regression") != (
+            expected_regression
+        ):
+            raise ValueError(
+                "completed control-ladder summary does not match trained-control "
+                "legacy regression evidence"
+            )
+
+    if saved_state is not None and saved_state.get("status") == "completed":
+        if set(rows_by_id) != set(expected_rows):
+            raise ValueError("completed control-ladder state has incomplete evidence rows")
+        if not summary_path.is_file():
+            raise ValueError("completed control-ladder state lacks its summary")
+        saved_summary = load_config(summary_path)
+        validate_completed_summary(saved_summary)
+        return saved_summary
+    if saved_state is not None and saved_state.get("status") == "finalizing" and summary_path.is_file():
+        if set(rows_by_id) != set(expected_rows):
+            raise ValueError("finalizing control-ladder state has incomplete evidence rows")
+        saved_summary = load_config(summary_path)
+        validate_completed_summary(saved_summary)
+        _write_luo2022_control_ladder_json(
+            state_path,
+            {
+                **saved_state,
+                "status": "completed",
+                "stage": "completed",
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+                "completed_at_utc": saved_summary.get("completed_at_utc"),
+            },
+        )
+        return saved_summary
+    if summary_path.is_file():
+        raise ValueError("control-ladder summary exists before its state is completed")
+
+    seed_everything(int(values["seed"]))
+    eval_base = build_torchvision_dataset(
+        name="MNIST",
+        root=DEFAULT_DATA_ROOT,
+        train=False,
+        image_size=int(frozen.contract["input"]["original_shape"][0]),
+        download=download,
+    )
+    eval_dataset = Subset(eval_base, range(min(int(values["eval_limit"]), len(eval_base))))
+    if len(eval_dataset) != int(values["eval_limit"]):
+        raise ValueError("frozen evaluation object count is unavailable from the requested dataset")
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=int(values["batch_size"]),
+        shuffle=False,
+    )
+    effective_chunk_size = int(
+        diffuser_chunk_size or values["diffuser_chunk_size"] or expected_training_count
+    )
+    if effective_chunk_size <= 0:
+        raise ValueError("diffuser chunk size must be positive")
+    resized_shape = (int(values["input_size"]), int(values["input_size"]))
+
+    control_output_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_progress(stage: str, *, status: str = "running") -> None:
+        _write_luo2022_control_ladder_json(
+            state_path,
+            {
+                "schema_version": 1,
+                "status": status,
+                "stage": stage,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+                "read_only": True,
+                "metric_protocol": LUO2022_CONTROL_LADDER_METRIC_PROTOCOL,
+                "requested_populations": list(requested_populations),
+                "requested_training_epochs": list(selected_training_epochs),
+                "completed_population_counts": completed_counts(),
+                "expected_population_counts_per_control": expected_population_counts,
+                "expected_record_count": len(expected_rows),
+                "objects_per_diffuser": len(eval_dataset),
+                "evidence_fingerprint": fingerprint,
+            },
+        )
+
+    def evaluate_and_record(
+        control_id: str,
+        forward: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        phases_cpu: torch.Tensor,
+        metadata_rows: list[dict[str, Any]],
+        *,
+        stage: str,
+    ) -> None:
+        missing = [
+            (index, metadata)
+            for index, metadata in enumerate(metadata_rows)
+            if f"{control_id}:{metadata['diffuser_id']}" not in rows_by_id
+        ]
+        if not missing:
+            save_progress(stage)
+            return
+        missing_indices = [index for index, _metadata in missing]
+        metrics = _evaluate_luo2022_forward_per_diffuser(
+            forward,
+            eval_loader,
+            phases_cpu[missing_indices].to(device),
+            resized_shape=resized_shape,
+            canvas_shape=optics_config.field_shape,
+            device=device,
+            max_batches=values["max_eval_batches"],
+            diffuser_chunk_size=effective_chunk_size,
+            include_roi_metrics=True,
+        )
+        new_rows: list[dict[str, Any]] = []
+        for (_index, metadata), metric in zip(missing, metrics, strict=True):
+            record_id = f"{control_id}:{metadata['diffuser_id']}"
+            row = {
+                "record_id": record_id,
+                "control_id": control_id,
+                **control_definitions[control_id],
+                **metadata,
+                **metric,
+                "checkpoint_sha256": frozen.checkpoint_sha256,
+                "source_freeze_version": str(frozen.contract["freeze_version"]),
+                "metric_protocol": LUO2022_CONTROL_LADDER_METRIC_PROTOCOL,
+            }
+            row["roi_full_canvas_metric_abs_error"] = abs(
+                float(row["roi_full_canvas_pearson"]) - float(row["pearson"])
+            )
+            if control_id == "trained_four_layer" and legacy_rows_by_id is not None:
+                row["legacy_pearson_abs_error"] = abs(
+                    float(row["pearson"])
+                    - float(legacy_rows_by_id[str(row["diffuser_id"])]["pearson"])
+                )
+                if (
+                    float(row["legacy_pearson_abs_error"])
+                    > LUO2022_ROI_REGRESSION_TOLERANCE
+                ):
+                    raise ValueError(
+                        "trained-four-layer C0 PCC does not reproduce existing post-hoc "
+                        f"evidence for {record_id}"
+                    )
+            else:
+                row["legacy_pearson_abs_error"] = None
+            validate_control_row(row)
+            new_rows.append(row)
+        _append_luo2022_control_ladder_rows(rows_path, new_rows)
+        for row in new_rows:
+            rows_by_id[str(row["record_id"])] = row
+        save_progress(stage)
+
+    forward_operators: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
+        "direct_free_space_no_d2nn": trained_model.forward_without_diffractive_layers,
+        "zero_phase_four_layer": zero_phase_model,
+        "trained_four_layer": trained_model,
+    }
+    save_progress("initializing")
+    for control_id in LUO2022_CONTROL_LADDER_IDS:
+        for population, phases_cpu, metadata_rows in phase_groups:
+            evaluate_and_record(
+                control_id,
+                forward_operators[control_id],
+                phases_cpu,
+                metadata_rows,
+                stage=f"{control_id}:{population}",
+            )
+
+    if set(rows_by_id) != set(expected_rows):
+        raise RuntimeError("control-ladder evaluation did not complete its requested scope")
+    trained_phase_after = trained_model.phase.detach().clone()
+    zero_phase_after = zero_phase_model.phase.detach().clone()
+    if not torch.equal(trained_phase_after, trained_phase_before):
+        raise RuntimeError("read-only control-ladder evaluation changed the frozen model phase")
+    if not torch.equal(zero_phase_after, zero_phase_before):
+        raise RuntimeError("read-only control-ladder evaluation changed the zero-phase control")
+
+    frozen_hashes_before = {
+        "checkpoint_sha256": frozen.checkpoint_sha256,
+        "runtime_config_sha256": frozen.runtime_config_sha256,
+        "source_config_sha256": frozen.source_config_sha256,
+        "manifest_sha256": frozen.manifest_sha256,
+        "run_state_sha256": frozen.run_state_sha256,
+        "selected_training_diffuser_banks_sha256": selected_training_bank_sha256,
+        "legacy_posthoc_per_diffuser_sha256": legacy_posthoc_per_diffuser_sha256,
+    }
+    frozen_hashes_after = {
+        "checkpoint_sha256": _sha256_file(frozen.checkpoint_path),
+        "runtime_config_sha256": _sha256_file(run_dir / "config.json"),
+        "source_config_sha256": _sha256_file(run_dir / "source_config.json"),
+        "manifest_sha256": _sha256_file(run_dir / "manifest.json"),
+        "run_state_sha256": _sha256_file(run_dir / "run_state.json"),
+        "selected_training_diffuser_banks_sha256": {
+            str(epoch): _sha256_file(path)
+            for epoch, path in selected_training_banks.items()
+        },
+        "legacy_posthoc_per_diffuser_sha256": (
+            _sha256_file(legacy_rows_path) if legacy_rows_path.is_file() else None
+        ),
+    }
+    if frozen_hashes_after != frozen_hashes_before:
+        raise RuntimeError("frozen R0 inputs changed during control-ladder evaluation")
+
+    control_order = {name: index for index, name in enumerate(LUO2022_CONTROL_LADDER_IDS)}
+    population_order = {"training": 0, "new": 1, "no_diffuser": 2}
+    rows = sorted(
+        rows_by_id.values(),
+        key=lambda row: (
+            control_order[str(row["control_id"])],
+            population_order[str(row["population"])],
+            int(row["training_epoch"] or 0),
+            int(row["within_epoch_index"]),
+        ),
+    )
+    summary_groups = _summarize_luo2022_control_ladder_rows(
+        rows,
+        requested_populations=requested_populations,
+    )
+    legacy_errors = [
+        float(row["legacy_pearson_abs_error"])
+        for row in rows
+        if row["control_id"] == "trained_four_layer"
+        and row["legacy_pearson_abs_error"] is not None
+    ]
+    if legacy_rows_by_id is not None and len(legacy_errors) != len(source_metadata):
+        raise RuntimeError(
+            "trained control does not contain one validated legacy regression error per diffuser"
+        )
+    summary = {
+        "schema_version": 1,
+        "status": "completed",
+        "completed_at_utc": datetime.now(UTC).isoformat(),
+        "read_only": True,
+        "metric_protocol": LUO2022_CONTROL_LADDER_METRIC_PROTOCOL,
+        "requested_populations": list(requested_populations),
+        "requested_training_epochs": list(selected_training_epochs),
+        "completed_population_counts": completed_counts(),
+        "expected_population_counts_per_control": expected_population_counts,
+        "expected_record_count": len(expected_rows),
+        "objects_per_diffuser": len(eval_dataset),
+        "evidence_spec": evidence_spec,
+        "groups": summary_groups,
+        "trained_four_layer_legacy_full_canvas_regression": {
+            "status": (
+                "verified_against_run_local_posthoc"
+                if legacy_rows_by_id is not None
+                else "not_available_run_local_posthoc_absent"
+            ),
+            "tolerance": LUO2022_ROI_REGRESSION_TOLERANCE,
+            "max_abs_error": max(legacy_errors) if legacy_errors else None,
+        },
+        "evidence_fingerprint": fingerprint,
+        "source_run": {
+            "profile_id": frozen.manifest["profile_id"],
+            "source_freeze_version": frozen.contract["freeze_version"],
+            "checkpoint": "checkpoints/luo2022_d2nn.pt",
+            "git": frozen.manifest.get("runtime", {}).get("git"),
+        },
+        "artifact_integrity": {
+            **frozen_hashes_before,
+            "source_config_integrity": frozen.source_config_integrity,
+            "evaluation_seed_diffusers_sha256": new_diffusers_sha256,
+            "no_diffuser_phase_sha256": no_diffuser_phase_sha256,
+            "trained_phase_before_sha256": trained_phase_sha256,
+            "trained_phase_after_sha256": _sha256_tensor(trained_phase_after),
+            "zero_phase_before_sha256": zero_phase_sha256,
+            "zero_phase_after_sha256": _sha256_tensor(zero_phase_after),
+            "trained_phase_unchanged": True,
+            "zero_phase_unchanged": True,
+            "frozen_input_hashes_unchanged": True,
+        },
+        "artifacts": {
+            "per_diffuser_jsonl": "control_ladder_per_diffuser_metrics.jsonl",
+            "per_diffuser_csv": "control_ladder_per_diffuser_metrics.csv",
+            "state": "control_ladder_state.json",
+            "summary": "control_ladder_summary.json",
+        },
+        "claim_boundary": (
+            "Read-only numerical controls for a frozen digital R0 checkpoint. The direct "
+            "condition is a project-defined single-propagation analogue of the paper's "
+            "supplementary no-diffractive-layer wording; the paper does not disclose the "
+            "exact numerical discretization, ROI, or aggregate sample protocol for Figure S4."
+        ),
+    }
+    save_progress("finalizing", status="finalizing")
+    _write_luo2022_control_ladder_csv(csv_path, rows)
+    _write_luo2022_control_ladder_json(summary_path, summary)
     save_progress("completed", status="completed")
     return summary
 

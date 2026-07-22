@@ -389,6 +389,34 @@ def test_luo2022_forward_trace_matches_forward_and_phase_masks_preserve_energy()
         )
 
 
+def test_luo2022_direct_no_d2nn_control_uses_single_total_post_diffuser_path() -> None:
+    config = Luo2022OpticsConfig(field_shape=(32, 32))
+    model = Luo2022FourLayerD2NN(config)
+    field = amplitude_to_complex_field(torch.rand(2, 1, 32, 32))
+    diffusers = torch.rand(2, *config.field_shape)
+
+    direct_output = model.forward_without_diffractive_layers(field, diffusers)
+    distorted = model.distort(field, diffusers)
+    manual_output = field_intensity(
+        model.post_diffuser_to_output_direct.propagate(distorted.flatten(0, 1))
+    ).reshape(2, 2, 32, 32)
+
+    assert torch.allclose(direct_output, manual_output, rtol=0.0, atol=0.0)
+    assert model.post_diffuser_to_output_direct.distance == pytest.approx(
+        config.diffuser_to_first_layer_distance
+        + (config.num_layers - 1) * config.layer_distance
+        + config.output_distance
+    )
+    with torch.no_grad():
+        model.phase.uniform_(-2.0, 2.0)
+    assert torch.allclose(
+        model.forward_without_diffractive_layers(field, diffusers),
+        direct_output,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 def test_luo2022_phase_initialization_is_checkpoint_compatible_and_seeded() -> None:
     config = Luo2022OpticsConfig(field_shape=(32, 32))
     default_model = Luo2022FourLayerD2NN(config)
