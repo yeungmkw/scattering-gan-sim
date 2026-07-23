@@ -171,6 +171,8 @@ def test_d2nn_cli_exposes_luo2022_optical_control_ladder() -> None:
             "training",
             "new",
             "no_diffuser",
+            "--control-controls",
+            "direct_free_space_no_d2nn",
             "--control-training-epochs",
             "2",
             "--diffuser-chunk-size",
@@ -182,6 +184,7 @@ def test_d2nn_cli_exposes_luo2022_optical_control_ladder() -> None:
     assert args.run_dir == Path("outputs/frozen_run")
     assert args.control_output_dir == Path("outputs/independent_control_evidence")
     assert args.control_populations == ["training", "new", "no_diffuser"]
+    assert args.control_controls == ["direct_free_space_no_d2nn"]
     assert args.control_training_epochs == [2]
     assert args.diffuser_chunk_size == 2
 
@@ -849,16 +852,17 @@ def test_luo2022_control_ladder_isolated_resume_and_trained_regression(
     zero_phase_model = experiment.Luo2022FourLayerD2NN(optics_config)
     control_operators = {
         "direct_free_space_no_d2nn": model.forward_without_diffractive_layers,
-        "zero_phase_four_layer": zero_phase_model.forward,
-        "trained_four_layer": model.forward,
+        "zero_phase_four_layer": zero_phase_model,
+        "trained_four_layer": model,
     }
     experiment._validate_luo2022_control_ladder_operator_bindings(
         control_operators,
         trained_model=model,
         zero_phase_model=zero_phase_model,
+        requested_controls=experiment.LUO2022_CONTROL_LADDER_IDS,
     )
     swapped_control_operators = dict(control_operators)
-    swapped_control_operators["direct_free_space_no_d2nn"] = zero_phase_model.forward
+    swapped_control_operators["direct_free_space_no_d2nn"] = zero_phase_model
     with pytest.raises(
         RuntimeError,
         match="direct_free_space_no_d2nn is not bound to the trained model's "
@@ -868,9 +872,10 @@ def test_luo2022_control_ladder_isolated_resume_and_trained_regression(
             swapped_control_operators,
             trained_model=model,
             zero_phase_model=zero_phase_model,
+            requested_controls=experiment.LUO2022_CONTROL_LADDER_IDS,
     )
     swapped_control_operators = dict(control_operators)
-    swapped_control_operators["zero_phase_four_layer"] = model.forward
+    swapped_control_operators["zero_phase_four_layer"] = model
     with pytest.raises(
         RuntimeError,
         match="zero_phase_four_layer is not bound to its expected four-layer optical operator",
@@ -879,6 +884,19 @@ def test_luo2022_control_ladder_isolated_resume_and_trained_regression(
             swapped_control_operators,
             trained_model=model,
             zero_phase_model=zero_phase_model,
+            requested_controls=experiment.LUO2022_CONTROL_LADDER_IDS,
+        )
+    swapped_control_operators = dict(control_operators)
+    swapped_control_operators["trained_four_layer"] = zero_phase_model
+    with pytest.raises(
+        RuntimeError,
+        match="trained_four_layer is not bound to its expected four-layer optical operator",
+    ):
+        experiment._validate_luo2022_control_ladder_operator_bindings(
+            swapped_control_operators,
+            trained_model=model,
+            zero_phase_model=zero_phase_model,
+            requested_controls=experiment.LUO2022_CONTROL_LADDER_IDS,
         )
     operator_calls: set[str] = set()
     routed_controls: list[str] = []
@@ -1137,6 +1155,27 @@ def test_luo2022_control_ladder_isolated_resume_and_trained_regression(
         in {"zero_phase_four_layer", "trained_four_layer"}
     ]
     assert all(row["post_diffuser_window_applications"] == 5 for row in sampled_rows)
+
+    direct_only_dir = tmp_path / "direct_scattering_evidence"
+    direct_only = experiment.run_luo2022_c0_optical_control_ladder(
+        run_dir=run_dir,
+        control_output_dir=direct_only_dir,
+        device_name="cpu",
+        populations=("training", "new", "no_diffuser"),
+        controls=("direct_free_space_no_d2nn",),
+        training_epochs=(2,),
+        diffuser_chunk_size=2,
+    )
+    assert direct_only["status"] == "completed"
+    assert direct_only["requested_controls"] == ["direct_free_space_no_d2nn"]
+    assert direct_only["expected_record_count"] == 5
+    assert direct_only["groups"]["paired_differences"] == {}
+    assert direct_only["trained_four_layer_legacy_full_canvas_regression"]["status"] == (
+        "not_requested"
+    )
+    assert set(direct_only["completed_population_counts"]) == {
+        "direct_free_space_no_d2nn"
+    }
 
     def fail_if_completed_control_re_evaluates(*_args: object, **_kwargs: object) -> object:
         pytest.fail("completed C0 evidence should return without evaluating another forward pass")

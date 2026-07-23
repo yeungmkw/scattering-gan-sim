@@ -485,6 +485,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     d2nn_parser.add_argument(
+        "--control-controls",
+        choices=LUO2022_CONTROL_LADDER_IDS,
+        nargs="+",
+        default=LUO2022_CONTROL_LADDER_IDS,
+        help=(
+            "Optical operators for --action control-ladder. Select "
+            "direct_free_space_no_d2nn alone to measure the raw scattering "
+            "baseline without evaluating phase-plate controls."
+        ),
+    )
+    d2nn_parser.add_argument(
         "--control-training-epochs",
         type=int,
         nargs="+",
@@ -598,6 +609,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     device_name=args.device,
                     diffuser_chunk_size=args.diffuser_chunk_size,
                     populations=tuple(args.control_populations),
+                    controls=tuple(args.control_controls),
                     training_epochs=(
                         tuple(args.control_training_epochs)
                         if args.control_training_epochs is not None
@@ -5042,6 +5054,7 @@ def _summarize_luo2022_control_ladder_rows(
     rows: list[dict[str, Any]],
     *,
     requested_populations: tuple[str, ...],
+    requested_controls: tuple[str, ...],
 ) -> dict[str, Any]:
     """Group C0 evidence by optical operator and matched diffuser population."""
 
@@ -5059,7 +5072,7 @@ def _summarize_luo2022_control_ladder_rows(
     }
     by_control = {
         control_id: [row for row in rows if row["control_id"] == control_id]
-        for control_id in LUO2022_CONTROL_LADDER_IDS
+        for control_id in requested_controls
     }
     groups = {
         control_id: {
@@ -5082,6 +5095,11 @@ def _summarize_luo2022_control_ladder_rows(
         ("trained_four_layer", "direct_free_space_no_d2nn"),
     )
     for minuend_control, subtrahend_control in comparisons:
+        if (
+            minuend_control not in requested_controls
+            or subtrahend_control not in requested_controls
+        ):
+            continue
         comparison_id = f"{minuend_control}_minus_{subtrahend_control}"
         by_population: dict[str, Any] = {}
         for population in requested_populations:
@@ -5124,32 +5142,33 @@ def _validate_luo2022_control_ladder_operator_bindings(
     *,
     trained_model: Luo2022FourLayerD2NN,
     zero_phase_model: Luo2022FourLayerD2NN,
+    requested_controls: tuple[str, ...],
 ) -> None:
     """Reject a C0 run if a named control is bound to the wrong optical operator."""
 
-    if set(forward_operators) != set(LUO2022_CONTROL_LADDER_IDS):
-        raise RuntimeError("control-ladder operator bindings do not cover the frozen controls")
+    if set(forward_operators) != set(requested_controls):
+        raise RuntimeError("control-ladder operator bindings do not cover requested controls")
 
-    direct_operator = forward_operators["direct_free_space_no_d2nn"]
-    if (
-        getattr(direct_operator, "__self__", None) is not trained_model
-        or getattr(direct_operator, "__func__", None)
-        is not Luo2022FourLayerD2NN.forward_without_diffractive_layers
-    ):
-        raise RuntimeError(
-            "direct_free_space_no_d2nn is not bound to the trained model's "
-            "direct-propagation operator"
-        )
+    if "direct_free_space_no_d2nn" in requested_controls:
+        direct_operator = forward_operators["direct_free_space_no_d2nn"]
+        if (
+            getattr(direct_operator, "__self__", None) is not trained_model
+            or getattr(direct_operator, "__func__", None)
+            is not Luo2022FourLayerD2NN.forward_without_diffractive_layers
+        ):
+            raise RuntimeError(
+                "direct_free_space_no_d2nn is not bound to the trained model's "
+                "direct-propagation operator"
+            )
 
     for control_id, expected_model in (
         ("zero_phase_four_layer", zero_phase_model),
         ("trained_four_layer", trained_model),
     ):
+        if control_id not in requested_controls:
+            continue
         forward_operator = forward_operators[control_id]
-        if (
-            getattr(forward_operator, "__self__", None) is not expected_model
-            or getattr(forward_operator, "__func__", None) is not Luo2022FourLayerD2NN.forward
-        ):
+        if forward_operator is not expected_model:
             raise RuntimeError(
                 f"{control_id} is not bound to its expected four-layer optical operator"
             )
@@ -5164,6 +5183,7 @@ def run_luo2022_c0_optical_control_ladder(
     device_name: str = "cpu",
     diffuser_chunk_size: int | None = None,
     populations: tuple[str, ...] = ("training", "new", "no_diffuser"),
+    controls: tuple[str, ...] = LUO2022_CONTROL_LADDER_IDS,
     training_epochs: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Evaluate direct, zero-phase, and frozen four-layer optical controls.
@@ -5178,6 +5198,9 @@ def run_luo2022_c0_optical_control_ladder(
     requested_populations = tuple(dict.fromkeys(populations))
     if not requested_populations or not set(requested_populations) <= allowed_populations:
         raise ValueError("control-ladder populations must be training, new, or no_diffuser")
+    requested_controls = tuple(dict.fromkeys(controls))
+    if not requested_controls or not set(requested_controls) <= set(LUO2022_CONTROL_LADDER_IDS):
+        raise ValueError("control-ladder controls must be known optical control identifiers")
     if training_epochs is not None and "training" not in requested_populations:
         raise ValueError("control training epoch selection requires the training population")
     run_resolved = run_dir.resolve()
@@ -5351,7 +5374,7 @@ def run_luo2022_c0_optical_control_ladder(
         + optics_config.output_distance
     )
     sampled_post_diffuser_window_applications = optics_config.num_layers + 1
-    control_definitions = {
+    all_control_definitions = {
         "direct_free_space_no_d2nn": {
             "operator": "single_direct_propagation",
             "phase_dependency": "none",
@@ -5401,12 +5424,17 @@ def run_luo2022_c0_optical_control_ladder(
             ),
         },
     }
+    control_definitions = {
+        control_id: all_control_definitions[control_id]
+        for control_id in requested_controls
+    }
     evidence_spec = {
         "schema_version": 1,
         "implementation_version": LUO2022_CONTROL_LADDER_METRIC_PROTOCOL,
         "read_only": True,
         "requested_populations": list(requested_populations),
         "requested_training_epochs": list(selected_training_epochs),
+        "requested_controls": list(requested_controls),
         "controls": control_definitions,
         "dataset": {
             "name": "MNIST",
@@ -5487,6 +5515,7 @@ def run_luo2022_c0_optical_control_ladder(
             **metadata,
         }
         for control_id in LUO2022_CONTROL_LADDER_IDS
+        if control_id in requested_controls
         for diffuser_id, metadata in source_metadata.items()
     }
     unexpected_rows = sorted(set(rows_by_id) - set(expected_rows))
@@ -5502,7 +5531,7 @@ def run_luo2022_c0_optical_control_ladder(
                 )
                 for population in sorted(allowed_populations)
             }
-            for control_id in LUO2022_CONTROL_LADDER_IDS
+            for control_id in requested_controls
         }
 
     metric_names = (
@@ -5671,6 +5700,7 @@ def run_luo2022_c0_optical_control_ladder(
         expected_groups = _summarize_luo2022_control_ladder_rows(
             list(rows_by_id.values()),
             requested_populations=requested_populations,
+            requested_controls=requested_controls,
         )
         if summary.get("groups") != expected_groups:
             raise ValueError("completed control-ladder summary does not match its evidence rows")
@@ -5683,8 +5713,15 @@ def run_luo2022_c0_optical_control_ladder(
         expected_regression = {
             "status": (
                 "verified_against_run_local_posthoc"
-                if legacy_rows_by_id is not None
-                else "not_available_run_local_posthoc_absent"
+                if (
+                    "trained_four_layer" in requested_controls
+                    and legacy_rows_by_id is not None
+                )
+                else (
+                    "not_requested"
+                    if "trained_four_layer" not in requested_controls
+                    else "not_available_run_local_posthoc_absent"
+                )
             ),
             "tolerance": LUO2022_ROI_REGRESSION_TOLERANCE,
             "max_abs_error": max(legacy_errors) if legacy_errors else None,
@@ -5835,18 +5872,23 @@ def run_luo2022_c0_optical_control_ladder(
             rows_by_id[str(row["record_id"])] = row
         save_progress(stage)
 
-    forward_operators: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
+    all_forward_operators: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {
         "direct_free_space_no_d2nn": trained_model.forward_without_diffractive_layers,
-        "zero_phase_four_layer": zero_phase_model.forward,
-        "trained_four_layer": trained_model.forward,
+        "zero_phase_four_layer": zero_phase_model,
+        "trained_four_layer": trained_model,
+    }
+    forward_operators = {
+        control_id: all_forward_operators[control_id]
+        for control_id in requested_controls
     }
     _validate_luo2022_control_ladder_operator_bindings(
         forward_operators,
         trained_model=trained_model,
         zero_phase_model=zero_phase_model,
+        requested_controls=requested_controls,
     )
     save_progress("initializing")
-    for control_id in LUO2022_CONTROL_LADDER_IDS:
+    for control_id in requested_controls:
         for population, phases_cpu, metadata_rows in phase_groups:
             evaluate_and_record(
                 control_id,
@@ -5905,6 +5947,7 @@ def run_luo2022_c0_optical_control_ladder(
     summary_groups = _summarize_luo2022_control_ladder_rows(
         rows,
         requested_populations=requested_populations,
+        requested_controls=requested_controls,
     )
     legacy_errors = [
         float(row["legacy_pearson_abs_error"])
@@ -5912,7 +5955,11 @@ def run_luo2022_c0_optical_control_ladder(
         if row["control_id"] == "trained_four_layer"
         and row["legacy_pearson_abs_error"] is not None
     ]
-    if legacy_rows_by_id is not None and len(legacy_errors) != len(source_metadata):
+    if (
+        "trained_four_layer" in requested_controls
+        and legacy_rows_by_id is not None
+        and len(legacy_errors) != len(source_metadata)
+    ):
         raise RuntimeError(
             "trained control does not contain one validated legacy regression error per diffuser"
         )
@@ -5924,6 +5971,7 @@ def run_luo2022_c0_optical_control_ladder(
         "metric_protocol": LUO2022_CONTROL_LADDER_METRIC_PROTOCOL,
         "requested_populations": list(requested_populations),
         "requested_training_epochs": list(selected_training_epochs),
+        "requested_controls": list(requested_controls),
         "completed_population_counts": completed_counts(),
         "expected_population_counts_per_control": expected_population_counts,
         "expected_record_count": len(expected_rows),
@@ -5933,8 +5981,15 @@ def run_luo2022_c0_optical_control_ladder(
         "trained_four_layer_legacy_full_canvas_regression": {
             "status": (
                 "verified_against_run_local_posthoc"
-                if legacy_rows_by_id is not None
-                else "not_available_run_local_posthoc_absent"
+                if (
+                    "trained_four_layer" in requested_controls
+                    and legacy_rows_by_id is not None
+                )
+                else (
+                    "not_requested"
+                    if "trained_four_layer" not in requested_controls
+                    else "not_available_run_local_posthoc_absent"
+                )
             ),
             "tolerance": LUO2022_ROI_REGRESSION_TOLERANCE,
             "max_abs_error": max(legacy_errors) if legacy_errors else None,
