@@ -15,39 +15,63 @@ Completed on July 17, 2026:
 5. The historical GPU phase comparison metadata and documentation were
    synchronized without changing its checkpoints or metric files.
 
-## Immediate Next Steps
+## Current Status and Next Decision
 
-The immediate task is a **terahertz reproduction baseline** for
-*Computational imaging without a computer*. The baseline must match the
-paper's optical architecture closely enough that later modifications can be
-evaluated against it.
+Updated July 23, 2026:
 
-The published parameters and frozen implementation choices are encoded in
-[`configs/luo2022_r0.json`](../configs/luo2022_r0.json). Code changes must cite
-the corresponding paper equation where applicable. Internal equation audits
-and reproduction working notes remain local rather than being published with
-the repository.
+The terahertz four-layer `n=20` R0 baseline is complete and sealed. The
+published parameters and frozen implementation choices are encoded in
+[`configs/luo2022_r0.json`](../configs/luo2022_r0.json). The completed evidence
+contains the key Figure-5 populations: all 2,000 training diffusers, the
+epochs 1-99 subset, the final-10-epoch subset, the final-epoch 20, 20 unseen
+diffusers, and a no-diffuser control, each evaluated on 10,000 test objects.
+Direct/no-D2NN controls and target-support diagnostics are also available.
 
-1. Preserve the current independent uniform phase-screen path as the named
-   control profile `iid_phase_v1`.
-2. Add a `luo2022_phase_v1` profile inspired by *Computational imaging without
-   a computer*: correlated random height maps, wavelength/material-dependent
-   phase modulation, and explicit propagation geometry.
-3. Align the order of object modulation, free-space propagation, diffuser
-   modulation, diffractive layer, and detector sampling. Preserve raw detector
-   intensity separately from the normalized neural-network input.
-4. Implement the paper's trainable four-layer phase-only D2NN without a U-Net
-   or GAN in the reconstruction path.
-5. Add deterministic diffuser identities and the paper-aligned training and
-   testing protocol before comparing neural architectures.
-6. Validate the existing angular-spectrum propagator against a
-   Rayleigh-Sommerfeld reference on representative sampled fields, including
-   aliasing, padding, and energy checks.
-7. Run small-resolution checks first, followed by a declared full-resolution
-   terahertz reproduction run. Compare its correlation, image quality, optical
-   efficiency, and diffuser-generalization results with the paper.
-8. Only after the reproduction gap is measured should the project add U-Net,
-   PatchGAN, reduced D2NN depth, or other optimizations.
+This is enough to establish reproduction capability and to draw a compact
+reproduction-style figure set. The project does not require every figure or
+pixel value in the paper to be recreated. Exact author-level numerical
+equivalence remains impossible because several implementation and metric
+details are unpublished.
+
+The execution decision is:
+
+1. **Freeze R0 and its diffuser model.** Do not tune unpublished parameters
+   merely to chase digitized paper values, and do not repeat completed
+   post-hoc evaluations without a new, declared evidence gap.
+2. **Run the depth-trend gate next.** Train independent 2-layer and 5-layer
+   variants under the same data, diffuser, loss, budget, and target-support
+   evaluation protocol. The existing 4-layer R0 is the fixed reference. This
+   supplies the missing Figure-7-style trend and the baseline for reduced-depth
+   claims.
+3. **Build the layer/backend Pareto matrix after the depth gate.** Compare
+   `{2, 3, 4}` optical layers with `{no digital backend, lightweight supervised
+   U-Net}`. Include a no-D2NN plus the same digital backend control so that the
+   digital model cannot silently account for the full gain.
+4. **Add adversarial training only as a marginal comparison.** PatchGAN must
+   be compared with the same supervised U-Net generator and optical front end;
+   R2 versus R1 measures the adversarial contribution.
+5. **Defer visible-light optimization until the terahertz Pareto result is
+   stable.** Visible-light work then starts from measured hardware geometry,
+   quantization, alignment, efficiency, and detector constraints.
+
+The `n=1`, `n=10`, and `n=15` paper curves require separate models. They are
+optional later controls, not blockers for closing R0 or starting the
+depth/backend program.
+
+### Key Data and Figure Readiness
+
+| Evidence or figure family | Current status | Decision |
+|---|---|---|
+| Published equations, geometry, loss, and `n=20` protocol | complete | frozen as the R0 contract |
+| 100-epoch training history and final checkpoint provenance | complete | no repeat training |
+| Figure-5-style `n=20` populations and error bars | complete | numerical panels can be drawn now |
+| Figure-6-style known/new/no-diffuser comparison | complete for the `n=20` slice | sufficient for the compact reproduction figure set |
+| Direct/no-D2NN control | complete | retain beside the trained network result |
+| Full-canvas, center, and target-support PCC | complete | target support is primary; full canvas is regression |
+| Example outputs and phase-map panels | generation path exists | regenerate read-only from the frozen checkpoint when a final figure layout is chosen |
+| Figure-7-style depth trend | 4-layer complete; 2-layer and 5-layer missing | next required experiment |
+| `n=1`, `n=10`, `n=15` memory curves | missing independent models | optional later, not an R0 blocker |
+| Hardware, resolution-target, pruning, and lens panels | not part of the current numerical scope | do not block the next research stage |
 
 ## Reproduction Boundary
 
@@ -63,12 +87,14 @@ its reported results are not treated as a reusable pretrained system.
 - The current package structure and experiment CLI remain in place. A
   paper-aligned profile is added to the existing system rather than creating a
   separate root-level reproduction project.
-- The current fixed single-layer D2NN plus U-Net path is neither the paper
-  baseline nor sufficient evidence of an improvement. It remains an
-  exploratory engineering path until the four-layer reference is available.
-- Until the four-layer all-optical D2NN is implemented and trained under a
-  sufficiently matched protocol, results must be called paper-aligned or
-  reproduction-inspired, not a paper reproduction.
+- The fixed single-layer D2NN plus U-Net path is neither the paper baseline
+  nor sufficient evidence of an improvement. It remains an exploratory
+  engineering path and must be compared against the now-available four-layer
+  reference before supporting an optimization claim.
+- The four-layer all-optical D2NN is now implemented and trained. Because the
+  author implementation, exact ROI, initialization, and source arrays remain
+  unpublished, the sealed result remains `reproduction-inspired`, not an
+  exact numerical reproduction.
 - Reduced spatial grids may be used for tests and small runs. Claim-level
   comparisons require a declared full-resolution profile and matching geometry.
 - Visible-light work begins only after the terahertz reproduction and
@@ -83,7 +109,7 @@ and evaluation metrics fixed.
 
 | Level | System | Purpose |
 |---|---|---|
-| R0 | paper-aligned four-layer D2NN only | reproduce the reference result |
+| R0 | sealed paper-aligned four-layer D2NN only | provide the fixed reference baseline |
 | R1 | R0 plus supervised U-Net refinement | measure the marginal effect of the digital decoder |
 | R2 | same R1 generator plus PatchGAN loss | measure the marginal effect of adversarial training |
 | R3 | reduced-depth D2NN variants | test optical-layer efficiency under the same protocol |
@@ -95,10 +121,10 @@ would have changed at the same time.
 
 ## Visible-Light Translation
 
-Visible-light simulation and optimization begin after the R0-R4 terahertz
-comparison is stable.
+Visible-light simulation and optimization begin after the depth/backend
+terahertz comparison is stable.
 
-1. First reproduce the terahertz result and quantify the gap from the paper.
+1. Use the sealed R0 and depth trend as the terahertz reference.
 2. Establish which optimization provides a real gain under the same terahertz
    conditions.
 3. Scale the validated system to visible wavelengths in an ideal,
