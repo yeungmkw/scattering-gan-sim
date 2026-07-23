@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "profile_id": "luo2022_fixed4_backend",
+  "status": "exploratory fixed-depth backend ablation",
+  "experiment_class": "E4",
+  "comparison_scope": "B0_R1_R2",
+  "r0_reference": {
+    "profile_id": "luo2022_thz_r0",
+    "freeze_version": "2026-07-19.3",
+    "public_tag": "luo2022-r0-v3",
+    "optical_layers": 4,
+    "frozen": true,
+    "rule": "The R0 optical model, geometry, diffuser protocol, phase parameters, and sealed metrics remain unchanged."
+  },
+  "assignment": {
+    "schema": "luo2022_fixed4_assignment_v1",
+    "evidence": "project_choice",
+    "unit": "object_diffuser_pair",
+    "seed": 0,
+    "train_object_ids": [
+      0,
+      49999
+    ],
+    "validation_object_ids": [
+      50000,
+      59999
+    ],
+    "training_diffusers": 2000,
+    "balance_rule": "each training diffuser receives 25 train objects and 5 validation objects",
+    "training": "deterministic_seeded_assignment_without_evaluation_examples",
+    "evaluation": "fixed_object_ids_crossed_with_each_declared_diffuser_condition",
+    "reuse_rule": "B0, R1, and R2 use identical object and diffuser assignments wherever their operators are comparable."
+  },
+  "cache": {
+    "quantity": "raw_detector_intensity",
+    "dtype": "float32",
+    "normalization_at_write": "none",
+    "operators": {
+      "direct_no_d2nn": "post_diffuser propagation to the detector without trainable phase layers",
+      "r0_four_layer": "output of the frozen four-layer R0 optical operator"
+    },
+    "immutability": "write_once_then_read_only_for_backend_training",
+    "shard_size": 512,
+    "metadata": [
+      "split",
+      "object_id",
+      "diffuser_condition",
+      "diffuser_id",
+      "operator"
+    ]
+  },
+  "input_scaling": {
+    "method": "per_operator_global_dataset_max",
+    "fit_split": "train_only",
+    "statistic": "maximum_over_all_cached_training_samples_and_pixels",
+    "operator_scopes": [
+      "direct_no_d2nn",
+      "r0_four_layer"
+    ],
+    "fit_separately_per_operator": true,
+    "apply_frozen_training_statistic_to_validation_and_evaluation": true,
+    "per_image_normalization": false,
+    "clipping": false,
+    "epsilon": 1e-12,
+    "evidence": "project_choice",
+    "rationale": "Preserve within-operator relative intensity while preventing validation or evaluation leakage."
+  },
+  "model": {
+    "generator": "unet",
+    "base_channels": 4,
+    "discriminator": "patchgan",
+    "target": "clean_mnist_intensity"
+  },
+  "variants": {
+    "B0": {
+      "definition": "direct_no_d2nn_plus_supervised_unet",
+      "optical_operator": "direct_no_d2nn",
+      "generator": "unet",
+      "discriminator": "none",
+      "epochs": {
+        "supervised": 30,
+        "adversarial": 0,
+        "total": 30
+      },
+      "purpose": "Measure what the same lightweight digital backend can recover without the trained four-layer optical operator."
+    },
+    "R1": {
+      "definition": "frozen_r0_four_layer_plus_supervised_unet",
+      "optical_operator": "r0_four_layer",
+      "generator": "unet",
+      "discriminator": "none",
+      "epochs": {
+        "shared_supervised_warmup": 20,
+        "supervised_continuation": 10,
+        "adversarial": 0,
+        "total": 30
+      },
+      "purpose": "Measure the marginal reconstruction effect of supervised digital refinement after frozen R0."
+    },
+    "R2": {
+      "definition": "frozen_r0_four_layer_plus_unet_patchgan",
+      "optical_operator": "r0_four_layer",
+      "generator": "unet",
+      "discriminator": "patchgan",
+      "epochs": {
+        "shared_supervised_warmup": 20,
+        "adversarial_continuation": 10,
+        "total": 30
+      },
+      "branch_rule": "Start from the identical epoch-20 supervised generator state used by R1.",
+      "purpose": "Measure the marginal adversarial effect relative to R1 without changing the optical operator or generator architecture."
+    }
+  },
+  "training": {
+    "batch_size": 32,
+    "seed": 0,
+    "generator_optimizer": {
+      "name": "Adam",
+      "learning_rate": 0.002,
+      "betas": [
+        0.9,
+        0.999
+      ]
+    },
+    "discriminator_optimizer": {
+      "name": "Adam",
+      "learning_rate": 0.0002,
+      "betas": [
+        0.5,
+        0.999
+      ]
+    },
+    "loss": {
+      "reconstruction": "L1",
+      "reconstruction_weight": 1.0,
+      "adversarial_weight": 0.01,
+      "B0_adversarial_weight": 0.0,
+      "R1_adversarial_weight": 0.0,
+      "R2_adversarial_weight": 0.01
+    },
+    "checkpoint": {
+      "frequency": "every_epoch",
+      "resume_scope": "completed_epoch_only",
+      "strict_compatibility": true,
+      "generator_update_budget_is_primary": true
+    }
+  },
+  "evaluation": {
+    "diffuser_conditions": [
+      "final_epoch_known",
+      "seed_disjoint_unseen",
+      "no_diffuser"
+    ],
+    "report_separately_by_condition": true,
+    "metrics": [
+      "target_support_pearson",
+      "psnr",
+      "ssim",
+      "full_canvas_pearson",
+      "worst_5_percent_target_support_pearson",
+      "per_digit_metrics"
+    ],
+    "fixed_example_object_ids": [
+      3,
+      2,
+      1,
+      18,
+      4,
+      8,
+      11,
+      0,
+      61,
+      7
+    ],
+    "fixed_example_labels": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "example_panels": [
+      "clean_target",
+      "raw_operator_intensity",
+      "reconstruction",
+      "absolute_error"
+    ]
+  },
+  "claim_boundary": {
+    "label": "exploratory fixed-depth backend ablation",
+    "supported": "A controlled single-seed fixed-four-layer comparison of direct digital reconstruction, supervised post-processing, and adversarial post-processing under the frozen synthetic diffuser protocol.",
+    "excluded": [
+      "depth efficiency",
+      "hardware performance",
+      "volumetric or multiple scattering validity",
+      "multi-seed uncertainty",
+      "exact numerical reproduction of the source paper",
+      "general superiority of adversarial reconstruction"
+    ]
+  }
+}

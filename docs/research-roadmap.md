@@ -17,7 +17,7 @@ Completed on July 17, 2026:
 
 ## Current Status and Next Decision
 
-Updated July 23, 2026:
+Updated July 24, 2026:
 
 The terahertz four-layer `n=20` R0 baseline is complete and sealed. The
 published parameters and frozen implementation choices are encoded in
@@ -38,21 +38,25 @@ The execution decision is:
 1. **Freeze R0 and its diffuser model.** Do not tune unpublished parameters
    merely to chase digitized paper values, and do not repeat completed
    post-hoc evaluations without a new, declared evidence gap.
-2. **Run the depth-trend gate next.** Train independent 2-layer and 5-layer
-   variants under the same data, diffuser, loss, budget, and target-support
-   evaluation protocol. The existing 4-layer R0 is the fixed reference. This
-   supplies the missing Figure-7-style trend and the baseline for reduced-depth
-   claims.
-3. **Build the layer/backend Pareto matrix after the depth gate.** Compare
-   `{2, 3, 4}` optical layers with `{no digital backend, lightweight supervised
-   U-Net}`. Include a no-D2NN plus the same digital backend control so that the
-   digital model cannot silently account for the full gain.
-4. **Add adversarial training only as a marginal comparison.** PatchGAN must
-   be compared with the same supervised U-Net generator and optical front end;
-   R2 versus R1 measures the adversarial contribution.
-5. **Defer visible-light optimization until the terahertz Pareto result is
-   stable.** Visible-light work then starts from measured hardware geometry,
-   quantization, alignment, efficiency, and detector constraints.
+2. **Run the fixed-four-layer backend ablation next.** B0 measures the same
+   lightweight supervised U-Net without the D2NN; R1 adds supervised U-Net
+   refinement after frozen R0; R2 adds PatchGAN training after the same R1
+   warmup. This isolates the optical-front-end and adversarial contributions
+   before another optical model is trained.
+3. **Keep R1 and R2 causally matched.** They share a 20-epoch supervised
+   warmup and then branch for 10 continued epochs: supervised-only for R1 and
+   adversarial for R2. B0 trains for 30 supervised epochs with the same U-Net
+   capacity, batch size, seed, and reconstruction objective.
+4. **Defer the depth scan.** Independent two-layer and five-layer models remain
+   useful for a later depth trend, but are not the current gate. No reduced-depth
+   claim is permitted from the fixed-four-layer study.
+5. **Defer visible-light optimization until the backend result and later depth
+   evidence are stable.** Visible-light work then starts from measured hardware
+   geometry, quantization, alignment, efficiency, and detector constraints.
+
+The public, executable source of truth for this stage is
+[`configs/luo2022_fixed4_backend.json`](../configs/luo2022_fixed4_backend.json).
+Its status is `exploratory fixed-depth backend ablation`.
 
 The `n=1`, `n=10`, and `n=15` paper curves require separate models. They are
 optional later controls, not blockers for closing R0 or starting the
@@ -69,7 +73,8 @@ depth/backend program.
 | Direct/no-D2NN control | complete | retain beside the trained network result |
 | Full-canvas, center, and target-support PCC | complete | target support is primary; full canvas is regression |
 | Example outputs and phase-map panels | generation path exists | regenerate read-only from the frozen checkpoint when a final figure layout is chosen |
-| Figure-7-style depth trend | 4-layer complete; 2-layer and 5-layer missing | next required experiment |
+| Fixed-four-layer backend ablation | contract defined for B0, R1, and R2 | current experiment |
+| Figure-7-style depth trend | 4-layer complete; 2-layer and 5-layer missing | deferred until the backend ablation is complete |
 | `n=1`, `n=10`, `n=15` memory curves | missing independent models | optional later, not an R0 blocker |
 | Hardware, resolution-target, pruning, and lens panels | not part of the current numerical scope | do not block the next research stage |
 
@@ -101,32 +106,44 @@ its reported results are not treated as a reusable pretrained system.
   controlled optimization comparisons. It is the bridge to the available
   laboratory hardware, not a shortcut around the terahertz reference.
 
-## Controlled Optimization Ladder
+## Fixed-Four-Layer Backend Ablation
 
-Every optimization must change one declared factor while keeping the
-terahertz forward model, dataset split, diffuser set, training budget, seeds,
-and evaluation metrics fixed.
+The current comparison keeps the R0 four-layer optical model frozen. Cached
+operator outputs are raw `float32` detector intensities. Scaling is fitted on
+the training split only, using a separate global dataset maximum for each
+operator, and the frozen statistic is reused for validation and evaluation.
+The object-diffuser assignment is a declared project choice and is shared
+across comparable variants.
 
-| Level | System | Purpose |
-|---|---|---|
-| R0 | sealed paper-aligned four-layer D2NN only | provide the fixed reference baseline |
-| R1 | R0 plus supervised U-Net refinement | measure the marginal effect of the digital decoder |
-| R2 | same R1 generator plus PatchGAN loss | measure the marginal effect of adversarial training |
-| R3 | reduced-depth D2NN variants | test optical-layer efficiency under the same protocol |
-| R4 | other losses or architecture changes, one at a time | attribute each claimed improvement |
+| Level | System | Schedule | Purpose |
+|---|---|---|---|
+| R0 | sealed paper-aligned four-layer D2NN only | frozen; no retraining | provide the optical reference |
+| B0 | direct/no-D2NN operator plus supervised U-Net | 30 supervised epochs | bound what the lightweight digital backend can recover without trained diffractive layers |
+| R1 | frozen R0 plus supervised U-Net | 20 warmup + 10 supervised epochs | measure the marginal effect of supervised digital refinement |
+| R2 | frozen R0 plus the same U-Net and PatchGAN | same 20-epoch warmup + 10 adversarial epochs | measure the marginal adversarial effect relative to R1 |
 
-R2 must be compared with R1, not only with R0. Otherwise a gain cannot be
-attributed specifically to the GAN because the U-Net and adversarial objective
-would have changed at the same time.
+All three digital variants use `base_channels=4`, batch size 32, seed 0, and
+unit-weight L1 reconstruction. The generator uses Adam with learning rate
+`0.002` and betas `(0.9, 0.999)`; R2's discriminator uses Adam with learning
+rate `0.0002` and betas `(0.5, 0.999)`, with adversarial weight `0.01`.
+Known, seed-disjoint unseen, and no-diffuser conditions are reported
+separately with fixed example object IDs.
+
+R2 must be compared with R1, not only with R0. B0 must remain beside them so
+the optical contribution cannot be silently assigned to the digital model.
+This single-seed, fixed-depth study is an exploratory result; it cannot support
+depth-efficiency, hardware, multiple-scattering, or broad GAN-superiority
+claims.
 
 ## Visible-Light Translation
 
 Visible-light simulation and optimization begin after the depth/backend
 terahertz comparison is stable.
 
-1. Use the sealed R0 and depth trend as the terahertz reference.
-2. Establish which optimization provides a real gain under the same terahertz
-   conditions.
+1. Use the sealed R0, fixed-four-layer backend result, and later depth trend as
+   the terahertz references.
+2. Establish which backend contribution provides a real gain under the same
+   terahertz conditions before varying optical depth.
 3. Scale the validated system to visible wavelengths in an ideal,
    wavelength-normalized simulation.
 4. Add laboratory constraints: available source, spatial light modulator or

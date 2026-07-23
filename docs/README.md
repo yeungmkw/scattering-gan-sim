@@ -15,15 +15,14 @@ Recommended reading order:
    claims.
 4. `luo2022-r0-results.md`: the sealed public R0 protocol, key results,
    controls, integrity boundary, and next research gate.
-5. Local R0 evidence notes: metric-domain diagnostics, frozen acceptance
-   rules, and numeric provenance. These remain outside the public repository.
-6. Local research appendices: visible-light migration, performance
-   mechanisms, and the 2023-2026 landscape. These also remain local.
 
-Internal reproduction contracts, supplementary-material audits, and
-machine-specific readiness notes are intentionally kept outside the public
-repository. The executable Luo 2022 R0 source of truth is
-`../configs/luo2022_r0.json`.
+The executable Luo 2022 R0 source of truth is
+[`configs/luo2022_r0.json`](../configs/luo2022_r0.json). The current
+fixed-four-layer B0/R1/R2 backend ablation is defined by
+[`configs/luo2022_fixed4_backend.json`](../configs/luo2022_fixed4_backend.json).
+It keeps R0 frozen, uses portable raw-intensity cache metadata, and records the
+train-only scaling, schedules, optimizers, fixed evaluation examples, and
+claim boundary needed to reuse the comparison.
 
 The companion notebook is a Chinese walkthrough of the simulation principle:
 

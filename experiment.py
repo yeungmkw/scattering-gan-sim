@@ -23,6 +23,8 @@ import shutil
 import tempfile
 import time
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from io import StringIO
@@ -42,9 +44,15 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset
 
 from coherent_data import (
+    Luo2022CachedIntensityDataset,
+    Luo2022IntensityCacheWriter,
+    build_luo2022_fixed_depth_assignment,
     build_coherent_mnist_datasets,
+    canonical_sha256,
+    make_luo2022_frozen_scale,
     materialize_coherent_dataset,
     prepare_luo2022_amplitude,
+    verify_luo2022_intensity_cache,
 )
 from d2nn import (
     AngularSpectrumPropagator,
@@ -80,7 +88,15 @@ from losses import (
     pearson_per_image,
     reconstruction_loss,
 )
-from metrics import reconstruction_metrics
+from metrics import (
+    digit_group_statistics,
+    pair_level_tail_statistics,
+    paired_diffuser_delta_statistics,
+    per_image_reconstruction_metrics,
+    reconstruction_metrics,
+    scalar_summary,
+    two_level_diffuser_summary,
+)
 from patchgan import PatchDiscriminator
 from runtime import (
     load_config,
@@ -107,6 +123,13 @@ DEFAULT_EVAL_LIMIT = 4
 DEFAULT_ADVERSARIAL_WEIGHT = 0.01
 DEFAULT_SAMPLE_EVERY = 1
 DEFAULT_LUO2022_CONFIG = Path("configs/luo2022_r0.json")
+DEFAULT_LUO2022_BACKEND_CONFIG = Path("configs/luo2022_fixed4_backend.json")
+LUO2022_BACKEND_SCHEMA_VERSION = 1
+LUO2022_BACKEND_CACHE_PROTOCOL = "luo2022_fixed4_raw_intensity_cache_v1"
+LUO2022_BACKEND_TRAINING_PROTOCOL = "luo2022_fixed4_backend_training_v1"
+LUO2022_BACKEND_EVALUATION_PROTOCOL = "luo2022_fixed4_backend_evaluation_v1"
+LUO2022_BACKEND_CONDITIONS = ("b0", "warmup", "r1", "r2")
+LUO2022_BACKEND_VARIANTS = ("R0", "B0", "R1", "R2")
 MANIFEST_SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 1
 METRICS_PROTOCOL_VERSION = 1
@@ -345,10 +368,19 @@ def build_parser() -> argparse.ArgumentParser:
             "evaluate",
             "diagnose",
             "control-ladder",
+            "backend-cache",
+            "backend-train",
+            "backend-evaluate",
         ),
         default="inspect",
     )
     d2nn_parser.add_argument("--config-path", type=Path, default=DEFAULT_LUO2022_CONFIG)
+    d2nn_parser.add_argument(
+        "--backend-config-path",
+        type=Path,
+        default=DEFAULT_LUO2022_BACKEND_CONFIG,
+        help="Public fixed-four-layer B0/R1/R2 ablation contract.",
+    )
     d2nn_parser.add_argument("--small-run", action="store_true")
     d2nn_parser.add_argument("--device", default="cpu")
     d2nn_parser.add_argument("--seed", type=int, default=None)
@@ -505,6 +537,46 @@ def build_parser() -> argparse.ArgumentParser:
             "to the final frozen epoch."
         ),
     )
+    d2nn_parser.add_argument(
+        "--backend-cache-dir",
+        type=Path,
+        default=Path("outputs/luo2022_fixed4_backend_cache"),
+        help="Ignored read-only raw-intensity cache shared by backend runs.",
+    )
+    d2nn_parser.add_argument(
+        "--backend-cache-operators",
+        choices=("direct", "frozen_four_layer"),
+        nargs="+",
+        default=("direct", "frozen_four_layer"),
+        help="Optical operators to materialize with --action backend-cache.",
+    )
+    d2nn_parser.add_argument(
+        "--backend-condition",
+        choices=("b0", "warmup", "r1", "r2"),
+        default=None,
+        help="Digital condition trained by --action backend-train.",
+    )
+    d2nn_parser.add_argument(
+        "--backend-warmup-dir",
+        type=Path,
+        default=None,
+        help="Completed common warm-up run required by R1 and R2.",
+    )
+    d2nn_parser.add_argument("--backend-b0-dir", type=Path, default=None)
+    d2nn_parser.add_argument("--backend-r1-dir", type=Path, default=None)
+    d2nn_parser.add_argument("--backend-r2-dir", type=Path, default=None)
+    d2nn_parser.add_argument(
+        "--backend-shard-size",
+        type=int,
+        default=512,
+        help="Number of assigned raw-intensity samples per atomic cache shard.",
+    )
+    d2nn_parser.add_argument(
+        "--backend-max-updates",
+        type=int,
+        default=None,
+        help="Small-run-only cap on generator updates per epoch.",
+    )
 
     unet_parser = subparsers.add_parser("unet", help="Train the coherent U-Net reconstructor.")
     add_training_args(unet_parser, default_output="outputs/coherent_unet")
@@ -572,6 +644,69 @@ def add_training_args(parser: argparse.ArgumentParser, *, default_output: str) -
 def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "d2nn":
         if args.profile == "luo2022_r0":
+            if args.action == "backend-cache":
+                if args.run_dir is None:
+                    raise ValueError("--run-dir is required for backend-cache")
+                return run_luo2022_backend_cache(
+                    run_dir=args.run_dir,
+                    cache_dir=args.backend_cache_dir,
+                    config_path=args.config_path,
+                    backend_config_path=args.backend_config_path,
+                    download=args.download,
+                    device_name=args.device,
+                    operators=tuple(args.backend_cache_operators),
+                    shard_size=args.backend_shard_size,
+                    small_run=args.small_run,
+                    train_limit=args.train_limit,
+                    validation_limit=args.eval_limit,
+                )
+            if args.action == "backend-train":
+                if args.run_dir is None:
+                    raise ValueError("--run-dir is required for backend-train")
+                if args.backend_condition is None:
+                    raise ValueError("--backend-condition is required for backend-train")
+                return run_luo2022_backend_training(
+                    run_dir=args.run_dir,
+                    output_dir=Path(args.output_dir),
+                    cache_dir=args.backend_cache_dir,
+                    config_path=args.config_path,
+                    backend_config_path=args.backend_config_path,
+                    condition=args.backend_condition,
+                    warmup_dir=args.backend_warmup_dir,
+                    device_name=args.device,
+                    small_run=args.small_run,
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    max_updates_per_epoch=args.backend_max_updates,
+                    resume=args.resume,
+                    download=args.download,
+                )
+            if args.action == "backend-evaluate":
+                if args.run_dir is None:
+                    raise ValueError("--run-dir is required for backend-evaluate")
+                required = {
+                    "--backend-b0-dir": args.backend_b0_dir,
+                    "--backend-r1-dir": args.backend_r1_dir,
+                    "--backend-r2-dir": args.backend_r2_dir,
+                }
+                missing = [name for name, value in required.items() if value is None]
+                if missing:
+                    raise ValueError(
+                        "backend-evaluate requires " + ", ".join(missing)
+                    )
+                return run_luo2022_backend_evaluation(
+                    run_dir=args.run_dir,
+                    output_dir=Path(args.output_dir),
+                    cache_dir=args.backend_cache_dir,
+                    config_path=args.config_path,
+                    backend_config_path=args.backend_config_path,
+                    b0_dir=args.backend_b0_dir,
+                    r1_dir=args.backend_r1_dir,
+                    r2_dir=args.backend_r2_dir,
+                    device_name=args.device,
+                    download=args.download,
+                    max_eval_batches=args.max_eval_batches,
+                )
             if args.action == "evaluate":
                 return run_luo2022_posthoc_evaluation(
                     run_dir=Path(args.output_dir),
@@ -2918,6 +3053,2457 @@ def _load_luo2022_frozen_run_artifacts(
         run_state_sha256=_sha256_file(run_state_path),
         source_config_integrity=source_config_integrity,
     )
+
+
+@dataclass
+class Luo2022FrozenBackendFrontend:
+    """Loaded R0 frontend plus immutable evidence captured around backend work."""
+
+    artifacts: Luo2022FrozenRunArtifacts
+    model: Luo2022FourLayerD2NN
+    integrity_before: dict[str, Any]
+    integrity_after: dict[str, Any] | None = None
+
+
+def _load_luo2022_backend_contract(
+    backend_config_path: Path = DEFAULT_LUO2022_BACKEND_CONFIG,
+    *,
+    artifacts: Luo2022FrozenRunArtifacts | None = None,
+) -> dict[str, Any]:
+    """Load and validate the public fixed-four-layer backend contract."""
+
+    contract = load_config(backend_config_path)
+    required_top_level = {
+        "schema_version",
+        "profile_id",
+        "status",
+        "experiment_class",
+        "r0_reference",
+        "assignment",
+        "cache",
+        "input_scaling",
+        "model",
+        "variants",
+        "training",
+        "evaluation",
+        "claim_boundary",
+    }
+    missing = sorted(required_top_level.difference(contract))
+    if missing:
+        raise ValueError(f"backend contract is missing required fields: {', '.join(missing)}")
+    if int(contract["schema_version"]) != 1:
+        raise ValueError("unsupported fixed-depth backend contract schema")
+    if contract["profile_id"] != "luo2022_fixed4_backend":
+        raise ValueError("backend contract profile_id is not the fixed-four-layer profile")
+    if contract["status"] != "exploratory fixed-depth backend ablation":
+        raise ValueError("backend contract has an unsupported claim-status label")
+    if int(contract["r0_reference"].get("optical_layers", -1)) != 4:
+        raise ValueError("backend contract must reference exactly four frozen optical layers")
+    if contract["r0_reference"].get("frozen") is not True:
+        raise ValueError("backend contract must freeze the R0 optical frontend")
+    if int(contract["model"].get("base_channels", -1)) != 4:
+        raise ValueError("fixed-depth backend contract requires base_channels=4")
+    scaling = contract["input_scaling"]
+    if (
+        scaling.get("method") != "per_operator_global_dataset_max"
+        or scaling.get("fit_split") != "train_only"
+        or scaling.get("per_image_normalization") is not False
+        or scaling.get("clipping") is not False
+    ):
+        raise ValueError("backend input scaling must be the frozen train-only global-max rule")
+    loss = contract["training"]["loss"]
+    if (
+        loss.get("reconstruction") != "L1"
+        or float(loss.get("reconstruction_weight", -1.0)) != 1.0
+        or float(loss.get("B0_adversarial_weight", -1.0)) != 0.0
+        or float(loss.get("R1_adversarial_weight", -1.0)) != 0.0
+    ):
+        raise ValueError("backend contract must preserve the common unit-weight L1 loss")
+    if artifacts is not None:
+        reference = contract["r0_reference"]
+        if reference.get("profile_id") != artifacts.contract.get("profile_id"):
+            raise ValueError("backend contract R0 profile does not match the frozen run")
+        if reference.get("freeze_version") != artifacts.contract.get("freeze_version"):
+            raise ValueError("backend contract R0 freeze version does not match the frozen run")
+        if int(artifacts.contract["d2nn"]["layers"]) != 4:
+            raise ValueError("the verified R0 run is not a four-layer optical model")
+    return contract
+
+
+def _backend_r0_fingerprint(artifacts: Luo2022FrozenRunArtifacts) -> str:
+    """Bind every immutable R0 input used by the backend experiment."""
+
+    return canonical_sha256(
+        {
+            "profile_id": artifacts.contract["profile_id"],
+            "freeze_version": artifacts.contract["freeze_version"],
+            "checkpoint_sha256": artifacts.checkpoint_sha256,
+            "runtime_config_sha256": artifacts.runtime_config_sha256,
+            "source_config_sha256": artifacts.source_config_sha256,
+            "manifest_sha256": artifacts.manifest_sha256,
+            "run_state_sha256": artifacts.run_state_sha256,
+            "runtime_contract_projection": _luo2022_runtime_contract_projection(
+                artifacts.contract
+            ),
+        }
+    )
+
+
+def _stable_torch_value(value: Any) -> Any:
+    """Convert tensor-bearing state into canonical JSON-compatible evidence."""
+
+    if isinstance(value, torch.Tensor):
+        return {
+            "kind": "tensor",
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+            "sha256": _sha256_tensor(value),
+        }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_torch_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_torch_value(item) for item in value]
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    raise TypeError(f"unsupported checkpoint fingerprint value: {type(value).__name__}")
+
+
+def _backend_state_sha256(state: Mapping[str, Any]) -> str:
+    return canonical_sha256(_stable_torch_value(state))
+
+
+def _backend_r0_integrity_snapshot(
+    artifacts: Luo2022FrozenRunArtifacts,
+    model: Luo2022FourLayerD2NN,
+) -> dict[str, Any]:
+    """Return current file/model hashes and the required frozen execution state."""
+
+    file_paths = {
+        "checkpoint_sha256": artifacts.checkpoint_path,
+        "runtime_config_sha256": artifacts.run_dir / "config.json",
+        "source_config_sha256": artifacts.run_dir / "source_config.json",
+        "manifest_sha256": artifacts.run_dir / "manifest.json",
+        "run_state_sha256": artifacts.run_dir / "run_state.json",
+    }
+    snapshot = {name: _sha256_file(path) for name, path in file_paths.items()}
+    snapshot.update(
+        {
+            "phase_sha256": _sha256_tensor(model.phase),
+            "model_state_sha256": _backend_state_sha256(model.state_dict()),
+            "model_training": bool(model.training),
+            "all_parameters_frozen": all(
+                not parameter.requires_grad for parameter in model.parameters()
+            ),
+            "all_parameter_gradients_none": all(
+                parameter.grad is None for parameter in model.parameters()
+            ),
+        }
+    )
+    return snapshot
+
+
+def _load_luo2022_frozen_backend_model(
+    *,
+    run_dir: Path,
+    config_path: Path = DEFAULT_LUO2022_CONFIG,
+    device: torch.device,
+) -> tuple[Luo2022FrozenRunArtifacts, Luo2022FourLayerD2NN, dict[str, Any]]:
+    """Strictly load R0 for backend inference in eval mode with no trainable state."""
+
+    artifacts = _load_luo2022_frozen_run_artifacts(
+        run_dir=run_dir,
+        config_path=config_path,
+        device=device,
+    )
+    optics_config = _luo2022_optics_config_from_frozen_run(
+        artifacts.runtime_config,
+        artifacts.contract,
+    )
+    model = Luo2022FourLayerD2NN(optics_config).to(device)
+    try:
+        model.load_state_dict(artifacts.checkpoint["model"], strict=True)
+    except RuntimeError as error:
+        raise ValueError("frozen R0 model state is incompatible with its optical config") from error
+    model.eval()
+    set_requires_grad(model, False)
+    for parameter in model.parameters():
+        parameter.grad = None
+    snapshot = _backend_r0_integrity_snapshot(artifacts, model)
+    if snapshot["model_training"] or not snapshot["all_parameters_frozen"]:
+        raise RuntimeError("frozen R0 frontend was not placed in eval/frozen state")
+    if not snapshot["all_parameter_gradients_none"]:
+        raise RuntimeError("frozen R0 frontend unexpectedly contains parameter gradients")
+    if snapshot["checkpoint_sha256"] != artifacts.checkpoint_sha256:
+        raise RuntimeError("frozen R0 checkpoint changed while it was being loaded")
+    return artifacts, model, snapshot
+
+
+def _assert_luo2022_backend_r0_unchanged(
+    frontend: Luo2022FrozenBackendFrontend,
+) -> dict[str, Any]:
+    """Verify that a backend action did not alter R0 files, phases, or gradients."""
+
+    after = _backend_r0_integrity_snapshot(frontend.artifacts, frontend.model)
+    before = frontend.integrity_before
+    immutable_fields = (
+        "checkpoint_sha256",
+        "runtime_config_sha256",
+        "source_config_sha256",
+        "manifest_sha256",
+        "run_state_sha256",
+        "phase_sha256",
+        "model_state_sha256",
+    )
+    changed = [name for name in immutable_fields if before.get(name) != after.get(name)]
+    if changed:
+        raise RuntimeError("frozen R0 integrity changed: " + ", ".join(changed))
+    if (
+        after["model_training"]
+        or not after["all_parameters_frozen"]
+        or not after["all_parameter_gradients_none"]
+    ):
+        raise RuntimeError("frozen R0 execution-state invariant was violated")
+    frontend.integrity_after = after
+    return {
+        "before": before,
+        "after": after,
+        "hashes_unchanged": True,
+        "phase_gradients_none": True,
+        "eval_mode": True,
+        "requires_grad_false": True,
+    }
+
+
+@contextmanager
+def _verified_luo2022_backend_frontend(
+    *,
+    run_dir: Path,
+    config_path: Path,
+    device: torch.device,
+):
+    """Yield a frozen R0 model and always audit it again on exit."""
+
+    artifacts, model, before = _load_luo2022_frozen_backend_model(
+        run_dir=run_dir,
+        config_path=config_path,
+        device=device,
+    )
+    frontend = Luo2022FrozenBackendFrontend(
+        artifacts=artifacts,
+        model=model,
+        integrity_before=before,
+    )
+    try:
+        yield frontend
+    finally:
+        _assert_luo2022_backend_r0_unchanged(frontend)
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Write JSON through an fsynced sibling and atomically replace the target."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _atomic_torch_save(path: Path, payload: Any) -> None:
+    """Atomically save a torch payload without exposing partial checkpoints."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        torch.save(payload, temporary_path)
+        with temporary_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _is_path_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _require_backend_output_outside_r0(output_dir: Path, run_dir: Path) -> None:
+    if _is_path_within(output_dir, run_dir) or _is_path_within(run_dir, output_dir):
+        raise ValueError("backend output/cache directory must be separate from the frozen R0 run")
+
+
+def _prepare_fresh_backend_output(output_dir: Path, *, resume: bool) -> None:
+    """Create a fresh output, or require explicit resume for an existing one."""
+
+    if output_dir.exists():
+        contents = [path for path in output_dir.iterdir() if not path.name.startswith(".")]
+        if contents and not resume:
+            raise FileExistsError(
+                "backend output directory is not fresh; use --resume only for a compatible run"
+            )
+        if resume and not contents:
+            raise FileNotFoundError("cannot resume an empty backend output directory")
+    elif resume:
+        raise FileNotFoundError("cannot resume a backend output directory that does not exist")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "checkpoints").mkdir(exist_ok=True)
+    (output_dir / "samples").mkdir(exist_ok=True)
+
+
+def _backend_cache_manifest_fingerprint(manifest: Mapping[str, Any]) -> str:
+    payload = {key: value for key, value in manifest.items() if key != "root_fingerprint"}
+    return canonical_sha256(payload)
+
+
+def _load_backend_cache_manifest(cache_dir: Path) -> dict[str, Any]:
+    manifest_path = cache_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError("backend cache manifest is missing")
+    manifest = load_config(manifest_path)
+    if manifest.get("protocol") != LUO2022_BACKEND_CACHE_PROTOCOL:
+        raise ValueError("unsupported backend cache protocol")
+    if manifest.get("root_fingerprint") != _backend_cache_manifest_fingerprint(manifest):
+        raise ValueError("backend cache root fingerprint mismatch")
+    if manifest.get("status") != "complete":
+        raise ValueError("backend cache is not complete")
+    for operator_id, split_map in manifest.get("caches", {}).items():
+        if operator_id not in {"direct_no_d2nn", "r0_four_layer"}:
+            raise ValueError("backend cache contains an unknown optical operator")
+        train_manifest: dict[str, Any] | None = None
+        for split, record in split_map.items():
+            cache_root = cache_dir / record["path"]
+            verified = verify_luo2022_intensity_cache(cache_root)
+            if verified["root_fingerprint"] != record["root_fingerprint"]:
+                raise ValueError("backend cache child fingerprint does not match its manifest")
+            if verified.get("split") != split:
+                raise ValueError("backend cache child split does not match its manifest")
+            if split == "train":
+                train_manifest = verified
+        if train_manifest is None:
+            raise ValueError(f"backend cache operator {operator_id} has no training split")
+        for split, record in split_map.items():
+            verified = verify_luo2022_intensity_cache(cache_dir / record["path"])
+            if verified["scale"]["value"] != train_manifest["scale"]["value"]:
+                raise ValueError("non-training cache does not reuse the frozen training scale")
+            if verified["operator_id"] != train_manifest["operator_id"]:
+                raise ValueError("cache operator IDs differ across splits")
+    return manifest
+
+
+def _backend_dataset(
+    cache_dir: Path,
+    *,
+    operator_id: str,
+    split: str = "train",
+) -> Luo2022CachedIntensityDataset:
+    manifest = _load_backend_cache_manifest(cache_dir)
+    try:
+        relative_path = manifest["caches"][operator_id][split]["path"]
+    except KeyError as error:
+        raise ValueError(f"backend cache is missing {operator_id}/{split}") from error
+    return Luo2022CachedIntensityDataset(cache_dir / relative_path)
+
+
+def _load_luo2022_training_diffuser_bank(
+    artifacts: Luo2022FrozenRunArtifacts,
+    *,
+    small_run: bool,
+    requested_count: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Load the original immutable per-epoch diffuser banks in epoch/index order."""
+
+    epoch_count = int(artifacts.runtime_config["runtime"]["epochs"])
+    phase_banks: list[torch.Tensor] = []
+    file_records: list[dict[str, Any]] = []
+    for epoch in range(1, epoch_count + 1):
+        phase_path = artifacts.run_dir / "diffusers" / f"training_epoch_{epoch:03d}.pt"
+        if not phase_path.is_file():
+            raise FileNotFoundError(f"frozen training diffuser bank is missing: {phase_path.name}")
+        phase_bank = torch.load(phase_path, map_location="cpu", weights_only=True)
+        if (
+            phase_bank.ndim != 3
+            or tuple(phase_bank.shape[-2:])
+            != tuple(artifacts.runtime_config["runtime"]["grid_size"] for _ in range(2))
+            or not torch.isfinite(phase_bank).all()
+        ):
+            raise ValueError(f"invalid frozen training diffuser bank: {phase_path.name}")
+        phase_banks.append(phase_bank.to(dtype=torch.float32))
+        file_records.append(
+            {
+                "epoch": epoch,
+                "file": f"diffusers/{phase_path.name}",
+                "sha256": _sha256_file(phase_path),
+                "count": int(phase_bank.shape[0]),
+            }
+        )
+    phases = torch.cat(phase_banks, dim=0)
+    if small_run:
+        resolved_count = min(int(requested_count), int(phases.shape[0]))
+    else:
+        resolved_count = int(requested_count)
+        if int(phases.shape[0]) != resolved_count:
+            raise ValueError(
+                "full backend cache requires the exact configured frozen training diffuser count"
+            )
+    if resolved_count <= 0:
+        raise ValueError("backend cache requires at least one frozen training diffuser")
+    phases = phases[:resolved_count].contiguous()
+    return phases, {
+        "ordering": "training_epoch_ascending_then_within_epoch_index_ascending",
+        "available_count": int(sum(row["count"] for row in file_records)),
+        "used_count": resolved_count,
+        "phase_sha256": _sha256_tensor(phases),
+        "files": file_records,
+    }
+
+
+def _backend_unpack_image_label(item: Any) -> tuple[torch.Tensor, int]:
+    if isinstance(item, tuple) and len(item) >= 2:
+        image, label = item[0], int(item[1])
+    elif isinstance(item, Mapping):
+        image, label = item["image"], int(item.get("label", 0))
+    else:
+        image, label = item, 0
+    if not isinstance(image, torch.Tensor):
+        from torchvision.transforms.functional import to_tensor
+
+        image = to_tensor(image)
+    if image.ndim == 2:
+        image = image.unsqueeze(0)
+    if image.ndim != 3:
+        raise ValueError("backend MNIST image must have shape (C,H,W)")
+    if image.shape[0] != 1:
+        image = image.mean(dim=0, keepdim=True)
+    return image.to(dtype=torch.float32).clamp(0.0, 1.0), label
+
+
+@torch.no_grad()
+def _backend_forward_assigned_diffusers(
+    model: Luo2022FourLayerD2NN,
+    object_field: torch.Tensor,
+    diffuser_bank: torch.Tensor,
+    diffuser_ids: Sequence[int] | torch.Tensor,
+    *,
+    operator_id: str,
+) -> torch.Tensor:
+    """Apply one assigned diffuser per object without forming a Cartesian product."""
+
+    if isinstance(diffuser_ids, torch.Tensor):
+        ids = [int(value) for value in diffuser_ids.detach().cpu().tolist()]
+    else:
+        ids = [int(value) for value in diffuser_ids]
+    if len(ids) != int(object_field.shape[0]):
+        raise ValueError("one diffuser ID is required for every backend object")
+    if any(diffuser_id < 0 or diffuser_id >= int(diffuser_bank.shape[0]) for diffuser_id in ids):
+        raise ValueError("backend assignment references a diffuser outside the frozen bank")
+    if operator_id == "direct_no_d2nn":
+        forward = model.forward_without_diffractive_layers
+    elif operator_id == "r0_four_layer":
+        forward = model.forward
+    else:
+        raise ValueError(f"unsupported backend optical operator {operator_id}")
+    output = object_field.real.new_empty(
+        (object_field.shape[0], 1, *object_field.shape[-2:])
+    )
+    grouped: dict[int, list[int]] = defaultdict(list)
+    for index, diffuser_id in enumerate(ids):
+        grouped[diffuser_id].append(index)
+    for diffuser_id, indices in grouped.items():
+        index_tensor = torch.tensor(indices, device=object_field.device, dtype=torch.long)
+        values = forward(
+            object_field.index_select(0, index_tensor),
+            diffuser_bank[diffuser_id : diffuser_id + 1],
+        )
+        output.index_copy_(0, index_tensor, values)
+    return output
+
+
+def _materialize_backend_cache_split(
+    *,
+    writer: Luo2022IntensityCacheWriter,
+    model: Luo2022FourLayerD2NN,
+    diffuser_bank: torch.Tensor,
+    dataset: Any,
+    source_indices: Sequence[int],
+    assignment_rows: Sequence[Mapping[str, Any]],
+    operator_id: str,
+    resized_shape: tuple[int, int],
+    canvas_shape: tuple[int, int],
+    device: torch.device,
+    shard_size: int,
+) -> None:
+    if len(source_indices) != len(assignment_rows):
+        raise ValueError("backend cache source indices and assignment rows differ in length")
+    # Keep the assignment identity unchanged while writing records in diffuser-major
+    # order.  A paper-scale assignment has only 25 train objects per diffuser;
+    # grouping them avoids tens of thousands of one-object optical forwards and
+    # gives both operators the same byte-level cache row order.
+    ordered_pairs = sorted(
+        zip(source_indices, assignment_rows, strict=True),
+        key=lambda pair: (int(pair[1]["diffuser_id"]), int(pair[1]["row_id"])),
+    )
+    ordered_source_indices = [int(source_index) for source_index, _row in ordered_pairs]
+    ordered_assignment_rows = [row for _source_index, row in ordered_pairs]
+    existing_rows = int(writer.manifest["row_count"])
+    for start in range(existing_rows, len(ordered_assignment_rows), shard_size):
+        stop = min(start + shard_size, len(ordered_assignment_rows))
+        images: list[torch.Tensor] = []
+        for source_index, row in zip(
+            ordered_source_indices[start:stop],
+            ordered_assignment_rows[start:stop],
+            strict=True,
+        ):
+            image, label = _backend_unpack_image_label(dataset[int(source_index)])
+            if label != int(row["label"]):
+                raise ValueError("MNIST label does not match frozen backend assignment")
+            images.append(image)
+        image_batch = torch.stack(images).to(device)
+        target = prepare_luo2022_amplitude(
+            image_batch,
+            resized_shape=resized_shape,
+            canvas_shape=canvas_shape,
+        )
+        raw = _backend_forward_assigned_diffusers(
+            model,
+            amplitude_to_complex_field(target),
+            diffuser_bank,
+            [int(row["diffuser_id"]) for row in ordered_assignment_rows[start:stop]],
+            operator_id=operator_id,
+        )
+        writer.append_shard(raw.detach().cpu(), ordered_assignment_rows[start:stop])
+
+
+def _backend_cache_operator_name(cli_name: str) -> str:
+    mapping = {"direct": "direct_no_d2nn", "frozen_four_layer": "r0_four_layer"}
+    try:
+        return mapping[cli_name]
+    except KeyError as error:
+        raise ValueError(f"unsupported backend cache operator {cli_name}") from error
+
+
+def run_luo2022_backend_cache(
+    *,
+    run_dir: Path,
+    cache_dir: Path,
+    config_path: Path = DEFAULT_LUO2022_CONFIG,
+    backend_config_path: Path = DEFAULT_LUO2022_BACKEND_CONFIG,
+    download: bool = False,
+    device_name: str = "cpu",
+    operators: tuple[str, ...] = ("direct", "frozen_four_layer"),
+    shard_size: int = 512,
+    small_run: bool = False,
+    train_limit: int | None = None,
+    validation_limit: int | None = None,
+) -> dict[str, Any]:
+    """Build shared balanced raw-intensity caches from the original R0 diffuser banks."""
+
+    run_dir = Path(run_dir)
+    cache_dir = Path(cache_dir)
+    _require_backend_output_outside_r0(cache_dir, run_dir)
+    if shard_size <= 0:
+        raise ValueError("backend shard_size must be positive")
+    operator_ids = tuple(dict.fromkeys(_backend_cache_operator_name(name) for name in operators))
+    if not operator_ids:
+        raise ValueError("at least one backend cache operator is required")
+    device = select_device(device_name)
+
+    with _verified_luo2022_backend_frontend(
+        run_dir=run_dir,
+        config_path=config_path,
+        device=device,
+    ) as frontend:
+        backend_contract = _load_luo2022_backend_contract(
+            backend_config_path,
+            artifacts=frontend.artifacts,
+        )
+        assignment_contract = backend_contract["assignment"]
+        configured_train_count = (
+            int(assignment_contract["train_object_ids"][1])
+            - int(assignment_contract["train_object_ids"][0])
+            + 1
+        )
+        configured_validation_count = (
+            int(assignment_contract["validation_object_ids"][1])
+            - int(assignment_contract["validation_object_ids"][0])
+            + 1
+        )
+        if not small_run and (train_limit is not None or validation_limit is not None):
+            raise ValueError("backend cache object-count overrides require --small-run")
+        resolved_train_count = (
+            min(8, configured_train_count) if small_run and train_limit is None
+            else configured_train_count if train_limit is None
+            else int(train_limit)
+        )
+        resolved_validation_count = (
+            min(4, configured_validation_count) if small_run and validation_limit is None
+            else configured_validation_count if validation_limit is None
+            else int(validation_limit)
+        )
+        if resolved_train_count <= 0 or resolved_validation_count <= 0:
+            raise ValueError("backend cache train and validation limits must be positive")
+        requested_diffusers = int(assignment_contract["training_diffusers"])
+        diffuser_bank, diffuser_provenance = _load_luo2022_training_diffuser_bank(
+            frontend.artifacts,
+            small_run=small_run,
+            requested_count=requested_diffusers,
+        )
+        runtime_values = frontend.artifacts.runtime_config["runtime"]
+        dataset = build_torchvision_dataset(
+            name="MNIST",
+            root=DEFAULT_DATA_ROOT,
+            train=True,
+            image_size=int(frontend.artifacts.contract["input"]["original_shape"][0]),
+            download=download,
+        )
+        if len(dataset) < resolved_train_count:
+            raise ValueError("MNIST training split is smaller than the backend train limit")
+        validation_start = int(assignment_contract["validation_object_ids"][0])
+        source_validation_start = validation_start
+        if len(dataset) < validation_start + resolved_validation_count:
+            if not small_run or len(dataset) < resolved_train_count + resolved_validation_count:
+                raise ValueError("MNIST training split is smaller than the backend validation range")
+            source_validation_start = resolved_train_count
+
+        train_labels = [
+            _backend_unpack_image_label(dataset[index])[1]
+            for index in range(resolved_train_count)
+        ]
+        validation_source_indices = list(
+            range(source_validation_start, source_validation_start + resolved_validation_count)
+        )
+        validation_labels = [
+            _backend_unpack_image_label(dataset[index])[1]
+            for index in validation_source_indices
+        ]
+        assignment_seed = int(assignment_contract["seed"])
+        diffusers_per_epoch = int(runtime_values["diffusers_per_epoch"])
+        train_assignment = build_luo2022_fixed_depth_assignment(
+            train_labels,
+            num_diffusers=int(diffuser_bank.shape[0]),
+            diffusers_per_epoch=diffusers_per_epoch,
+            seed=assignment_seed,
+            object_id_offset=int(assignment_contract["train_object_ids"][0]),
+        )
+        validation_assignment = build_luo2022_fixed_depth_assignment(
+            validation_labels,
+            num_diffusers=int(diffuser_bank.shape[0]),
+            diffusers_per_epoch=diffusers_per_epoch,
+            seed=assignment_seed,
+            object_id_offset=validation_start,
+        )
+        request = {
+            "protocol": LUO2022_BACKEND_CACHE_PROTOCOL,
+            "backend_contract_sha256": _sha256_file(backend_config_path),
+            "r0_fingerprint": _backend_r0_fingerprint(frontend.artifacts),
+            "operators": list(operator_ids),
+            "small_run": bool(small_run),
+            "train_count": resolved_train_count,
+            "validation_count": resolved_validation_count,
+            "shard_size": int(shard_size),
+            "train_assignment_sha256": train_assignment["root_sha"],
+            "validation_assignment_sha256": validation_assignment["root_sha"],
+            "diffuser_phase_sha256": diffuser_provenance["phase_sha256"],
+        }
+        request_fingerprint = canonical_sha256(request)
+        manifest_path = cache_dir / "manifest.json"
+        if manifest_path.is_file():
+            saved = load_config(manifest_path)
+            if saved.get("request_fingerprint") != request_fingerprint:
+                raise ValueError("existing backend cache is incompatible with this request")
+            if saved.get("status") == "complete":
+                verified = _load_backend_cache_manifest(cache_dir)
+                return {"manifest": verified, "cache_dir": str(cache_dir)}
+        elif cache_dir.exists() and any(
+            path for path in cache_dir.iterdir() if not path.name.startswith(".")
+        ):
+            raise ValueError("backend cache directory contains files but no recoverable manifest")
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        building_manifest = {
+            "schema_version": LUO2022_BACKEND_SCHEMA_VERSION,
+            "protocol": LUO2022_BACKEND_CACHE_PROTOCOL,
+            "status": "building",
+            "request": request,
+            "request_fingerprint": request_fingerprint,
+            "r0": {
+                "fingerprint": request["r0_fingerprint"],
+                "checkpoint_sha256": frontend.artifacts.checkpoint_sha256,
+                "source_config_sha256": frontend.artifacts.source_config_sha256,
+                "phase_sha256_before": frontend.integrity_before["phase_sha256"],
+            },
+            "assignment": {
+                "rule": "deterministic_sha256_rank_round_robin_balanced_project_choice",
+                "shared_across_operators": True,
+                "train_sha256": train_assignment["root_sha"],
+                "validation_sha256": validation_assignment["root_sha"],
+                "train_count": resolved_train_count,
+                "validation_count": resolved_validation_count,
+            },
+            "diffusers": diffuser_provenance,
+            "input_scaling": {
+                "method": "per_operator_global_dataset_max",
+                "fit_split": "train_only",
+                "per_image_normalization": False,
+                "clipping": False,
+            },
+            "caches": {},
+        }
+        building_manifest["root_fingerprint"] = _backend_cache_manifest_fingerprint(
+            building_manifest
+        )
+        _atomic_write_json(manifest_path, building_manifest)
+        _atomic_write_json(
+            cache_dir / "config.json",
+            {
+                "schema_version": LUO2022_BACKEND_SCHEMA_VERSION,
+                "protocol": LUO2022_BACKEND_CACHE_PROTOCOL,
+                "request": request,
+                "request_fingerprint": request_fingerprint,
+                "assignment": building_manifest["assignment"],
+                "input_scaling": building_manifest["input_scaling"],
+                "r0": building_manifest["r0"],
+            },
+        )
+        _atomic_write_json(cache_dir / "train_assignment.json", train_assignment)
+        _atomic_write_json(cache_dir / "validation_assignment.json", validation_assignment)
+
+        canvas_shape = tuple(int(value) for value in diffuser_bank.shape[-2:])
+        resized_shape = (int(runtime_values["input_size"]),) * 2
+        # The full 2,000 x 240 x 240 bank is roughly 440 MiB.  Transfer it
+        # exactly once and reuse it across shards, splits, and operators while
+        # retaining the CPU tensor above for portable provenance hashing.
+        diffuser_bank_device = diffuser_bank.to(device)
+        caches: dict[str, Any] = {}
+        for operator_id in operator_ids:
+            split_manifests: dict[str, Any] = {}
+            train_root = cache_dir / operator_id / "train"
+            train_writer = Luo2022IntensityCacheWriter(
+                train_root,
+                operator_id=operator_id,
+                split="train",
+                assignment_sha=train_assignment["root_sha"],
+                r0_fingerprint=request["r0_fingerprint"],
+                expected_shape=(1, *canvas_shape),
+                expected_rows=resolved_train_count,
+            )
+            _materialize_backend_cache_split(
+                writer=train_writer,
+                model=frontend.model,
+                diffuser_bank=diffuser_bank_device,
+                dataset=dataset,
+                source_indices=[
+                    int(row["object_id"])
+                    - int(assignment_contract["train_object_ids"][0])
+                    for row in train_assignment["rows"]
+                ],
+                assignment_rows=train_assignment["rows"],
+                operator_id=operator_id,
+                resized_shape=resized_shape,
+                canvas_shape=canvas_shape,
+                device=device,
+                shard_size=shard_size,
+            )
+            train_manifest = train_writer.finalize()
+            split_manifests["train"] = {
+                "path": f"{operator_id}/train",
+                "root_fingerprint": train_manifest["root_fingerprint"],
+                "row_count": train_manifest["row_count"],
+                "scale": train_manifest["scale"],
+            }
+
+            validation_root = cache_dir / operator_id / "validation"
+            validation_writer = Luo2022IntensityCacheWriter(
+                validation_root,
+                operator_id=operator_id,
+                split="validation",
+                assignment_sha=validation_assignment["root_sha"],
+                r0_fingerprint=request["r0_fingerprint"],
+                expected_shape=(1, *canvas_shape),
+                expected_rows=resolved_validation_count,
+            )
+            _materialize_backend_cache_split(
+                writer=validation_writer,
+                model=frontend.model,
+                diffuser_bank=diffuser_bank_device,
+                dataset=dataset,
+                source_indices=[
+                    source_validation_start
+                    + int(row["object_id"])
+                    - validation_start
+                    for row in validation_assignment["rows"]
+                ],
+                assignment_rows=validation_assignment["rows"],
+                operator_id=operator_id,
+                resized_shape=resized_shape,
+                canvas_shape=canvas_shape,
+                device=device,
+                shard_size=shard_size,
+            )
+            validation_manifest = validation_writer.finalize(
+                frozen_scale=make_luo2022_frozen_scale(train_manifest)
+            )
+            split_manifests["validation"] = {
+                "path": f"{operator_id}/validation",
+                "root_fingerprint": validation_manifest["root_fingerprint"],
+                "row_count": validation_manifest["row_count"],
+                "scale": validation_manifest["scale"],
+            }
+            caches[operator_id] = split_manifests
+
+        integrity = _assert_luo2022_backend_r0_unchanged(frontend)
+        complete_manifest = {
+            **building_manifest,
+            "status": "complete",
+            "completed_at_utc": datetime.now(UTC).isoformat(),
+            "caches": caches,
+            "r0": {
+                **building_manifest["r0"],
+                "phase_sha256_after": integrity["after"]["phase_sha256"],
+                "hashes_unchanged": integrity["hashes_unchanged"],
+                "eval_no_grad": True,
+            },
+            "runtime": run_metadata(),
+            "artifacts": {
+                "config": "config.json",
+                "train_assignment": "train_assignment.json",
+                "validation_assignment": "validation_assignment.json",
+            },
+        }
+        complete_manifest["root_fingerprint"] = _backend_cache_manifest_fingerprint(
+            complete_manifest
+        )
+        _atomic_write_json(manifest_path, complete_manifest)
+        verified = _load_backend_cache_manifest(cache_dir)
+        return {"manifest": verified, "cache_dir": str(cache_dir)}
+
+
+def backend_epoch_permutation(*, sample_count: int, seed: int, global_epoch: int) -> list[int]:
+    """Return the fixed object order shared by matched backend conditions."""
+
+    if sample_count <= 0 or global_epoch <= 0:
+        raise ValueError("sample_count and global_epoch must be positive")
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed) + int(global_epoch) * 1_000_003 + 4_202_022)
+    return torch.randperm(sample_count, generator=generator).tolist()
+
+
+def _backend_epoch_order_record(
+    *,
+    sample_count: int,
+    seed: int,
+    global_epoch: int,
+    batch_size: int,
+    max_updates: int | None,
+) -> tuple[list[int], dict[str, Any]]:
+    full_order = backend_epoch_permutation(
+        sample_count=sample_count,
+        seed=seed,
+        global_epoch=global_epoch,
+    )
+    update_budget = math.ceil(sample_count / batch_size)
+    if max_updates is not None:
+        if max_updates <= 0:
+            raise ValueError("backend max_updates_per_epoch must be positive")
+        update_budget = min(update_budget, int(max_updates))
+    consumed_order = full_order[: min(sample_count, update_budget * batch_size)]
+    return consumed_order, {
+        "global_epoch": int(global_epoch),
+        "algorithm": "torch_randperm_seed_plus_global_epoch_domain_v1",
+        "full_order_sha256": canonical_sha256(full_order),
+        "consumed_order_sha256": canonical_sha256(consumed_order),
+        "sample_count": int(sample_count),
+        "consumed_count": len(consumed_order),
+        "generator_update_budget": int(update_budget),
+    }
+
+
+def _initialized_backend_generator(*, seed: int, device: torch.device) -> UNetReconstructor:
+    """Construct the frozen base-4 U-Net without perturbing caller RNG state."""
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(seed))
+        generator = UNetReconstructor(base_channels=4)
+    return generator.to(device)
+
+
+def _initialized_backend_discriminator(
+    *, seed: int, device: torch.device
+) -> PatchDiscriminator:
+    """Construct the base-4 PatchGAN in a branch-local RNG domain."""
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(seed) + 8_402_031)
+        discriminator = PatchDiscriminator(base_channels=4)
+    return discriminator.to(device)
+
+
+def backend_supervised_train_step(
+    generator: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    source: torch.Tensor,
+    target: torch.Tensor,
+) -> dict[str, float]:
+    """Perform the common unit-weight L1 generator update used by B0/R1/warm-up."""
+
+    generator.train()
+    optimizer.zero_grad(set_to_none=True)
+    prediction = generator(source)
+    loss = F.l1_loss(prediction, target)
+    if not torch.isfinite(loss):
+        raise FloatingPointError("backend supervised loss is not finite")
+    loss.backward()
+    if not any(parameter.grad is not None for parameter in generator.parameters()):
+        raise RuntimeError("backend generator received no gradients")
+    optimizer.step()
+    return {"l1": float(loss.detach()), "generator_total": float(loss.detach())}
+
+
+def backend_gan_train_step(
+    generator: torch.nn.Module,
+    discriminator: torch.nn.Module,
+    generator_optimizer: torch.optim.Optimizer,
+    discriminator_optimizer: torch.optim.Optimizer,
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    adversarial_weight: float,
+) -> dict[str, float]:
+    """Perform one matched-budget R2 update: one D step and one G step."""
+
+    if adversarial_weight <= 0:
+        raise ValueError("R2 adversarial_weight must be positive")
+    generator.train()
+    discriminator.train()
+    # Reuse one generator forward for both losses.  Besides avoiding duplicate
+    # compute, this keeps U-Net BatchNorm running-stat updates matched one-for-
+    # one with R1; R2's only generator-side change is then the adversarial term.
+    fake = generator(source)
+    discriminator_optimizer.zero_grad(set_to_none=True)
+    discriminator_real = adversarial_loss(
+        discriminator(source, target), target_is_real=True
+    )
+    discriminator_fake = adversarial_loss(
+        discriminator(source, fake.detach()), target_is_real=False
+    )
+    discriminator_total = 0.5 * (discriminator_real + discriminator_fake)
+    if not torch.isfinite(discriminator_total):
+        raise FloatingPointError("backend discriminator loss is not finite")
+    discriminator_total.backward()
+    if not any(parameter.grad is not None for parameter in discriminator.parameters()):
+        raise RuntimeError("backend discriminator received no gradients")
+    discriminator_optimizer.step()
+
+    generator_optimizer.zero_grad(set_to_none=True)
+    l1 = F.l1_loss(fake, target)
+    set_requires_grad(discriminator, False)
+    try:
+        adversarial = adversarial_loss(
+            discriminator(source, fake), target_is_real=True
+        )
+        generator_total = l1 + float(adversarial_weight) * adversarial
+        if not torch.isfinite(generator_total):
+            raise FloatingPointError("backend R2 generator loss is not finite")
+        generator_total.backward()
+        if not any(parameter.grad is not None for parameter in generator.parameters()):
+            raise RuntimeError("backend R2 generator received no gradients")
+        generator_optimizer.step()
+    finally:
+        set_requires_grad(discriminator, True)
+    return {
+        "l1": float(l1.detach()),
+        "adversarial": float(adversarial.detach()),
+        "generator_total": float(generator_total.detach()),
+        "discriminator_total": float(discriminator_total.detach()),
+        "discriminator_real": float(discriminator_real.detach()),
+        "discriminator_fake": float(discriminator_fake.detach()),
+    }
+
+
+def _backend_training_batch(
+    cached_dataset: Luo2022CachedIntensityDataset,
+    mnist_dataset: Any,
+    indices: Sequence[int],
+    *,
+    resized_shape: tuple[int, int],
+    canvas_shape: tuple[int, int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    samples = [cached_dataset[int(index)] for index in indices]
+    source = torch.stack([sample["input_intensity"] for sample in samples]).to(device)
+    images: list[torch.Tensor] = []
+    for sample in samples:
+        object_id = int(sample["object_id"])
+        source_index = object_id
+        if source_index >= len(mnist_dataset):
+            # Tiny test fixtures do not contain the physical MNIST indices
+            # 50000--59999.  Their validation rows remain globally identified
+            # but are read from the final split-local fixture entries.
+            source_index = (
+                len(mnist_dataset)
+                - len(cached_dataset)
+                + object_id
+                - int(cached_dataset.object_id_min)
+            )
+        image, label = _backend_unpack_image_label(mnist_dataset[source_index])
+        if label != int(sample["label"]):
+            raise ValueError("cached backend label does not match MNIST source object")
+        images.append(image)
+    target = prepare_luo2022_amplitude(
+        torch.stack(images).to(device),
+        resized_shape=resized_shape,
+        canvas_shape=canvas_shape,
+    )
+    return source, target
+
+
+@torch.no_grad()
+def _evaluate_backend_cached_generator(
+    generator: torch.nn.Module,
+    cached_dataset: Luo2022CachedIntensityDataset,
+    mnist_dataset: Any,
+    *,
+    batch_size: int,
+    resized_shape: tuple[int, int],
+    canvas_shape: tuple[int, int],
+    device: torch.device,
+) -> dict[str, float]:
+    generator.eval()
+    totals: dict[str, float] = defaultdict(float)
+    count = 0
+    for start in range(0, len(cached_dataset), batch_size):
+        stop = min(start + batch_size, len(cached_dataset))
+        source, target = _backend_training_batch(
+            cached_dataset,
+            mnist_dataset,
+            list(range(start, stop)),
+            resized_shape=resized_shape,
+            canvas_shape=canvas_shape,
+            device=device,
+        )
+        prediction = generator(source)
+        batch_metrics = reconstruction_metrics(prediction, target)
+        for name, value in batch_metrics.items():
+            totals[name] += float(value) * int(target.shape[0])
+        count += int(target.shape[0])
+    if count == 0:
+        raise ValueError("backend validation cache is empty")
+    return {name: value / count for name, value in totals.items()}
+
+
+def _backend_condition_spec(
+    backend_contract: Mapping[str, Any],
+    condition: str,
+    *,
+    small_run: bool,
+    epochs: int | None,
+) -> dict[str, Any]:
+    normalized = condition.lower()
+    if normalized not in LUO2022_BACKEND_CONDITIONS:
+        raise ValueError(f"unknown backend condition {condition}")
+    if not small_run and epochs is not None:
+        raise ValueError("backend epoch overrides require --small-run")
+    if normalized == "b0":
+        configured_epochs = int(backend_contract["variants"]["B0"]["epochs"]["total"])
+        operator_id = "direct_no_d2nn"
+    elif normalized == "warmup":
+        configured_epochs = int(
+            backend_contract["variants"]["R1"]["epochs"]["shared_supervised_warmup"]
+        )
+        operator_id = "r0_four_layer"
+    else:
+        field = "supervised_continuation" if normalized == "r1" else "adversarial_continuation"
+        configured_epochs = int(backend_contract["variants"][normalized.upper()]["epochs"][field])
+        operator_id = "r0_four_layer"
+    resolved_epochs = int(epochs) if epochs is not None else (1 if small_run else configured_epochs)
+    if resolved_epochs <= 0:
+        raise ValueError("backend training epochs must be positive")
+    return {
+        "condition": normalized,
+        "operator_id": operator_id,
+        "stage_epochs": resolved_epochs,
+        "configured_stage_epochs": configured_epochs,
+        "uses_discriminator": normalized == "r2",
+        "requires_warmup": normalized in {"r1", "r2"},
+    }
+
+
+def _backend_checkpoint_payload_fingerprint(checkpoint: Mapping[str, Any]) -> str:
+    payload = {
+        "protocol": checkpoint.get("protocol"),
+        "compatibility_fingerprint": checkpoint.get("compatibility_fingerprint"),
+        "condition": checkpoint.get("condition"),
+        "completed_epoch": checkpoint.get("completed_epoch"),
+        "global_completed_epoch": checkpoint.get("global_completed_epoch"),
+        "generator_update_count": checkpoint.get("generator_update_count"),
+        "generator_state_sha256": _backend_state_sha256(checkpoint.get("generator", {})),
+        "generator_optimizer_sha256": _backend_state_sha256(
+            checkpoint.get("generator_optimizer", {})
+        ),
+        "discriminator_state_sha256": (
+            _backend_state_sha256(checkpoint["discriminator"])
+            if checkpoint.get("discriminator") is not None
+            else None
+        ),
+        "discriminator_optimizer_sha256": (
+            _backend_state_sha256(checkpoint["discriminator_optimizer"])
+            if checkpoint.get("discriminator_optimizer") is not None
+            else None
+        ),
+        "history_sha256": canonical_sha256(checkpoint.get("history", [])),
+        "epoch_order_sha256": canonical_sha256(checkpoint.get("epoch_orders", [])),
+        "branch_start": checkpoint.get("branch_start"),
+        "torch_rng_state_sha256": (
+            _sha256_tensor(checkpoint["torch_rng_state"])
+            if isinstance(checkpoint.get("torch_rng_state"), torch.Tensor)
+            else None
+        ),
+        "cuda_rng_state_sha256": (
+            [_sha256_tensor(state) for state in checkpoint["cuda_rng_state_all"]]
+            if checkpoint.get("cuda_rng_state_all") is not None
+            else None
+        ),
+    }
+    return canonical_sha256(payload)
+
+
+def _validate_backend_checkpoint(
+    checkpoint: Mapping[str, Any],
+    *,
+    expected_compatibility_fingerprint: str | None = None,
+) -> None:
+    if checkpoint.get("protocol") != LUO2022_BACKEND_TRAINING_PROTOCOL:
+        raise ValueError("unsupported backend checkpoint protocol")
+    if (
+        expected_compatibility_fingerprint is not None
+        and checkpoint.get("compatibility_fingerprint")
+        != expected_compatibility_fingerprint
+    ):
+        raise ValueError("resume checkpoint compatibility fingerprint mismatch")
+    completed_epoch = int(checkpoint.get("completed_epoch", -1))
+    history = checkpoint.get("history")
+    epoch_orders = checkpoint.get("epoch_orders")
+    if completed_epoch < 0 or not isinstance(history, list) or len(history) != completed_epoch:
+        raise ValueError("backend checkpoint epoch and history are inconsistent")
+    if not isinstance(epoch_orders, list) or len(epoch_orders) != completed_epoch:
+        raise ValueError("backend checkpoint epoch-order history is inconsistent")
+    expected_updates = sum(int(row["generator_updates"]) for row in history)
+    if int(checkpoint.get("generator_update_count", -1)) != expected_updates:
+        raise ValueError("backend checkpoint generator update count is inconsistent")
+    if checkpoint.get("payload_fingerprint") != _backend_checkpoint_payload_fingerprint(
+        checkpoint
+    ):
+        raise ValueError("backend checkpoint payload fingerprint mismatch")
+
+
+def _load_backend_training_checkpoint(
+    path: Path,
+    *,
+    device: torch.device,
+    expected_compatibility_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"backend checkpoint is missing: {path.name}")
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    _validate_backend_checkpoint(
+        checkpoint,
+        expected_compatibility_fingerprint=expected_compatibility_fingerprint,
+    )
+    return checkpoint
+
+
+def _save_backend_epoch_checkpoint(
+    *,
+    output_dir: Path,
+    checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    checkpoint["payload_fingerprint"] = _backend_checkpoint_payload_fingerprint(checkpoint)
+    epoch = int(checkpoint["completed_epoch"])
+    epoch_path = output_dir / "checkpoints" / f"epoch_{epoch:03d}.pt"
+    latest_path = output_dir / "checkpoints" / "latest.pt"
+    _atomic_torch_save(epoch_path, checkpoint)
+    _atomic_torch_save(latest_path, checkpoint)
+    return checkpoint
+
+
+def _backend_restore_rng(checkpoint: Mapping[str, Any], device: torch.device) -> None:
+    torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+    if device.type == "cuda" and checkpoint.get("cuda_rng_state_all") is not None:
+        torch.cuda.set_rng_state_all(
+            [state.cpu() for state in checkpoint["cuda_rng_state_all"]]
+        )
+
+
+def _completed_backend_run_checkpoint(
+    run_dir: Path,
+    *,
+    device: torch.device,
+    expected_condition: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    config_path = run_dir / "config.json"
+    state_path = run_dir / "run_state.json"
+    manifest_path = run_dir / "manifest.json"
+    if not all(path.is_file() for path in (config_path, state_path, manifest_path)):
+        raise FileNotFoundError("completed backend run is missing config/state/manifest")
+    config = load_config(config_path)
+    run_state = load_config(state_path)
+    manifest = load_config(manifest_path)
+    if run_state.get("status") != "completed" or manifest.get("status") != "completed":
+        raise ValueError("backend branch requires a completed source run")
+    if expected_condition is not None and config.get("condition") != expected_condition:
+        raise ValueError(f"backend run is not the required {expected_condition} condition")
+    checkpoint_path = run_dir / "checkpoints" / "latest.pt"
+    checkpoint = _load_backend_training_checkpoint(
+        checkpoint_path,
+        device=device,
+        expected_compatibility_fingerprint=config.get("compatibility_fingerprint"),
+    )
+    if int(checkpoint["completed_epoch"]) != int(config["stage_epochs"]):
+        raise ValueError("completed backend checkpoint does not cover its configured stage")
+    if run_state.get("latest_checkpoint_sha256") != _sha256_file(checkpoint_path):
+        raise ValueError("completed backend checkpoint hash does not match run state")
+    return config, checkpoint, manifest
+
+
+def run_luo2022_backend_training(
+    *,
+    run_dir: Path,
+    output_dir: Path,
+    cache_dir: Path,
+    config_path: Path = DEFAULT_LUO2022_CONFIG,
+    backend_config_path: Path = DEFAULT_LUO2022_BACKEND_CONFIG,
+    condition: str,
+    warmup_dir: Path | None = None,
+    device_name: str = "cpu",
+    small_run: bool = False,
+    epochs: int | None = None,
+    batch_size: int | None = None,
+    max_updates_per_epoch: int | None = None,
+    resume: bool = False,
+    download: bool = False,
+) -> dict[str, Any]:
+    """Train B0/common warm-up/R1/R2 with fixed orders and strict resume."""
+
+    run_dir = Path(run_dir)
+    output_dir = Path(output_dir)
+    cache_dir = Path(cache_dir)
+    _require_backend_output_outside_r0(output_dir, run_dir)
+    _require_backend_output_outside_r0(cache_dir, run_dir)
+    if _is_path_within(output_dir, cache_dir) or _is_path_within(cache_dir, output_dir):
+        raise ValueError("backend training output and shared cache must be separate")
+    device = select_device(device_name)
+    cache_manifest = _load_backend_cache_manifest(cache_dir)
+
+    with _verified_luo2022_backend_frontend(
+        run_dir=run_dir,
+        config_path=config_path,
+        device=device,
+    ) as frontend:
+        backend_contract = _load_luo2022_backend_contract(
+            backend_config_path,
+            artifacts=frontend.artifacts,
+        )
+        if cache_manifest["request"]["r0_fingerprint"] != _backend_r0_fingerprint(
+            frontend.artifacts
+        ):
+            raise ValueError("backend cache does not belong to the verified frozen R0 run")
+        spec = _backend_condition_spec(
+            backend_contract,
+            condition,
+            small_run=small_run,
+            epochs=epochs,
+        )
+        if max_updates_per_epoch is not None and not small_run:
+            raise ValueError("backend update caps require --small-run")
+        training_contract = backend_contract["training"]
+        configured_batch_size = int(training_contract["batch_size"])
+        if not small_run and batch_size is not None:
+            raise ValueError("backend batch-size overrides require --small-run")
+        resolved_batch_size = int(batch_size or (2 if small_run else configured_batch_size))
+        if resolved_batch_size <= 0:
+            raise ValueError("backend batch_size must be positive")
+        seed = int(training_contract["seed"])
+        seed_everything(seed)
+
+        train_cache = _backend_dataset(
+            cache_dir,
+            operator_id=spec["operator_id"],
+            split="train",
+        )
+        validation_cache = _backend_dataset(
+            cache_dir,
+            operator_id=spec["operator_id"],
+            split="validation",
+        )
+        if len(train_cache) == 0:
+            raise ValueError("backend training cache is empty")
+        base_dataset = build_torchvision_dataset(
+            name="MNIST",
+            root=DEFAULT_DATA_ROOT,
+            train=True,
+            image_size=int(frontend.artifacts.contract["input"]["original_shape"][0]),
+            download=download,
+        )
+        runtime_values = frontend.artifacts.runtime_config["runtime"]
+        resized_shape = (int(runtime_values["input_size"]),) * 2
+        canvas_shape = (int(runtime_values["grid_size"]),) * 2
+
+        generator_optimizer_contract = training_contract["generator_optimizer"]
+        discriminator_optimizer_contract = training_contract["discriminator_optimizer"]
+        generator = _initialized_backend_generator(seed=seed, device=device)
+        fresh_generator_initial_state_sha256 = _backend_state_sha256(
+            generator.state_dict()
+        )
+        generator_optimizer = torch.optim.Adam(
+            generator.parameters(),
+            lr=float(generator_optimizer_contract["learning_rate"]),
+            betas=tuple(float(value) for value in generator_optimizer_contract["betas"]),
+        )
+        discriminator: PatchDiscriminator | None = None
+        discriminator_optimizer: torch.optim.Optimizer | None = None
+        global_epoch_offset = 0
+        warmup_provenance: dict[str, Any] | None = None
+        branch_start: dict[str, Any] | None = None
+        branch_rng: dict[str, Any] | None = None
+        if spec["requires_warmup"]:
+            if warmup_dir is None:
+                raise ValueError("R1 and R2 require --backend-warmup-dir")
+            warmup_path = Path(warmup_dir)
+            warmup_config, warmup_checkpoint, _warmup_manifest = (
+                _completed_backend_run_checkpoint(
+                    warmup_path,
+                    device=device,
+                    expected_condition="warmup",
+                )
+            )
+            compatibility_fields = (
+                "backend_contract_sha256",
+                "r0_fingerprint",
+                "cache_root_fingerprint",
+                "cache_assignment_sha256",
+                "seed",
+                "batch_size",
+                "base_channels",
+                "fresh_generator_initial_state_sha256",
+                "generator_optimizer",
+                "reconstruction_loss",
+                "max_updates_per_epoch",
+                "small_run",
+            )
+            requested_values = {
+                "backend_contract_sha256": _sha256_file(backend_config_path),
+                "r0_fingerprint": _backend_r0_fingerprint(frontend.artifacts),
+                "cache_root_fingerprint": cache_manifest["root_fingerprint"],
+                "cache_assignment_sha256": cache_manifest["assignment"]["train_sha256"],
+                "seed": seed,
+                "batch_size": resolved_batch_size,
+                "base_channels": 4,
+                "fresh_generator_initial_state_sha256": (
+                    fresh_generator_initial_state_sha256
+                ),
+                "generator_optimizer": generator_optimizer_contract,
+                "reconstruction_loss": {"name": "L1", "weight": 1.0},
+                "max_updates_per_epoch": max_updates_per_epoch,
+                "small_run": bool(small_run),
+            }
+            mismatched = [
+                name
+                for name in compatibility_fields
+                if warmup_config.get(name) != requested_values[name]
+            ]
+            if mismatched:
+                raise ValueError(
+                    "warm-up run is incompatible with the requested branch: "
+                    + ", ".join(mismatched)
+                )
+            generator.load_state_dict(warmup_checkpoint["generator"], strict=True)
+            generator_optimizer.load_state_dict(warmup_checkpoint["generator_optimizer"])
+            global_epoch_offset = int(warmup_checkpoint["global_completed_epoch"])
+            warmup_checkpoint_path = warmup_path / "checkpoints" / "latest.pt"
+            warmup_provenance = {
+                "checkpoint_sha256": _sha256_file(warmup_checkpoint_path),
+                "compatibility_fingerprint": warmup_checkpoint["compatibility_fingerprint"],
+                "completed_epoch": int(warmup_checkpoint["completed_epoch"]),
+                "global_completed_epoch": global_epoch_offset,
+                "generator_update_count": int(warmup_checkpoint["generator_update_count"]),
+            }
+            branch_start = {
+                "warmup_checkpoint_sha256": warmup_provenance["checkpoint_sha256"],
+                "generator_state_sha256": _backend_state_sha256(generator.state_dict()),
+                "generator_optimizer_sha256": _backend_state_sha256(
+                    generator_optimizer.state_dict()
+                ),
+                "warmup_generator_update_count": warmup_provenance[
+                    "generator_update_count"
+                ],
+            }
+            branch_rng = {
+                "torch_rng_state": warmup_checkpoint["torch_rng_state"].clone(),
+                "cuda_rng_state_all": warmup_checkpoint.get("cuda_rng_state_all"),
+            }
+        if spec["uses_discriminator"]:
+            discriminator = _initialized_backend_discriminator(seed=seed, device=device)
+            discriminator_optimizer = torch.optim.Adam(
+                discriminator.parameters(),
+                lr=float(discriminator_optimizer_contract["learning_rate"]),
+                betas=tuple(
+                    float(value) for value in discriminator_optimizer_contract["betas"]
+                ),
+            )
+        if branch_rng is not None:
+            torch.set_rng_state(branch_rng["torch_rng_state"].cpu())
+            if device.type == "cuda" and branch_rng["cuda_rng_state_all"] is not None:
+                torch.cuda.set_rng_state_all(
+                    [state.cpu() for state in branch_rng["cuda_rng_state_all"]]
+                )
+
+        config = {
+            "schema_version": LUO2022_BACKEND_SCHEMA_VERSION,
+            "protocol": LUO2022_BACKEND_TRAINING_PROTOCOL,
+            "status_label": backend_contract["status"],
+            "experiment_class": backend_contract["experiment_class"],
+            "condition": spec["condition"],
+            "operator_id": spec["operator_id"],
+            "backend_contract_sha256": _sha256_file(backend_config_path),
+            "r0_fingerprint": _backend_r0_fingerprint(frontend.artifacts),
+            "cache_root_fingerprint": cache_manifest["root_fingerprint"],
+            "cache_assignment_sha256": cache_manifest["assignment"]["train_sha256"],
+            "cache_scale": train_cache.manifest["scale"],
+            "stage_epochs": int(spec["stage_epochs"]),
+            "global_epoch_offset": int(global_epoch_offset),
+            "seed": seed,
+            "batch_size": resolved_batch_size,
+            "base_channels": 4,
+            "fresh_generator_initial_state_sha256": (
+                fresh_generator_initial_state_sha256
+            ),
+            "generator_optimizer": generator_optimizer_contract,
+            "discriminator_optimizer": (
+                discriminator_optimizer_contract if spec["uses_discriminator"] else None
+            ),
+            "reconstruction_loss": {"name": "L1", "weight": 1.0},
+            "adversarial_weight": (
+                float(training_contract["loss"]["R2_adversarial_weight"])
+                if spec["uses_discriminator"]
+                else 0.0
+            ),
+            "max_updates_per_epoch": max_updates_per_epoch,
+            "small_run": bool(small_run),
+            "warmup": warmup_provenance,
+            "input_scaling": {
+                "raw_detector_intensity": True,
+                "method": "operator_train_dataset_global_max",
+                "scale": float(train_cache.scale),
+                "per_image_normalization": False,
+                "clipping": False,
+            },
+            "device": str(device),
+        }
+        compatibility_payload = {
+            key: value for key, value in config.items() if key not in {"device"}
+        }
+        config["compatibility_fingerprint"] = canonical_sha256(compatibility_payload)
+
+        _prepare_fresh_backend_output(output_dir, resume=resume)
+        history: list[dict[str, Any]] = []
+        epoch_orders: list[dict[str, Any]] = []
+        completed_epoch = 0
+        generator_update_count = 0
+        if resume:
+            saved_config = load_config(output_dir / "config.json")
+            if saved_config != config:
+                raise ValueError("resume config does not exactly match the requested backend run")
+            checkpoint = _load_backend_training_checkpoint(
+                output_dir / "checkpoints" / "latest.pt",
+                device=device,
+                expected_compatibility_fingerprint=config["compatibility_fingerprint"],
+            )
+            if checkpoint.get("condition") != spec["condition"]:
+                raise ValueError("resume checkpoint condition mismatch")
+            generator.load_state_dict(checkpoint["generator"], strict=True)
+            generator_optimizer.load_state_dict(checkpoint["generator_optimizer"])
+            if spec["uses_discriminator"]:
+                assert discriminator is not None and discriminator_optimizer is not None
+                if checkpoint.get("discriminator") is None:
+                    raise ValueError("R2 resume checkpoint is missing the discriminator")
+                discriminator.load_state_dict(checkpoint["discriminator"], strict=True)
+                discriminator_optimizer.load_state_dict(
+                    checkpoint["discriminator_optimizer"]
+                )
+            elif checkpoint.get("discriminator") is not None:
+                raise ValueError("supervised backend checkpoint unexpectedly contains a discriminator")
+            if checkpoint.get("branch_start") != branch_start:
+                raise ValueError("resume checkpoint warm-up branch provenance mismatch")
+            history = list(checkpoint["history"])
+            epoch_orders = list(checkpoint["epoch_orders"])
+            completed_epoch = int(checkpoint["completed_epoch"])
+            generator_update_count = int(checkpoint["generator_update_count"])
+            _backend_restore_rng(checkpoint, device)
+        else:
+            _atomic_write_json(output_dir / "config.json", config)
+            _atomic_write_json(output_dir / "source_backend_config.json", backend_contract)
+            _atomic_write_json(output_dir / "history.json", history)
+            _atomic_write_json(
+                output_dir / "run_state.json",
+                {
+                    "status": "running",
+                    "completed_epoch": 0,
+                    "target_epochs": int(spec["stage_epochs"]),
+                    "compatibility_fingerprint": config["compatibility_fingerprint"],
+                },
+            )
+
+        for local_epoch in range(completed_epoch + 1, int(spec["stage_epochs"]) + 1):
+            global_epoch = global_epoch_offset + local_epoch
+            order, order_record = _backend_epoch_order_record(
+                sample_count=len(train_cache),
+                seed=seed,
+                global_epoch=global_epoch,
+                batch_size=resolved_batch_size,
+                max_updates=max_updates_per_epoch,
+            )
+            totals: dict[str, float] = defaultdict(float)
+            seen = 0
+            updates_this_epoch = 0
+            for start in range(0, len(order), resolved_batch_size):
+                indices = order[start : start + resolved_batch_size]
+                source, target = _backend_training_batch(
+                    train_cache,
+                    base_dataset,
+                    indices,
+                    resized_shape=resized_shape,
+                    canvas_shape=canvas_shape,
+                    device=device,
+                )
+                if spec["uses_discriminator"]:
+                    assert discriminator is not None and discriminator_optimizer is not None
+                    values = backend_gan_train_step(
+                        generator,
+                        discriminator,
+                        generator_optimizer,
+                        discriminator_optimizer,
+                        source,
+                        target,
+                        adversarial_weight=float(config["adversarial_weight"]),
+                    )
+                else:
+                    values = backend_supervised_train_step(
+                        generator,
+                        generator_optimizer,
+                        source,
+                        target,
+                    )
+                batch_count = len(indices)
+                for name, value in values.items():
+                    totals[name] += float(value) * batch_count
+                seen += batch_count
+                updates_this_epoch += 1
+            if seen == 0 or updates_this_epoch != order_record["generator_update_budget"]:
+                raise RuntimeError("backend epoch did not consume its fixed update budget")
+            generator_update_count += updates_this_epoch
+            validation_metrics = _evaluate_backend_cached_generator(
+                generator,
+                validation_cache,
+                base_dataset,
+                batch_size=resolved_batch_size,
+                resized_shape=resized_shape,
+                canvas_shape=canvas_shape,
+                device=device,
+            )
+            epoch_record = {
+                "epoch": local_epoch,
+                "global_epoch": global_epoch,
+                "generator_updates": updates_this_epoch,
+                "generator_updates_total": generator_update_count,
+                "order": order_record,
+                "train": {name: value / seen for name, value in totals.items()},
+                "validation": validation_metrics,
+            }
+            if not all(
+                math.isfinite(float(value))
+                for section in (epoch_record["train"], validation_metrics)
+                for value in section.values()
+            ):
+                raise FloatingPointError("backend epoch produced non-finite metrics")
+            history.append(epoch_record)
+            epoch_orders.append(order_record)
+            checkpoint = {
+                "protocol": LUO2022_BACKEND_TRAINING_PROTOCOL,
+                "compatibility_fingerprint": config["compatibility_fingerprint"],
+                "condition": spec["condition"],
+                "completed_epoch": local_epoch,
+                "global_completed_epoch": global_epoch,
+                "generator_update_count": generator_update_count,
+                "generator": generator.state_dict(),
+                "generator_optimizer": generator_optimizer.state_dict(),
+                "discriminator": discriminator.state_dict() if discriminator is not None else None,
+                "discriminator_optimizer": (
+                    discriminator_optimizer.state_dict()
+                    if discriminator_optimizer is not None
+                    else None
+                ),
+                "history": history,
+                "epoch_orders": epoch_orders,
+                "branch_start": branch_start,
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state_all": (
+                    torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+                ),
+            }
+            checkpoint = _save_backend_epoch_checkpoint(
+                output_dir=output_dir,
+                checkpoint=checkpoint,
+            )
+            _atomic_write_json(output_dir / "history.json", history)
+            _atomic_write_json(
+                output_dir / "run_state.json",
+                {
+                    "status": "running",
+                    "completed_epoch": local_epoch,
+                    "target_epochs": int(spec["stage_epochs"]),
+                    "generator_update_count": generator_update_count,
+                    "latest_checkpoint": "checkpoints/latest.pt",
+                    "latest_checkpoint_sha256": _sha256_file(
+                        output_dir / "checkpoints" / "latest.pt"
+                    ),
+                    "compatibility_fingerprint": config["compatibility_fingerprint"],
+                },
+            )
+
+        final_checkpoint_path = output_dir / "checkpoints" / "latest.pt"
+        final_checkpoint = _load_backend_training_checkpoint(
+            final_checkpoint_path,
+            device=device,
+            expected_compatibility_fingerprint=config["compatibility_fingerprint"],
+        )
+        integrity = _assert_luo2022_backend_r0_unchanged(frontend)
+        training_metrics = {
+            "schema_version": LUO2022_BACKEND_SCHEMA_VERSION,
+            "protocol": LUO2022_BACKEND_TRAINING_PROTOCOL,
+            "condition": spec["condition"],
+            "completed_epochs": int(spec["stage_epochs"]),
+            "generator_update_count": int(final_checkpoint["generator_update_count"]),
+            "final_train": history[-1]["train"],
+            "final_validation": history[-1]["validation"],
+            "epoch_order_sha256": canonical_sha256(epoch_orders),
+        }
+        _atomic_write_json(output_dir / "metrics.json", training_metrics)
+        manifest = {
+            "schema_version": LUO2022_BACKEND_SCHEMA_VERSION,
+            "protocol": LUO2022_BACKEND_TRAINING_PROTOCOL,
+            "status": "completed",
+            "status_label": backend_contract["status"],
+            "condition": spec["condition"],
+            "operator_id": spec["operator_id"],
+            "generator_parameter_count": sum(
+                parameter.numel() for parameter in generator.parameters()
+            ),
+            "discriminator_parameter_count": (
+                sum(parameter.numel() for parameter in discriminator.parameters())
+                if discriminator is not None
+                else 0
+            ),
+            "generator_update_count": int(final_checkpoint["generator_update_count"]),
+            "stage_epochs": int(spec["stage_epochs"]),
+            "global_epoch_offset": int(global_epoch_offset),
+            "branch_start": branch_start,
+            "r0_integrity": integrity,
+            "runtime": run_metadata(),
+            "artifacts": {
+                "config": "config.json",
+                "history": "history.json",
+                "metrics": "metrics.json",
+                "latest_checkpoint": "checkpoints/latest.pt",
+                "run_state": "run_state.json",
+            },
+        }
+        _atomic_write_json(output_dir / "manifest.json", manifest)
+        _atomic_write_json(
+            output_dir / "run_state.json",
+            {
+                "status": "completed",
+                "completed_at_utc": datetime.now(UTC).isoformat(),
+                "completed_epoch": int(spec["stage_epochs"]),
+                "target_epochs": int(spec["stage_epochs"]),
+                "generator_update_count": int(final_checkpoint["generator_update_count"]),
+                "latest_checkpoint": "checkpoints/latest.pt",
+                "latest_checkpoint_sha256": _sha256_file(final_checkpoint_path),
+                "final_metrics": "metrics.json",
+                "compatibility_fingerprint": config["compatibility_fingerprint"],
+            },
+        )
+        return {
+            "history": history,
+            "metrics": training_metrics,
+            "manifest": manifest,
+            "config": config,
+        }
+
+
+def _load_backend_generator_for_evaluation(
+    run_dir: Path,
+    *,
+    condition: str,
+    device: torch.device,
+) -> tuple[torch.nn.Module, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    config, checkpoint, manifest = _completed_backend_run_checkpoint(
+        run_dir,
+        device=device,
+        expected_condition=condition,
+    )
+    generator = _initialized_backend_generator(seed=int(config["seed"]), device=device)
+    generator.load_state_dict(checkpoint["generator"], strict=True)
+    generator.eval()
+    return generator, config, checkpoint, manifest
+
+
+def _validate_backend_comparison_runs(
+    *,
+    cache_manifest: Mapping[str, Any],
+    b0_config: Mapping[str, Any],
+    b0_checkpoint: Mapping[str, Any],
+    r1_config: Mapping[str, Any],
+    r1_checkpoint: Mapping[str, Any],
+    r2_config: Mapping[str, Any],
+    r2_checkpoint: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reject an evaluator input set that is not a controlled B0/R1/R2 comparison."""
+
+    configs = {"B0": b0_config, "R1": r1_config, "R2": r2_config}
+    common_fields = (
+        "backend_contract_sha256",
+        "r0_fingerprint",
+        "cache_root_fingerprint",
+        "cache_assignment_sha256",
+        "seed",
+        "batch_size",
+        "base_channels",
+        "fresh_generator_initial_state_sha256",
+        "generator_optimizer",
+        "reconstruction_loss",
+        "max_updates_per_epoch",
+        "small_run",
+    )
+    for name, config in configs.items():
+        if config["cache_root_fingerprint"] != cache_manifest["root_fingerprint"]:
+            raise ValueError(f"{name} was not trained from the requested backend cache")
+    for field in common_fields:
+        values = {canonical_sha256(config.get(field)) for config in configs.values()}
+        if len(values) != 1:
+            raise ValueError(f"backend comparison field {field} differs across B0/R1/R2")
+    if r1_config.get("operator_id") != "r0_four_layer" or r2_config.get(
+        "operator_id"
+    ) != "r0_four_layer":
+        raise ValueError("R1 and R2 must use the same frozen four-layer operator")
+    if b0_config.get("operator_id") != "direct_no_d2nn":
+        raise ValueError("B0 must use the direct no-D2NN operator")
+    if float(r1_config.get("adversarial_weight", -1.0)) != 0.0:
+        raise ValueError("R1 must not contain adversarial loss")
+    if float(r2_config.get("adversarial_weight", 0.0)) <= 0.0:
+        raise ValueError("R2 must add a positive adversarial loss")
+    branch_start = r1_checkpoint.get("branch_start")
+    if not isinstance(branch_start, dict) or r2_checkpoint.get("branch_start") != branch_start:
+        raise ValueError("R1 and R2 do not share the exact warm-up branch state")
+    if r1_config.get("global_epoch_offset") != r2_config.get("global_epoch_offset"):
+        raise ValueError("R1 and R2 continuation epoch offsets differ")
+    r1_orders = [row["consumed_order_sha256"] for row in r1_checkpoint["epoch_orders"]]
+    r2_orders = [row["consumed_order_sha256"] for row in r2_checkpoint["epoch_orders"]]
+    if r1_orders != r2_orders:
+        raise ValueError("R1 and R2 did not consume the same object order")
+    if int(r1_checkpoint["generator_update_count"]) != int(
+        r2_checkpoint["generator_update_count"]
+    ):
+        raise ValueError("R1 and R2 generator update budgets differ")
+    total_r1_updates = int(branch_start["warmup_generator_update_count"]) + int(
+        r1_checkpoint["generator_update_count"]
+    )
+    if int(b0_checkpoint["generator_update_count"]) != total_r1_updates:
+        raise ValueError("B0 and warm-up+R1 total generator update budgets differ")
+    return {
+        "shared_warmup_checkpoint_sha256": branch_start["warmup_checkpoint_sha256"],
+        "shared_generator_start_sha256": branch_start["generator_state_sha256"],
+        "shared_generator_optimizer_start_sha256": branch_start[
+            "generator_optimizer_sha256"
+        ],
+        "continuation_order_sha256": r1_orders,
+        "continuation_generator_updates": int(r1_checkpoint["generator_update_count"]),
+        "b0_total_generator_updates": int(b0_checkpoint["generator_update_count"]),
+        "r1_total_generator_updates": total_r1_updates,
+        "r2_total_generator_updates": int(branch_start["warmup_generator_update_count"])
+        + int(r2_checkpoint["generator_update_count"]),
+        "matched": True,
+    }
+
+
+def _backend_evaluation_populations(
+    frontend: Luo2022FrozenBackendFrontend,
+) -> dict[str, tuple[torch.Tensor, list[int] | None]]:
+    runtime_values = frontend.artifacts.runtime_config["runtime"]
+    epoch = int(runtime_values["epochs"])
+    known_path = frontend.artifacts.run_dir / "diffusers" / f"training_epoch_{epoch:03d}.pt"
+    if not known_path.is_file():
+        raise FileNotFoundError("final known-diffuser bank is missing from the frozen R0 run")
+    known = torch.load(known_path, map_location="cpu", weights_only=True).to(dtype=torch.float32)
+    optics_config = frontend.model.config
+    diffuser_kwargs = _luo2022_diffuser_kwargs(
+        optics_config,
+        frontend.artifacts.contract,
+    )
+    seed_schedule, _provenance = _luo2022_frozen_diffuser_seed_schedule(
+        frontend.artifacts.runtime_config,
+        frontend.artifacts.contract,
+    )
+    uniqueness = frontend.artifacts.contract["diffuser"]["uniqueness"]
+    unseen = make_unique_correlated_diffusers(
+        int(runtime_values["eval_diffusers"]),
+        field_shape=optics_config.field_shape,
+        base_seed=int(seed_schedule["evaluation_base_seed"]),
+        minimum_difference_radians=float(uniqueness["minimum_radians"]),
+        phase_representation=str(uniqueness["phase_representation"]),
+        **diffuser_kwargs,
+    ).to(dtype=torch.float32)
+    no_diffuser = torch.zeros((1, *optics_config.field_shape), dtype=torch.float32)
+    known_start = (epoch - 1) * int(runtime_values["diffusers_per_epoch"])
+    return {
+        "final_epoch_known": (
+            known,
+            list(range(known_start, known_start + int(known.shape[0]))),
+        ),
+        "seed_disjoint_unseen": (
+            unseen,
+            list(range(int(unseen.shape[0]))),
+        ),
+        "no_diffuser": (no_diffuser, None),
+    }
+
+
+def _backend_pair_summary(
+    store: Mapping[str, Any],
+    *,
+    no_diffuser: bool,
+) -> dict[str, Any]:
+    diffuser_ids = None if no_diffuser else store["diffuser_ids"]
+    metric_summaries = {
+        name: {
+            "distribution": two_level_diffuser_summary(
+                values,
+                diffuser_ids=diffuser_ids,
+            ),
+            "per_digit": digit_group_statistics(
+                values,
+                store["digits"],
+                diffuser_ids=diffuser_ids,
+            ),
+        }
+        for name, values in store["metrics"].items()
+    }
+    target_pcc = store["metrics"]["pearson_target_support"]
+    metric_summaries["pearson_target_support"]["worst_5_percent"] = (
+        pair_level_tail_statistics(target_pcc)
+    )
+    return {
+        "pair_count": len(store["object_ids"]),
+        "object_id_coverage": {
+            "unique_count": len(set(store["object_ids"])),
+            "minimum": min(store["object_ids"]),
+            "maximum": max(store["object_ids"]),
+        },
+        "metrics": metric_summaries,
+    }
+
+
+def _save_fixed_backend_sample_grid(
+    samples: Mapping[int, Mapping[str, torch.Tensor]],
+    *,
+    requested_ids: Sequence[int],
+    output_path: Path,
+    title: str,
+) -> None:
+    ordered_ids = [object_id for object_id in requested_ids if object_id in samples]
+    if not ordered_ids:
+        return
+    panels = (
+        "clean_target",
+        "direct_scattered_intensity",
+        "frozen_four_layer_output",
+        "B0_reconstruction",
+        "R1_reconstruction",
+        "R2_reconstruction",
+        "B0_absolute_error",
+        "R1_absolute_error",
+        "R2_absolute_error",
+    )
+    fig, axes = plt.subplots(
+        len(ordered_ids),
+        len(panels),
+        figsize=(1.7 * len(panels), 1.7 * len(ordered_ids)),
+        squeeze=False,
+    )
+    for row_index, object_id in enumerate(ordered_ids):
+        for column_index, panel in enumerate(panels):
+            axis = axes[row_index][column_index]
+            image = samples[object_id][panel].detach().cpu().squeeze().numpy()
+            axis.imshow(image, cmap="gray", vmin=0.0, vmax=1.0)
+            if row_index == 0:
+                axis.set_title(panel.replace("_", " "), fontsize=7)
+            if column_index == 0:
+                axis.set_ylabel(str(object_id), fontsize=7)
+            axis.set_xticks([])
+            axis.set_yticks([])
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def _save_backend_metric_plot(metrics: Mapping[str, Any], output_path: Path) -> None:
+    conditions = ("final_epoch_known", "seed_disjoint_unseen", "no_diffuser")
+    metric_names = ("pearson_target_support", "psnr", "ssim")
+    fig, axes = plt.subplots(1, len(metric_names), figsize=(12.0, 3.6), squeeze=False)
+    x = np.arange(len(conditions), dtype=np.float64)
+    width = 0.18
+    for metric_index, metric_name in enumerate(metric_names):
+        axis = axes[0][metric_index]
+        for variant_index, variant in enumerate(LUO2022_BACKEND_VARIANTS):
+            values = [
+                metrics["conditions"][condition][variant]["metrics"][metric_name][
+                    "distribution"
+                ]["statistics"]["mean"]
+                for condition in conditions
+            ]
+            axis.bar(
+                x + (variant_index - 1.5) * width,
+                values,
+                width=width,
+                label=variant,
+            )
+        axis.set_title(metric_name)
+        axis.set_xticks(x, ["known", "unseen", "none"])
+        axis.grid(axis="y", alpha=0.25)
+    axes[0][0].legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def _save_backend_cost_plot(
+    metrics: Mapping[str, Any],
+    model_metadata: Mapping[str, Any],
+    output_path: Path,
+) -> None:
+    fig, axis = plt.subplots(figsize=(5.2, 4.0))
+    for variant in LUO2022_BACKEND_VARIANTS:
+        x = float(model_metadata[variant]["digital_parameter_count"])
+        y = float(
+            metrics["conditions"]["seed_disjoint_unseen"][variant]["metrics"][
+                "pearson_target_support"
+            ]["distribution"]["statistics"]["mean"]
+        )
+        axis.scatter([x], [y], s=55)
+        axis.annotate(variant, (x, y))
+    axis.set_xlabel("digital parameter count")
+    axis.set_ylabel("unseen target-support PCC")
+    axis.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def _save_backend_training_plot(
+    histories: Mapping[str, Sequence[Mapping[str, Any]]],
+    output_path: Path,
+) -> None:
+    fig, axis = plt.subplots(figsize=(6.2, 4.0))
+    for variant, history in histories.items():
+        if not history:
+            continue
+        axis.plot(
+            [int(row["global_epoch"]) for row in history],
+            [float(row["train"]["l1"]) for row in history],
+            marker="o",
+            label=variant,
+        )
+    axis.set_xlabel("global epoch")
+    axis.set_ylabel("training L1")
+    axis.grid(alpha=0.25)
+    axis.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def run_luo2022_backend_evaluation(
+    *,
+    run_dir: Path,
+    output_dir: Path,
+    cache_dir: Path,
+    config_path: Path = DEFAULT_LUO2022_CONFIG,
+    backend_config_path: Path = DEFAULT_LUO2022_BACKEND_CONFIG,
+    b0_dir: Path,
+    r1_dir: Path,
+    r2_dir: Path,
+    device_name: str = "cpu",
+    download: bool = False,
+    max_eval_batches: int | None = None,
+) -> dict[str, Any]:
+    """Stream unified R0/B0/R1/R2 metrics over known/unseen/no-diffuser controls."""
+
+    run_dir = Path(run_dir)
+    output_dir = Path(output_dir)
+    cache_dir = Path(cache_dir)
+    _require_backend_output_outside_r0(output_dir, run_dir)
+    _require_backend_output_outside_r0(cache_dir, run_dir)
+    if max_eval_batches is not None and max_eval_batches <= 0:
+        raise ValueError("max_eval_batches must be positive")
+    device = select_device(device_name)
+    cache_manifest = _load_backend_cache_manifest(cache_dir)
+    _prepare_fresh_backend_output(output_dir, resume=False)
+
+    with _verified_luo2022_backend_frontend(
+        run_dir=run_dir,
+        config_path=config_path,
+        device=device,
+    ) as frontend:
+        backend_contract = _load_luo2022_backend_contract(
+            backend_config_path,
+            artifacts=frontend.artifacts,
+        )
+        if cache_manifest["request"]["r0_fingerprint"] != _backend_r0_fingerprint(
+            frontend.artifacts
+        ):
+            raise ValueError("backend evaluation cache does not match the frozen R0 run")
+        b0, b0_config, b0_checkpoint, b0_manifest = _load_backend_generator_for_evaluation(
+            Path(b0_dir), condition="b0", device=device
+        )
+        r1, r1_config, r1_checkpoint, r1_manifest = _load_backend_generator_for_evaluation(
+            Path(r1_dir), condition="r1", device=device
+        )
+        r2, r2_config, r2_checkpoint, r2_manifest = _load_backend_generator_for_evaluation(
+            Path(r2_dir), condition="r2", device=device
+        )
+        fairness = _validate_backend_comparison_runs(
+            cache_manifest=cache_manifest,
+            b0_config=b0_config,
+            b0_checkpoint=b0_checkpoint,
+            r1_config=r1_config,
+            r1_checkpoint=r1_checkpoint,
+            r2_config=r2_config,
+            r2_checkpoint=r2_checkpoint,
+        )
+        direct_scale = float(
+            verify_luo2022_intensity_cache(
+                cache_dir / cache_manifest["caches"]["direct_no_d2nn"]["train"]["path"]
+            )["scale"]["value"]
+        )
+        frozen_scale = float(
+            verify_luo2022_intensity_cache(
+                cache_dir / cache_manifest["caches"]["r0_four_layer"]["train"]["path"]
+            )["scale"]["value"]
+        )
+        runtime_values = frontend.artifacts.runtime_config["runtime"]
+        eval_limit = int(runtime_values["eval_limit"])
+        batch_size = int(b0_config["batch_size"])
+        eval_dataset = build_torchvision_dataset(
+            name="MNIST",
+            root=DEFAULT_DATA_ROOT,
+            train=False,
+            image_size=int(frontend.artifacts.contract["input"]["original_shape"][0]),
+            download=download,
+        )
+        eval_count = min(eval_limit, len(eval_dataset))
+        if max_eval_batches is not None:
+            eval_count = min(eval_count, max_eval_batches * batch_size)
+        if eval_count <= 0:
+            raise ValueError("backend evaluation dataset is empty")
+        populations = _backend_evaluation_populations(frontend)
+        requested_sample_ids = [
+            int(value) for value in backend_contract["evaluation"]["fixed_example_object_ids"]
+        ]
+        stores: dict[str, dict[str, dict[str, Any]]] = {
+            condition_name: {
+                variant: {
+                    "object_ids": [],
+                    "digits": [],
+                    "diffuser_ids": [],
+                    "metrics": defaultdict(list),
+                }
+                for variant in LUO2022_BACKEND_VARIANTS
+            }
+            for condition_name in populations
+        }
+        fixed_samples: dict[str, dict[int, dict[str, torch.Tensor]]] = {
+            condition_name: {} for condition_name in populations
+        }
+        inference_seconds: dict[str, float] = defaultdict(float)
+        inference_items: dict[str, int] = defaultdict(int)
+        per_object_path = output_dir / "per_object_metrics.csv"
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".per_object_metrics.", suffix=".tmp", dir=output_dir
+        )
+        os.close(descriptor)
+        temporary_csv = Path(temporary_name)
+        fieldnames = [
+            "condition",
+            "variant",
+            "object_id",
+            "label",
+            "diffuser_id",
+            "pearson_target_support",
+            "pearson_full_canvas",
+            "psnr",
+            "ssim",
+        ]
+        try:
+            with temporary_csv.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for condition_name, (phases_cpu, public_diffuser_ids) in populations.items():
+                    phases = phases_cpu.to(device)
+                    for object_start in range(0, eval_count, batch_size):
+                        object_stop = min(object_start + batch_size, eval_count)
+                        batch_items = [
+                            _backend_unpack_image_label(eval_dataset[index])
+                            for index in range(object_start, object_stop)
+                        ]
+                        images = torch.stack([item[0] for item in batch_items]).to(device)
+                        labels = [int(item[1]) for item in batch_items]
+                        target = prepare_luo2022_amplitude(
+                            images,
+                            resized_shape=(int(runtime_values["input_size"]),) * 2,
+                            canvas_shape=(int(runtime_values["grid_size"]),) * 2,
+                        )
+                        field = amplitude_to_complex_field(target)
+                        for diffuser_index in range(int(phases.shape[0])):
+                            one_phase = phases[diffuser_index : diffuser_index + 1]
+                            with torch.inference_mode():
+                                if device.type == "cuda":
+                                    torch.cuda.synchronize(device)
+                                optical_start = time.perf_counter()
+                                direct_raw = frontend.model.forward_without_diffractive_layers(
+                                    field, one_phase
+                                )[:, 0].unsqueeze(1)
+                                frozen_raw = frontend.model(field, one_phase)[:, 0].unsqueeze(1)
+                                if device.type == "cuda":
+                                    torch.cuda.synchronize(device)
+                                inference_seconds["R0_optical"] += time.perf_counter() - optical_start
+                                direct_input = direct_raw / direct_scale
+                                frozen_input = frozen_raw / frozen_scale
+                                digital_predictions: dict[str, torch.Tensor] = {}
+                                for variant, generator, source in (
+                                    ("B0", b0, direct_input),
+                                    ("R1", r1, frozen_input),
+                                    ("R2", r2, frozen_input),
+                                ):
+                                    if device.type == "cuda":
+                                        torch.cuda.synchronize(device)
+                                    digital_start = time.perf_counter()
+                                    digital_predictions[variant] = generator(source)
+                                    if device.type == "cuda":
+                                        torch.cuda.synchronize(device)
+                                    inference_seconds[variant] += time.perf_counter() - digital_start
+                                    inference_items[variant] += int(target.shape[0])
+                                predictions = {
+                                    "R0": frozen_input,
+                                    **digital_predictions,
+                                }
+                                inference_items["R0"] += int(target.shape[0])
+                                for variant, prediction in predictions.items():
+                                    per_image = per_image_reconstruction_metrics(
+                                        prediction,
+                                        target,
+                                        target_support=target > 0,
+                                    )
+                                    store = stores[condition_name][variant]
+                                    diffuser_id = (
+                                        None
+                                        if public_diffuser_ids is None
+                                        else int(public_diffuser_ids[diffuser_index])
+                                    )
+                                    for batch_index, object_id in enumerate(
+                                        range(object_start, object_stop)
+                                    ):
+                                        row_metrics = {
+                                            name: float(values[batch_index].detach().cpu())
+                                            for name, values in per_image.items()
+                                        }
+                                        store["object_ids"].append(object_id)
+                                        store["digits"].append(labels[batch_index])
+                                        if diffuser_id is not None:
+                                            store["diffuser_ids"].append(diffuser_id)
+                                        for name, value in row_metrics.items():
+                                            store["metrics"][name].append(value)
+                                        writer.writerow(
+                                            {
+                                                "condition": condition_name,
+                                                "variant": variant,
+                                                "object_id": object_id,
+                                                "label": labels[batch_index],
+                                                "diffuser_id": "" if diffuser_id is None else diffuser_id,
+                                                **row_metrics,
+                                            }
+                                        )
+                                if diffuser_index == 0:
+                                    for batch_index, object_id in enumerate(
+                                        range(object_start, object_stop)
+                                    ):
+                                        if object_id not in requested_sample_ids:
+                                            continue
+                                        clean = target[batch_index].detach().cpu()
+                                        direct_image = direct_input[batch_index].detach().cpu()
+                                        frozen_image = frozen_input[batch_index].detach().cpu()
+                                        b0_image = digital_predictions["B0"][batch_index].detach().cpu()
+                                        r1_image = digital_predictions["R1"][batch_index].detach().cpu()
+                                        r2_image = digital_predictions["R2"][batch_index].detach().cpu()
+                                        fixed_samples[condition_name][object_id] = {
+                                            "clean_target": clean,
+                                            "direct_scattered_intensity": direct_image,
+                                            "frozen_four_layer_output": frozen_image,
+                                            "B0_reconstruction": b0_image,
+                                            "R1_reconstruction": r1_image,
+                                            "R2_reconstruction": r2_image,
+                                            "B0_absolute_error": (b0_image - clean).abs(),
+                                            "R1_absolute_error": (r1_image - clean).abs(),
+                                            "R2_absolute_error": (r2_image - clean).abs(),
+                                        }
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_csv, per_object_path)
+        finally:
+            if temporary_csv.exists():
+                temporary_csv.unlink()
+
+        condition_metrics: dict[str, Any] = {}
+        for condition_name, variants in stores.items():
+            no_diffuser = condition_name == "no_diffuser"
+            expected_pairs = eval_count * int(populations[condition_name][0].shape[0])
+            condition_metrics[condition_name] = {}
+            for variant, store in variants.items():
+                if len(store["object_ids"]) != expected_pairs:
+                    raise RuntimeError("backend evaluator pair coverage is incomplete")
+                if not no_diffuser and len(store["diffuser_ids"]) != expected_pairs:
+                    raise RuntimeError("backend evaluator diffuser IDs are incomplete")
+                condition_metrics[condition_name][variant] = _backend_pair_summary(
+                    store,
+                    no_diffuser=no_diffuser,
+                )
+        metrics: dict[str, Any] = {
+            "schema_version": LUO2022_BACKEND_SCHEMA_VERSION,
+            "protocol": LUO2022_BACKEND_EVALUATION_PROTOCOL,
+            "status_label": backend_contract["status"],
+            "conditions": condition_metrics,
+        }
+        causal_pairs = {
+            "digital_reconstruction_total_gain_R1_minus_R0": ("R1", "R0"),
+            "optical_frontend_net_contribution_R1_minus_B0": ("R1", "B0"),
+            "gan_marginal_contribution_R2_minus_R1": ("R2", "R1"),
+        }
+        metrics["causal_deltas"] = {
+            question: {
+                condition_name: {
+                    metric_name: (
+                        float(
+                            condition_metrics[condition_name][comparison]["metrics"][
+                                metric_name
+                            ]["distribution"]["statistics"]["mean"]
+                        )
+                        - float(
+                            condition_metrics[condition_name][reference]["metrics"][
+                                metric_name
+                            ]["distribution"]["statistics"]["mean"]
+                        )
+                    )
+                    for metric_name in (
+                        "pearson_target_support",
+                        "pearson_full_canvas",
+                        "psnr",
+                        "ssim",
+                    )
+                }
+                for condition_name in condition_metrics
+            }
+            for question, (comparison, reference) in causal_pairs.items()
+        }
+        metrics["causal_delta_inference"] = {}
+        for question, (comparison, reference) in causal_pairs.items():
+            question_statistics: dict[str, Any] = {}
+            for condition_name in condition_metrics:
+                metric_statistics: dict[str, Any] = {}
+                for metric_name in (
+                    "pearson_target_support",
+                    "pearson_full_canvas",
+                    "psnr",
+                    "ssim",
+                ):
+                    if condition_name == "no_diffuser":
+                        reference_values = stores[condition_name][reference]["metrics"][
+                            metric_name
+                        ]
+                        comparison_values = stores[condition_name][comparison]["metrics"][
+                            metric_name
+                        ]
+                        metric_statistics[metric_name] = {
+                            "aggregation_unit": "object",
+                            "delta_definition": "comparison_minus_reference",
+                            "statistics": scalar_summary(
+                                [
+                                    float(comparison_value) - float(reference_value)
+                                    for reference_value, comparison_value in zip(
+                                        reference_values,
+                                        comparison_values,
+                                        strict=True,
+                                    )
+                                ]
+                            ),
+                        }
+                    else:
+                        reference_rows = condition_metrics[condition_name][reference][
+                            "metrics"
+                        ][metric_name]["distribution"]["per_diffuser"]
+                        comparison_rows = condition_metrics[condition_name][comparison][
+                            "metrics"
+                        ][metric_name]["distribution"]["per_diffuser"]
+                        metric_statistics[metric_name] = {
+                            "aggregation_unit": "matched_diffuser",
+                            **paired_diffuser_delta_statistics(
+                                {
+                                    row["diffuser_id"]: float(row["mean"])
+                                    for row in reference_rows
+                                },
+                                {
+                                    row["diffuser_id"]: float(row["mean"])
+                                    for row in comparison_rows
+                                },
+                            ),
+                        }
+                question_statistics[condition_name] = metric_statistics
+            metrics["causal_delta_inference"][question] = question_statistics
+        model_metadata = {
+            "R0": {
+                "digital_parameter_count": 0,
+                "optical_layers": 4,
+                "mean_digital_inference_seconds_per_object": 0.0,
+            },
+            "B0": {
+                "digital_parameter_count": int(b0_manifest["generator_parameter_count"]),
+                "optical_layers": 0,
+            },
+            "R1": {
+                "digital_parameter_count": int(r1_manifest["generator_parameter_count"]),
+                "optical_layers": 4,
+            },
+            "R2": {
+                "digital_parameter_count": int(r2_manifest["generator_parameter_count"])
+                + int(r2_manifest["discriminator_parameter_count"]),
+                "generator_parameter_count": int(r2_manifest["generator_parameter_count"]),
+                "discriminator_parameter_count": int(
+                    r2_manifest["discriminator_parameter_count"]
+                ),
+                "optical_layers": 4,
+            },
+        }
+        for variant in ("B0", "R1", "R2"):
+            model_metadata[variant]["mean_digital_inference_seconds_per_object"] = (
+                inference_seconds[variant] / max(1, inference_items[variant])
+            )
+        metrics["model_and_budget"] = {
+            "models": model_metadata,
+            "training_fairness": fairness,
+        }
+        metrics["input_scaling"] = {
+            "quantity": "raw_detector_intensity",
+            "direct_no_d2nn_train_global_max": direct_scale,
+            "r0_four_layer_train_global_max": frozen_scale,
+            "R0_metric_input": "raw_frozen_four_layer_intensity_divided_by_r0_operator_train_global_max",
+            "digital_inputs": "raw_operator_intensity_divided_by_matching_operator_train_global_max",
+            "fit_split": "train_only",
+            "per_image_normalization": False,
+            "clipping": False,
+        }
+        _atomic_write_json(output_dir / "metrics.json", metrics)
+        for condition_name, samples in fixed_samples.items():
+            _save_fixed_backend_sample_grid(
+                samples,
+                requested_ids=requested_sample_ids,
+                output_path=output_dir / "samples" / f"{condition_name}.png",
+                title=condition_name,
+            )
+        _save_backend_metric_plot(metrics, output_dir / "metrics_comparison.png")
+        _save_backend_cost_plot(metrics, model_metadata, output_dir / "cost.png")
+        _save_backend_training_plot(
+            {
+                "B0": b0_checkpoint["history"],
+                "R1": r1_checkpoint["history"],
+                "R2": r2_checkpoint["history"],
+            },
+            output_dir / "training_curves.png",
+        )
+        integrity = _assert_luo2022_backend_r0_unchanged(frontend)
+        evaluation_config = {
+            "schema_version": LUO2022_BACKEND_SCHEMA_VERSION,
+            "protocol": LUO2022_BACKEND_EVALUATION_PROTOCOL,
+            "backend_contract_sha256": _sha256_file(backend_config_path),
+            "r0_fingerprint": _backend_r0_fingerprint(frontend.artifacts),
+            "cache_root_fingerprint": cache_manifest["root_fingerprint"],
+            "evaluation_object_count": eval_count,
+            "max_eval_batches": max_eval_batches,
+            "diffuser_conditions": list(populations),
+            "fixed_example_object_ids": requested_sample_ids,
+            "input_scaling": metrics["input_scaling"],
+            "fairness": fairness,
+        }
+        _atomic_write_json(output_dir / "config.json", evaluation_config)
+        manifest = {
+            "schema_version": LUO2022_BACKEND_SCHEMA_VERSION,
+            "protocol": LUO2022_BACKEND_EVALUATION_PROTOCOL,
+            "status": "completed",
+            "status_label": backend_contract["status"],
+            "r0_integrity": integrity,
+            "runtime": run_metadata(),
+            "artifacts": {
+                "config": "config.json",
+                "metrics": "metrics.json",
+                "per_object_metrics": "per_object_metrics.csv",
+                "metric_plot": "metrics_comparison.png",
+                "cost_plot": "cost.png",
+                "training_curves": "training_curves.png",
+                "samples": [
+                    f"samples/{condition_name}.png"
+                    for condition_name, samples in fixed_samples.items()
+                    if samples
+                ],
+            },
+        }
+        _atomic_write_json(output_dir / "manifest.json", manifest)
+        return {"metrics": metrics, "manifest": manifest, "config": evaluation_config}
 
 
 def _luo2022_optics_config_from_frozen_run(

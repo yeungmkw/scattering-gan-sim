@@ -90,15 +90,14 @@ The local evidence ledger contains 2,021 unique per-diffuser rows:
 
 The full-canvas recomputation matches the frozen evaluator exactly, the
 checkpoint remained read-only during post-hoc evaluation, and all retained
-evidence checksums pass. Generated rows, checkpoints, machine details, and
-internal reproduction audits are intentionally excluded from the public
-repository.
+evidence checksums pass. Generated rows and checkpoints are intentionally
+excluded from the public repository.
 
 ## Acceptance and Claim Boundary
 
 The project-defined post-training absolute-level, optical-control,
 memory-structure, and integrity gates passed. The depth-trend gate remains
-deferred until independent two-layer and five-layer models are trained.
+deferred; the next controlled study keeps all four optical layers frozen.
 
 The result supports the following narrow statement:
 
@@ -113,8 +112,17 @@ advantage over all digital reconstruction methods.
 
 ## Next Research Gate
 
-The next experiment is the controlled two/four/five-layer depth trend. The
-four-layer result in this document remains unchanged. Two-layer and
-five-layer variants must use the same data, diffuser banks, optimization
-budget, loss, geometry convention, and evaluation protocol before the project
-begins the optical-layer versus lightweight-digital-backend Pareto study.
+The next experiment is the fixed-four-layer B0/R1/R2 backend ablation defined
+in
+[`configs/luo2022_fixed4_backend.json`](../configs/luo2022_fixed4_backend.json).
+The four-layer result and every number in this document remain unchanged.
+
+- B0 trains the lightweight supervised U-Net on the direct/no-D2NN operator.
+- R1 trains the same U-Net after frozen R0.
+- R2 branches from R1's identical 20-epoch supervised warmup and adds 10
+  adversarial epochs; R1 receives a matched 10-epoch supervised continuation.
+
+This is an exploratory fixed-depth backend ablation. It can measure digital
+and adversarial marginal effects under this protocol, but it cannot establish
+an optical depth trend. Independent two-layer and five-layer training is
+deferred and remains necessary before any reduced-depth claim.
