@@ -563,7 +563,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--backend-warmup-dir",
         type=Path,
         default=None,
-        help="Completed common warm-up run required by R1 and R2.",
+        help=(
+            "Completed common warm-up run required by R1/R2 training and by "
+            "the controlled backend evaluator."
+        ),
     )
     d2nn_parser.add_argument("--backend-b0-dir", type=Path, default=None)
     d2nn_parser.add_argument("--backend-r1-dir", type=Path, default=None)
@@ -688,6 +691,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 if args.run_dir is None:
                     raise ValueError("--run-dir is required for backend-evaluate")
                 required = {
+                    "--backend-warmup-dir": args.backend_warmup_dir,
                     "--backend-b0-dir": args.backend_b0_dir,
                     "--backend-r1-dir": args.backend_r1_dir,
                     "--backend-r2-dir": args.backend_r2_dir,
@@ -703,6 +707,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                     cache_dir=args.backend_cache_dir,
                     config_path=args.config_path,
                     backend_config_path=args.backend_config_path,
+                    warmup_dir=args.backend_warmup_dir,
                     b0_dir=args.backend_b0_dir,
                     r1_dir=args.backend_r1_dir,
                     r2_dir=args.backend_r2_dir,
@@ -4794,6 +4799,9 @@ def _load_backend_generator_for_evaluation(
 def _validate_backend_comparison_runs(
     *,
     cache_manifest: Mapping[str, Any],
+    warmup_checkpoint_sha256: str,
+    warmup_config: Mapping[str, Any],
+    warmup_checkpoint: Mapping[str, Any],
     b0_config: Mapping[str, Any],
     b0_checkpoint: Mapping[str, Any],
     r1_config: Mapping[str, Any],
@@ -4803,7 +4811,18 @@ def _validate_backend_comparison_runs(
 ) -> dict[str, Any]:
     """Reject an evaluator input set that is not a controlled B0/R1/R2 comparison."""
 
-    configs = {"B0": b0_config, "R1": r1_config, "R2": r2_config}
+    configs = {
+        "warm-up": warmup_config,
+        "B0": b0_config,
+        "R1": r1_config,
+        "R2": r2_config,
+    }
+    checkpoints = {
+        "warm-up": warmup_checkpoint,
+        "B0": b0_checkpoint,
+        "R1": r1_checkpoint,
+        "R2": r2_checkpoint,
+    }
     common_fields = (
         "backend_contract_sha256",
         "r0_fingerprint",
@@ -4831,19 +4850,106 @@ def _validate_backend_comparison_runs(
         raise ValueError("R1 and R2 must use the same frozen four-layer operator")
     if b0_config.get("operator_id") != "direct_no_d2nn":
         raise ValueError("B0 must use the direct no-D2NN operator")
+    if warmup_config.get("operator_id") != "r0_four_layer":
+        raise ValueError("warm-up must use the frozen four-layer operator")
+    if float(warmup_config.get("adversarial_weight", -1.0)) != 0.0:
+        raise ValueError("warm-up must not contain adversarial loss")
+    if warmup_checkpoint.get("discriminator") is not None or warmup_checkpoint.get(
+        "discriminator_optimizer"
+    ) is not None:
+        raise ValueError("warm-up checkpoint unexpectedly contains a discriminator")
     if float(r1_config.get("adversarial_weight", -1.0)) != 0.0:
         raise ValueError("R1 must not contain adversarial loss")
     if float(r2_config.get("adversarial_weight", 0.0)) <= 0.0:
         raise ValueError("R2 must add a positive adversarial loss")
+
+    for name, config in configs.items():
+        checkpoint = checkpoints[name]
+        stage_epochs = int(config["stage_epochs"])
+        global_epoch_offset = int(config["global_epoch_offset"])
+        history = list(checkpoint["history"])
+        epoch_orders = list(checkpoint["epoch_orders"])
+        if int(checkpoint["completed_epoch"]) != stage_epochs:
+            raise ValueError(f"{name} checkpoint epoch count differs from its config")
+        if int(checkpoint["global_completed_epoch"]) != global_epoch_offset + stage_epochs:
+            raise ValueError(f"{name} global epoch offset differs from its config")
+        if len(history) != stage_epochs or len(epoch_orders) != stage_epochs:
+            raise ValueError(f"{name} history/order coverage differs from its config")
+        expected_global_epochs = list(
+            range(global_epoch_offset + 1, global_epoch_offset + stage_epochs + 1)
+        )
+        if [int(row["global_epoch"]) for row in history] != expected_global_epochs:
+            raise ValueError(f"{name} history global epochs are not contiguous")
+        if [int(row["global_epoch"]) for row in epoch_orders] != expected_global_epochs:
+            raise ValueError(f"{name} order global epochs are not contiguous")
+        update_budget = sum(
+            int(row["generator_update_budget"]) for row in epoch_orders
+        )
+        if int(checkpoint["generator_update_count"]) != update_budget:
+            raise ValueError(f"{name} generator update count differs from epoch budgets")
+        if [int(row["generator_updates"]) for row in history] != [
+            int(row["generator_update_budget"]) for row in epoch_orders
+        ]:
+            raise ValueError(f"{name} history update counts differ from epoch budgets")
+
+    if int(warmup_config["global_epoch_offset"]) != 0:
+        raise ValueError("warm-up global epoch offset must be zero")
+    if int(b0_config["global_epoch_offset"]) != 0:
+        raise ValueError("B0 global epoch offset must be zero")
+    warmup_global_epoch = int(warmup_checkpoint["global_completed_epoch"])
+    if int(r1_config["global_epoch_offset"]) != warmup_global_epoch or int(
+        r2_config["global_epoch_offset"]
+    ) != warmup_global_epoch:
+        raise ValueError("R1/R2 continuation offsets do not follow the completed warm-up")
+
+    actual_warmup_provenance = {
+        "checkpoint_sha256": warmup_checkpoint_sha256,
+        "compatibility_fingerprint": warmup_checkpoint["compatibility_fingerprint"],
+        "completed_epoch": int(warmup_checkpoint["completed_epoch"]),
+        "global_completed_epoch": warmup_global_epoch,
+        "generator_update_count": int(warmup_checkpoint["generator_update_count"]),
+    }
+    if r1_config.get("warmup") != actual_warmup_provenance or r2_config.get(
+        "warmup"
+    ) != actual_warmup_provenance:
+        raise ValueError("R1/R2 config provenance does not match the supplied warm-up")
+
+    expected_branch_start = {
+        "warmup_checkpoint_sha256": warmup_checkpoint_sha256,
+        "generator_state_sha256": _backend_state_sha256(
+            warmup_checkpoint["generator"]
+        ),
+        "generator_optimizer_sha256": _backend_state_sha256(
+            warmup_checkpoint["generator_optimizer"]
+        ),
+        "warmup_generator_update_count": int(
+            warmup_checkpoint["generator_update_count"]
+        ),
+    }
     branch_start = r1_checkpoint.get("branch_start")
-    if not isinstance(branch_start, dict) or r2_checkpoint.get("branch_start") != branch_start:
-        raise ValueError("R1 and R2 do not share the exact warm-up branch state")
+    if branch_start != expected_branch_start or r2_checkpoint.get(
+        "branch_start"
+    ) != expected_branch_start:
+        raise ValueError("R1/R2 branch start does not match the supplied warm-up")
     if r1_config.get("global_epoch_offset") != r2_config.get("global_epoch_offset"):
         raise ValueError("R1 and R2 continuation epoch offsets differ")
-    r1_orders = [row["consumed_order_sha256"] for row in r1_checkpoint["epoch_orders"]]
-    r2_orders = [row["consumed_order_sha256"] for row in r2_checkpoint["epoch_orders"]]
+    warmup_orders = list(warmup_checkpoint["epoch_orders"])
+    b0_orders = list(b0_checkpoint["epoch_orders"])
+    r1_orders = list(r1_checkpoint["epoch_orders"])
+    r2_orders = list(r2_checkpoint["epoch_orders"])
     if r1_orders != r2_orders:
         raise ValueError("R1 and R2 did not consume the same object order")
+    warmup_plus_r1_orders = [*warmup_orders, *r1_orders]
+    if b0_orders != warmup_plus_r1_orders:
+        raise ValueError("B0 order sequence does not match warm-up plus R1")
+    if int(b0_config["stage_epochs"]) != int(warmup_config["stage_epochs"]) + int(
+        r1_config["stage_epochs"]
+    ):
+        raise ValueError("B0 epoch budget does not match warm-up plus R1")
+    if int(b0_config["stage_epochs"]) != int(warmup_config["stage_epochs"]) + int(
+        r2_config["stage_epochs"]
+    ):
+        raise ValueError("B0 epoch budget does not match warm-up plus R2")
     if int(r1_checkpoint["generator_update_count"]) != int(
         r2_checkpoint["generator_update_count"]
     ):
@@ -4853,18 +4959,31 @@ def _validate_backend_comparison_runs(
     )
     if int(b0_checkpoint["generator_update_count"]) != total_r1_updates:
         raise ValueError("B0 and warm-up+R1 total generator update budgets differ")
+    total_r2_updates = int(warmup_checkpoint["generator_update_count"]) + int(
+        r2_checkpoint["generator_update_count"]
+    )
+    if int(b0_checkpoint["generator_update_count"]) != total_r2_updates:
+        raise ValueError("B0 and warm-up+R2 total generator update budgets differ")
     return {
-        "shared_warmup_checkpoint_sha256": branch_start["warmup_checkpoint_sha256"],
-        "shared_generator_start_sha256": branch_start["generator_state_sha256"],
-        "shared_generator_optimizer_start_sha256": branch_start[
+        "shared_warmup_checkpoint_sha256": warmup_checkpoint_sha256,
+        "warmup_provenance": actual_warmup_provenance,
+        "shared_generator_start_sha256": expected_branch_start[
+            "generator_state_sha256"
+        ],
+        "shared_generator_optimizer_start_sha256": expected_branch_start[
             "generator_optimizer_sha256"
         ],
-        "continuation_order_sha256": r1_orders,
+        "warmup_order_sequence_sha256": canonical_sha256(warmup_orders),
+        "continuation_order_sequence_sha256": canonical_sha256(r1_orders),
+        "b0_order_sequence_sha256": canonical_sha256(b0_orders),
+        "warmup_plus_r1_order_sequence_sha256": canonical_sha256(
+            warmup_plus_r1_orders
+        ),
+        "warmup_generator_updates": int(warmup_checkpoint["generator_update_count"]),
         "continuation_generator_updates": int(r1_checkpoint["generator_update_count"]),
         "b0_total_generator_updates": int(b0_checkpoint["generator_update_count"]),
         "r1_total_generator_updates": total_r1_updates,
-        "r2_total_generator_updates": int(branch_start["warmup_generator_update_count"])
-        + int(r2_checkpoint["generator_update_count"]),
+        "r2_total_generator_updates": total_r2_updates,
         "matched": True,
     }
 
@@ -5020,50 +5139,204 @@ def _save_backend_metric_plot(metrics: Mapping[str, Any], output_path: Path) -> 
     plt.close(fig)
 
 
+def _backend_cost_plot_series(
+    metrics: Mapping[str, Any],
+    model_metadata: Mapping[str, Any],
+) -> dict[str, dict[str, float | int]]:
+    """Return the inference-only cost coordinates used by the cost plot."""
+
+    return {
+        variant: {
+            "unseen_target_support_pcc": float(
+                metrics["conditions"]["seed_disjoint_unseen"][variant]["metrics"][
+                    "pearson_target_support"
+                ]["distribution"]["statistics"]["mean"]
+            ),
+            "inference_digital_parameter_count": int(
+                model_metadata[variant]["inference_digital_parameter_count"]
+            ),
+            "training_only_digital_parameter_count": int(
+                model_metadata[variant]["training_only_digital_parameter_count"]
+            ),
+            "mean_digital_inference_seconds_per_object": float(
+                model_metadata[variant]["mean_digital_inference_seconds_per_object"]
+            ),
+        }
+        for variant in LUO2022_BACKEND_VARIANTS
+    }
+
+
 def _save_backend_cost_plot(
     metrics: Mapping[str, Any],
     model_metadata: Mapping[str, Any],
     output_path: Path,
-) -> None:
-    fig, axis = plt.subplots(figsize=(5.2, 4.0))
+) -> dict[str, dict[str, float | int]]:
+    series = _backend_cost_plot_series(metrics, model_metadata)
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.2), squeeze=False)
+    annotation_offsets = {
+        "R0": (4, 6),
+        "B0": (4, -14),
+        "R1": (4, 6),
+        "R2": (4, 18),
+    }
     for variant in LUO2022_BACKEND_VARIANTS:
-        x = float(model_metadata[variant]["digital_parameter_count"])
-        y = float(
-            metrics["conditions"]["seed_disjoint_unseen"][variant]["metrics"][
-                "pearson_target_support"
-            ]["distribution"]["statistics"]["mean"]
+        variant_series = series[variant]
+        pcc = float(variant_series["unseen_target_support_pcc"])
+        inference_parameters = float(
+            variant_series["inference_digital_parameter_count"]
         )
-        axis.scatter([x], [y], s=55)
-        axis.annotate(variant, (x, y))
-    axis.set_xlabel("digital parameter count")
-    axis.set_ylabel("unseen target-support PCC")
-    axis.grid(alpha=0.25)
+        inference_seconds = float(
+            variant_series["mean_digital_inference_seconds_per_object"]
+        )
+        training_only_parameters = int(
+            variant_series["training_only_digital_parameter_count"]
+        )
+        parameter_label = variant
+        if training_only_parameters:
+            parameter_label += f"\n+{training_only_parameters:,} train-only"
+        for axis, x_value, label in (
+            (axes[0][0], inference_parameters, parameter_label),
+            (axes[0][1], inference_seconds, variant),
+        ):
+            axis.scatter([x_value], [pcc], s=55)
+            axis.annotate(
+                label,
+                (x_value, pcc),
+                xytext=annotation_offsets[variant],
+                textcoords="offset points",
+                fontsize=8,
+            )
+    axes[0][0].set_xlabel("digital inference parameter count")
+    axes[0][0].set_title("Inference model size")
+    axes[0][1].set_xlabel("mean digital inference seconds / object")
+    axes[0][1].set_title("Measured digital inference time")
+    for axis in axes[0]:
+        axis.set_ylabel("unseen target-support PCC")
+        axis.grid(alpha=0.25)
+    fig.suptitle("Digital inference cost (training-only parameters excluded)")
     fig.tight_layout()
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
+    return series
+
+
+def _combined_backend_training_histories(
+    *,
+    warmup_history: Sequence[Mapping[str, Any]],
+    b0_history: Sequence[Mapping[str, Any]],
+    r1_history: Sequence[Mapping[str, Any]],
+    r2_history: Sequence[Mapping[str, Any]],
+) -> dict[str, list[Mapping[str, Any]]]:
+    """Return full matched histories, including the common R1/R2 warm-up."""
+
+    histories = {
+        "B0": list(b0_history),
+        "R1": [*warmup_history, *r1_history],
+        "R2": [*warmup_history, *r2_history],
+    }
+    for variant, history in histories.items():
+        global_epochs = [int(row["global_epoch"]) for row in history]
+        if global_epochs != list(range(1, len(history) + 1)):
+            raise ValueError(f"{variant} combined history is not globally contiguous")
+    return histories
+
+
+def _backend_training_curve_series(
+    histories: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    """Extract auditable scalar series used by the backend training plot."""
+
+    series: dict[str, Any] = {}
+    for variant, history in histories.items():
+        series[variant] = {
+            "global_epoch": [int(row["global_epoch"]) for row in history],
+            "training_l1": [float(row["train"]["l1"]) for row in history],
+            "validation_l1": [float(row["validation"]["l1"]) for row in history],
+            "validation_pearson": [
+                float(row["validation"]["pearson"]) for row in history
+            ],
+            "validation_psnr": [
+                float(row["validation"]["psnr"]) for row in history
+            ],
+            "validation_ssim": [
+                float(row["validation"]["ssim"]) for row in history
+            ],
+        }
+    r2_gan_history = [
+        row for row in histories.get("R2", ()) if "adversarial" in row.get("train", {})
+    ]
+    series["R2"]["gan_continuation"] = {
+        "global_epoch": [int(row["global_epoch"]) for row in r2_gan_history],
+        "generator_adversarial": [
+            float(row["train"]["adversarial"]) for row in r2_gan_history
+        ],
+        "generator_total": [
+            float(row["train"]["generator_total"]) for row in r2_gan_history
+        ],
+        "discriminator_real": [
+            float(row["train"]["discriminator_real"]) for row in r2_gan_history
+        ],
+        "discriminator_fake": [
+            float(row["train"]["discriminator_fake"]) for row in r2_gan_history
+        ],
+        "discriminator_total": [
+            float(row["train"]["discriminator_total"]) for row in r2_gan_history
+        ],
+    }
+    return series
 
 
 def _save_backend_training_plot(
     histories: Mapping[str, Sequence[Mapping[str, Any]]],
     output_path: Path,
-) -> None:
-    fig, axis = plt.subplots(figsize=(6.2, 4.0))
-    for variant, history in histories.items():
-        if not history:
-            continue
-        axis.plot(
-            [int(row["global_epoch"]) for row in history],
-            [float(row["train"]["l1"]) for row in history],
-            marker="o",
-            label=variant,
+) -> dict[str, Any]:
+    series = _backend_training_curve_series(histories)
+    fig, axes = plt.subplots(2, 3, figsize=(13.2, 7.2), squeeze=False)
+    panels = (
+        (axes[0][0], "training_l1", "Training L1"),
+        (axes[0][1], "validation_l1", "Validation L1"),
+        (axes[0][2], "validation_pearson", "Validation PCC"),
+        (axes[1][0], "validation_psnr", "Validation PSNR"),
+        (axes[1][1], "validation_ssim", "Validation SSIM"),
+    )
+    for axis, metric_name, title in panels:
+        for variant, variant_series in series.items():
+            if not variant_series["global_epoch"]:
+                continue
+            axis.plot(
+                variant_series["global_epoch"],
+                variant_series[metric_name],
+                label=variant,
+            )
+        axis.set_title(title)
+        axis.set_xlabel("global epoch")
+        axis.grid(alpha=0.25)
+
+    gan_axis = axes[1][2]
+    gan_series = series["R2"]["gan_continuation"]
+    gan_metrics = (
+        ("generator_adversarial", "G adversarial"),
+        ("generator_total", "G total"),
+        ("discriminator_real", "D real"),
+        ("discriminator_fake", "D fake"),
+        ("discriminator_total", "D total"),
+    )
+    for metric_name, label in gan_metrics:
+        gan_axis.plot(
+            gan_series["global_epoch"],
+            gan_series[metric_name],
+            label=label,
         )
-    axis.set_xlabel("global epoch")
-    axis.set_ylabel("training L1")
-    axis.grid(alpha=0.25)
-    axis.legend()
+    gan_axis.set_title("R2 GAN continuation losses")
+    gan_axis.set_xlabel("global epoch")
+    gan_axis.grid(alpha=0.25)
+    gan_axis.legend(fontsize=7, ncol=2)
+    axes[0][0].legend(fontsize=8)
+    fig.suptitle("Matched training histories (R1/R2 include shared warm-up)")
     fig.tight_layout()
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
+    return series
 
 
 def run_luo2022_backend_evaluation(
@@ -5073,6 +5346,7 @@ def run_luo2022_backend_evaluation(
     cache_dir: Path,
     config_path: Path = DEFAULT_LUO2022_CONFIG,
     backend_config_path: Path = DEFAULT_LUO2022_BACKEND_CONFIG,
+    warmup_dir: Path,
     b0_dir: Path,
     r1_dir: Path,
     r2_dir: Path,
@@ -5106,6 +5380,17 @@ def run_luo2022_backend_evaluation(
             frontend.artifacts
         ):
             raise ValueError("backend evaluation cache does not match the frozen R0 run")
+        warmup_path = Path(warmup_dir)
+        warmup_config, warmup_checkpoint, _warmup_manifest = (
+            _completed_backend_run_checkpoint(
+                warmup_path,
+                device=device,
+                expected_condition="warmup",
+            )
+        )
+        warmup_checkpoint_sha256 = _sha256_file(
+            warmup_path / "checkpoints" / "latest.pt"
+        )
         b0, b0_config, b0_checkpoint, b0_manifest = _load_backend_generator_for_evaluation(
             Path(b0_dir), condition="b0", device=device
         )
@@ -5117,6 +5402,9 @@ def run_luo2022_backend_evaluation(
         )
         fairness = _validate_backend_comparison_runs(
             cache_manifest=cache_manifest,
+            warmup_checkpoint_sha256=warmup_checkpoint_sha256,
+            warmup_config=warmup_config,
+            warmup_checkpoint=warmup_checkpoint,
             b0_config=b0_config,
             b0_checkpoint=b0_checkpoint,
             r1_config=r1_config,
@@ -5411,27 +5699,55 @@ def run_luo2022_backend_evaluation(
                         }
                 question_statistics[condition_name] = metric_statistics
             metrics["causal_delta_inference"][question] = question_statistics
+        b0_generator_parameters = int(b0_manifest["generator_parameter_count"])
+        r1_generator_parameters = int(r1_manifest["generator_parameter_count"])
+        r2_generator_parameters = int(r2_manifest["generator_parameter_count"])
+        r2_discriminator_parameters = int(
+            r2_manifest["discriminator_parameter_count"]
+        )
         model_metadata = {
             "R0": {
+                # Legacy total kept for compatibility.  Cost plots and new
+                # consumers must use the explicit inference/training-only
+                # fields below.
                 "digital_parameter_count": 0,
+                "inference_digital_parameter_count": 0,
+                "training_only_digital_parameter_count": 0,
+                "training_total_digital_parameter_count": 0,
+                "generator_parameter_count": 0,
+                "discriminator_parameter_count": 0,
                 "optical_layers": 4,
                 "mean_digital_inference_seconds_per_object": 0.0,
             },
             "B0": {
-                "digital_parameter_count": int(b0_manifest["generator_parameter_count"]),
+                "digital_parameter_count": b0_generator_parameters,
+                "inference_digital_parameter_count": b0_generator_parameters,
+                "training_only_digital_parameter_count": 0,
+                "training_total_digital_parameter_count": b0_generator_parameters,
+                "generator_parameter_count": b0_generator_parameters,
+                "discriminator_parameter_count": 0,
                 "optical_layers": 0,
             },
             "R1": {
-                "digital_parameter_count": int(r1_manifest["generator_parameter_count"]),
+                "digital_parameter_count": r1_generator_parameters,
+                "inference_digital_parameter_count": r1_generator_parameters,
+                "training_only_digital_parameter_count": 0,
+                "training_total_digital_parameter_count": r1_generator_parameters,
+                "generator_parameter_count": r1_generator_parameters,
+                "discriminator_parameter_count": 0,
                 "optical_layers": 4,
             },
             "R2": {
-                "digital_parameter_count": int(r2_manifest["generator_parameter_count"])
-                + int(r2_manifest["discriminator_parameter_count"]),
-                "generator_parameter_count": int(r2_manifest["generator_parameter_count"]),
-                "discriminator_parameter_count": int(
-                    r2_manifest["discriminator_parameter_count"]
+                "digital_parameter_count": (
+                    r2_generator_parameters + r2_discriminator_parameters
                 ),
+                "inference_digital_parameter_count": r2_generator_parameters,
+                "training_only_digital_parameter_count": r2_discriminator_parameters,
+                "training_total_digital_parameter_count": (
+                    r2_generator_parameters + r2_discriminator_parameters
+                ),
+                "generator_parameter_count": r2_generator_parameters,
+                "discriminator_parameter_count": r2_discriminator_parameters,
                 "optical_layers": 4,
             },
         }
@@ -5439,6 +5755,11 @@ def run_luo2022_backend_evaluation(
             model_metadata[variant]["mean_digital_inference_seconds_per_object"] = (
                 inference_seconds[variant] / max(1, inference_items[variant])
             )
+        for metadata in model_metadata.values():
+            metadata["digital_parameter_count_semantics"] = (
+                "legacy_alias_of_training_total_digital_parameter_count"
+            )
+            metadata["discriminator_inference_role"] = "none"
         metrics["model_and_budget"] = {
             "models": model_metadata,
             "training_fairness": fairness,
@@ -5454,6 +5775,7 @@ def run_luo2022_backend_evaluation(
             "clipping": False,
         }
         _atomic_write_json(output_dir / "metrics.json", metrics)
+        _atomic_write_json(output_dir / "model_metadata.json", model_metadata)
         for condition_name, samples in fixed_samples.items():
             _save_fixed_backend_sample_grid(
                 samples,
@@ -5462,14 +5784,22 @@ def run_luo2022_backend_evaluation(
                 title=condition_name,
             )
         _save_backend_metric_plot(metrics, output_dir / "metrics_comparison.png")
-        _save_backend_cost_plot(metrics, model_metadata, output_dir / "cost.png")
-        _save_backend_training_plot(
-            {
-                "B0": b0_checkpoint["history"],
-                "R1": r1_checkpoint["history"],
-                "R2": r2_checkpoint["history"],
-            },
+        cost_plot_series = _save_backend_cost_plot(
+            metrics, model_metadata, output_dir / "cost.png"
+        )
+        _atomic_write_json(output_dir / "cost_plot_series.json", cost_plot_series)
+        combined_histories = _combined_backend_training_histories(
+            warmup_history=warmup_checkpoint["history"],
+            b0_history=b0_checkpoint["history"],
+            r1_history=r1_checkpoint["history"],
+            r2_history=r2_checkpoint["history"],
+        )
+        training_curve_series = _save_backend_training_plot(
+            combined_histories,
             output_dir / "training_curves.png",
+        )
+        _atomic_write_json(
+            output_dir / "training_curve_series.json", training_curve_series
         )
         integrity = _assert_luo2022_backend_r0_unchanged(frontend)
         evaluation_config = {
@@ -5484,6 +5814,11 @@ def run_luo2022_backend_evaluation(
             "fixed_example_object_ids": requested_sample_ids,
             "input_scaling": metrics["input_scaling"],
             "fairness": fairness,
+            "training_history_segments": {
+                "B0": ["B0"],
+                "R1": ["shared_warmup", "R1_continuation"],
+                "R2": ["shared_warmup", "R2_continuation"],
+            },
         }
         _atomic_write_json(output_dir / "config.json", evaluation_config)
         manifest = {
@@ -5496,10 +5831,13 @@ def run_luo2022_backend_evaluation(
             "artifacts": {
                 "config": "config.json",
                 "metrics": "metrics.json",
+                "model_metadata": "model_metadata.json",
                 "per_object_metrics": "per_object_metrics.csv",
                 "metric_plot": "metrics_comparison.png",
                 "cost_plot": "cost.png",
+                "cost_plot_series": "cost_plot_series.json",
                 "training_curves": "training_curves.png",
+                "training_curve_series": "training_curve_series.json",
                 "samples": [
                     f"samples/{condition_name}.png"
                     for condition_name, samples in fixed_samples.items()

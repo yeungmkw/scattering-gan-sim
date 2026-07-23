@@ -60,6 +60,14 @@ def test_backend_contract_has_comparable_variant_schedules() -> None:
         "adversarial_continuation": 10,
         "total": 30,
     }
+    assert variants["B0"]["epochs"]["total"] == (
+        variants["R1"]["epochs"]["shared_supervised_warmup"]
+        + variants["R1"]["epochs"]["supervised_continuation"]
+    )
+    assert variants["B0"]["epochs"]["total"] == (
+        variants["R2"]["epochs"]["shared_supervised_warmup"]
+        + variants["R2"]["epochs"]["adversarial_continuation"]
+    )
     assert "identical epoch-20" in variants["R2"]["branch_rule"]
 
 

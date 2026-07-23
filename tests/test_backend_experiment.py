@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -150,6 +151,7 @@ def backend_runs(tmp_path_factory: pytest.TempPathFactory):
         run_dir=run_dir,
         output_dir=evaluation_dir,
         cache_dir=cache_dir,
+        warmup_dir=warmup_dir,
         b0_dir=b0_dir,
         r1_dir=r1_dir,
         r2_dir=r2_dir,
@@ -209,6 +211,8 @@ def test_backend_cli_exposes_cache_train_and_evaluate_actions() -> None:
             "backend-evaluate",
             "--run-dir",
             "r0",
+            "--backend-warmup-dir",
+            "warmup",
             "--backend-b0-dir",
             "b0",
             "--backend-r1-dir",
@@ -221,7 +225,28 @@ def test_backend_cli_exposes_cache_train_and_evaluate_actions() -> None:
     assert cache_args.backend_cache_operators == ("direct", "frozen_four_layer")
     assert train_args.backend_condition == "r2"
     assert train_args.backend_warmup_dir == Path("warmup")
+    assert evaluate_args.backend_warmup_dir == Path("warmup")
     assert evaluate_args.backend_b0_dir == Path("b0")
+
+    missing_warmup_args = parser.parse_args(
+        [
+            "d2nn",
+            "--profile",
+            "luo2022_r0",
+            "--action",
+            "backend-evaluate",
+            "--run-dir",
+            "r0",
+            "--backend-b0-dir",
+            "b0",
+            "--backend-r1-dir",
+            "r1",
+            "--backend-r2-dir",
+            "r2",
+        ]
+    )
+    with pytest.raises(ValueError, match="--backend-warmup-dir"):
+        experiment.dispatch(missing_warmup_args)
 
 
 def test_b0_forward_and_supervised_backward_update_generator() -> None:
@@ -358,6 +383,82 @@ def test_warmup_branches_have_identical_start_order_and_update_budget(backend_ru
     assert r1["discriminator"] is None
     assert r2["discriminator"] is not None
 
+    fairness = backend_runs["evaluation"]["metrics"]["model_and_budget"][
+        "training_fairness"
+    ]
+    b0 = torch.load(
+        backend_runs["b0_dir"] / "checkpoints" / "latest.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert b0["epoch_orders"] == [*warmup["epoch_orders"], *r1["epoch_orders"]]
+    assert fairness["b0_order_sequence_sha256"] == fairness[
+        "warmup_plus_r1_order_sequence_sha256"
+    ]
+    assert fairness["warmup_generator_updates"] == 1
+    assert fairness["b0_total_generator_updates"] == 2
+    assert fairness["r1_total_generator_updates"] == 2
+    assert fairness["r2_total_generator_updates"] == 2
+
+
+def test_backend_fairness_rejects_wrong_warmup_hash_or_b0_order(backend_runs) -> None:
+    cache_manifest = backend_runs["cache_result"]["manifest"]
+    configs = {
+        name: experiment.load_config(backend_runs[f"{name}_dir"] / "config.json")
+        for name in ("warmup", "b0", "r1", "r2")
+    }
+    checkpoints = {
+        name: torch.load(
+            backend_runs[f"{name}_dir"] / "checkpoints" / "latest.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+        for name in ("warmup", "b0", "r1", "r2")
+    }
+    warmup_sha256 = experiment._sha256_file(
+        backend_runs["warmup_dir"] / "checkpoints" / "latest.pt"
+    )
+    common = {
+        "cache_manifest": cache_manifest,
+        "warmup_config": configs["warmup"],
+        "warmup_checkpoint": checkpoints["warmup"],
+        "b0_config": configs["b0"],
+        "b0_checkpoint": checkpoints["b0"],
+        "r1_config": configs["r1"],
+        "r1_checkpoint": checkpoints["r1"],
+        "r2_config": configs["r2"],
+        "r2_checkpoint": checkpoints["r2"],
+    }
+
+    with pytest.raises(ValueError, match="supplied warm-up"):
+        experiment._validate_backend_comparison_runs(
+            **common,
+            warmup_checkpoint_sha256="0" * 64,
+        )
+
+    tampered_b0 = copy.deepcopy(checkpoints["b0"])
+    tampered_b0["epoch_orders"][1]["consumed_order_sha256"] = "tampered"
+    with pytest.raises(ValueError, match="B0 order sequence"):
+        experiment._validate_backend_comparison_runs(
+            **{**common, "b0_checkpoint": tampered_b0},
+            warmup_checkpoint_sha256=warmup_sha256,
+        )
+
+
+def test_backend_evaluator_rejects_non_warmup_source_dir(backend_runs) -> None:
+    with pytest.raises(ValueError, match="required warmup condition"):
+        experiment.run_luo2022_backend_evaluation(
+            run_dir=backend_runs["run_dir"],
+            output_dir=backend_runs["root"] / "wrong-warmup-evaluation",
+            cache_dir=backend_runs["cache_dir"],
+            warmup_dir=backend_runs["b0_dir"],
+            b0_dir=backend_runs["b0_dir"],
+            r1_dir=backend_runs["r1_dir"],
+            r2_dir=backend_runs["r2_dir"],
+            device_name="cpu",
+            max_eval_batches=1,
+        )
+
 
 def test_resume_rejects_incompatible_batch_size(backend_runs) -> None:
     with pytest.raises(ValueError, match="resume config"):
@@ -457,6 +558,17 @@ def test_small_backend_e2e_writes_complete_metrics_and_fixed_outputs(backend_run
         "R2",
     }
     assert metrics["model_and_budget"]["training_fairness"]["matched"] is True
+    models = metrics["model_and_budget"]["models"]
+    assert models["B0"]["inference_digital_parameter_count"] == 7_557
+    assert models["R1"]["inference_digital_parameter_count"] == 7_557
+    assert models["R2"]["inference_digital_parameter_count"] == 7_557
+    assert models["R2"]["digital_parameter_count"] == 10_442
+    assert models["R2"]["training_only_digital_parameter_count"] == 2_885
+    assert models["R2"]["training_total_digital_parameter_count"] == 10_442
+    assert models["R2"]["generator_parameter_count"] == 7_557
+    assert models["R2"]["discriminator_parameter_count"] == 2_885
+    assert models["B0"]["training_only_digital_parameter_count"] == 0
+    assert models["R1"]["training_only_digital_parameter_count"] == 0
     assert set(metrics["causal_deltas"]) == {
         "digital_reconstruction_total_gain_R1_minus_R0",
         "optical_frontend_net_contribution_R1_minus_B0",
@@ -484,4 +596,33 @@ def test_small_backend_e2e_writes_complete_metrics_and_fixed_outputs(backend_run
     assert (evaluation_dir / "metrics_comparison.png").is_file()
     assert (evaluation_dir / "cost.png").is_file()
     assert (evaluation_dir / "training_curves.png").is_file()
+    assert (evaluation_dir / "model_metadata.json").is_file()
+    assert (evaluation_dir / "cost_plot_series.json").is_file()
+    assert (evaluation_dir / "training_curve_series.json").is_file()
     assert (evaluation_dir / "samples" / "seed_disjoint_unseen.png").is_file()
+
+    assert experiment.load_config(evaluation_dir / "model_metadata.json") == models
+    cost_series = experiment.load_config(evaluation_dir / "cost_plot_series.json")
+    assert cost_series["R2"]["inference_digital_parameter_count"] == 7_557
+    assert cost_series["R2"]["training_only_digital_parameter_count"] == 2_885
+    assert cost_series["R2"]["inference_digital_parameter_count"] != models["R2"][
+        "digital_parameter_count"
+    ]
+    training_series = experiment.load_config(
+        evaluation_dir / "training_curve_series.json"
+    )
+    assert training_series["B0"]["global_epoch"] == [1, 2]
+    assert training_series["R1"]["global_epoch"] == [1, 2]
+    assert training_series["R2"]["global_epoch"] == [1, 2]
+    assert training_series["R1"]["training_l1"][0] == training_series["R2"][
+        "training_l1"
+    ][0]
+    assert training_series["R2"]["gan_continuation"]["global_epoch"] == [2]
+    assert set(training_series["R2"]["gan_continuation"]) == {
+        "global_epoch",
+        "generator_adversarial",
+        "generator_total",
+        "discriminator_real",
+        "discriminator_fake",
+        "discriminator_total",
+    }
