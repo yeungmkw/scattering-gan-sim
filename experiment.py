@@ -37,6 +37,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - exercised on Windows CUDA hosts
     resource = None
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -3341,7 +3344,9 @@ def _atomic_torch_save(path: Path, payload: Any) -> None:
     temporary_path = Path(temporary_name)
     try:
         torch.save(payload, temporary_path)
-        with temporary_path.open("rb") as handle:
+        # Windows rejects fsync on a read-only descriptor.  Reopen read/write;
+        # no bytes are changed, but both Windows and POSIX can flush the file.
+        with temporary_path.open("rb+") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
     finally:
