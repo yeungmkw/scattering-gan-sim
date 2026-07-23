@@ -38,9 +38,17 @@ dist/
 # Jupyter local state
 .ipynb_checkpoints/
 
-# Internal research contracts and machine-specific readiness notes
+# Internal research contracts and audits — kept local, not public.
 docs/*-reproduction-spec.md
 docs/*-readiness-assessment.md
+docs/*-acceptance-gates.md
+docs/*-metric-region-diagnosis.md
+docs/improvement-research-*.md
+docs/research-appendix-*.md
+docs/*supplement*-audit*.md
+
+# Local diagnosis notebooks, scratch data, and working notes
+work/
 
 # Downloaded datasets and generated experiment artifacts
 data/

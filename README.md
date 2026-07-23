@@ -1,13 +1,16 @@
 # Scattering GAN Simulation
 
 A compact research simulation for reconstructing clean targets from
-scattering-corrupted coherent intensity measurements. The project combines a
-controlled optical forward model with U-Net reconstruction and optional
-conditional PatchGAN refinement.
+scattering-corrupted coherent intensity measurements. The repository contains
+both a legacy U-Net/PatchGAN reconstruction path and a sealed, paper-aligned
+four-layer diffractive R0 baseline.
 
 ```text
 MNIST target -> coherent field -> scattering-like corruption -> propagation
              -> fixed diffractive layer -> U-Net -> optional PatchGAN
+
+MNIST amplitude -> correlated diffuser -> trainable phase layers
+                -> detector intensity
 ```
 
 ![Fixed-diffuser U-Net and PatchGAN comparison](docs/assets/gpu_phase_comparison_samples.png)
@@ -94,11 +97,12 @@ uv run python -m experiment d2nn \
   --output-dir outputs/luo2022_r0_assessment
 ```
 
-Freeze `2026-07-19.3` passes the reduced training rerun and the exact
-240x240 audit of all 1,999,000 unordered pairs in a 2,000-diffuser bank. The
-R0 path is ready to transfer to a CUDA machine; a local GPU benchmark is not a
-prerequisite. Machine-specific readiness notes and reproduction working
-documents remain local and are not tracked in the public repository.
+Freeze `2026-07-19.3` completed the full 240x240, 100-epoch CUDA run and the
+read-only evaluation of all 2,000 training diffusers, 20 unseen diffusers, and
+the no-diffuser control. See the
+[sealed R0 result summary](docs/luo2022-r0-results.md). Machine-specific
+readiness notes, checkpoints, generated evidence rows, and reproduction
+working documents remain local and are not tracked in the public repository.
 
 Long CUDA runs write `checkpoints/latest.pt`, one deterministic diffuser bank
 per epoch, `review.json`, and `run_state.json`. On limited-memory GPUs,
@@ -132,7 +136,9 @@ trains end to end; it is not evidence of validity for real scattering media or
 hardware.
 
 See [the comparison note](docs/gpu-phase-comparison.md) and the
-[research roadmap](docs/research-roadmap.md) for details.
+[research roadmap](docs/research-roadmap.md) for details. The independent
+[R0 result summary](docs/luo2022-r0-results.md) records the all-optical
+four-layer reference and its claim boundary.
 
 ## Repository Layout
 
@@ -153,10 +159,11 @@ Only lightweight result figures are kept under `docs/assets/`.
 
 ## Limitations
 
-The present forward model omits calibrated PSFs, diffuser material parameters,
-sensor noise, detector calibration, hardware alignment, fabrication constraints,
-and an optical implementation of GAN inference. Treat all reported results as
-controlled digital simulations.
+The legacy forward model omits calibrated PSFs and material calibration. The
+R0 profile includes a paper-aligned correlated thin phase diffuser but still
+omits volumetric multiple scattering, sensor noise, detector calibration,
+hardware alignment, and fabrication constraints. Treat all reported results
+as controlled numerical simulations.
 
 ## License
 

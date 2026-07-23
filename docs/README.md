@@ -13,9 +13,11 @@ Recommended reading order:
    and U-Net+PatchGAN.
 3. `research-roadmap.md`: what should be added next before making stronger
    claims.
-4. Local R0 evidence notes: metric-domain diagnostics, frozen acceptance
+4. `luo2022-r0-results.md`: the sealed public R0 protocol, key results,
+   controls, integrity boundary, and next research gate.
+5. Local R0 evidence notes: metric-domain diagnostics, frozen acceptance
    rules, and numeric provenance. These remain outside the public repository.
-5. Local research appendices: visible-light migration, performance
+6. Local research appendices: visible-light migration, performance
    mechanisms, and the 2023-2026 landscape. These also remain local.
 
 Internal reproduction contracts, supplementary-material audits, and
