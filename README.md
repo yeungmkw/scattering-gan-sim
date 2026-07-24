@@ -3,7 +3,8 @@
 A compact research simulation for reconstructing clean targets from
 scattering-corrupted coherent intensity measurements. The repository contains
 a legacy U-Net/PatchGAN path, a sealed paper-aligned four-layer diffractive R0
-baseline, and a completed fixed-four-layer digital-backend ablation.
+baseline, a completed fixed-four-layer digital-backend ablation, and an
+independent visible-light Huang 2026 numerical profile.
 
 ```text
 MNIST target -> coherent field -> scattering-like corruption -> propagation
@@ -126,6 +127,41 @@ JSONL and CSV evidence. It averages all configured test objects separately
 for each diffuser, then reports distributions for all training diffusers,
 epochs 1 through 99, the final 10 epochs, the final epoch, unseen diffusers,
 and the no-diffuser control.
+
+### Huang 2026 Visible-Light Profile
+
+The `huang2026_visible` profile implements a three-layer 660 nm DONN,
+Gaussian–Schell IC-DONN, and 491/532/660 nm MWDONN with online random-height
+diffusers. It also provides matched direct/lens/DONN controls, SLM
+phase-encoding and non-ideality models, misalignment assessment, and strict
+update-level checkpoint resume.
+
+Run a reduced coherent validation:
+
+```bash
+uv run python -m experiment d2nn \
+  --profile huang2026_visible \
+  --mode coherent \
+  --action train \
+  --execution-label small \
+  --download \
+  --output-dir outputs/huang2026_visible_coherent_small
+```
+
+The nominal geometry uses the main-text 29.5 mm adjacent spacing and 71.2 mm
+detector distance. Only this default geometry has a 189.2 mm total path that
+matches the published 47.3 mm focal-length 4f control. The conflicting
+2.95/7.1 mm Supporting Note S7 values form an explicitly labeled
+`supplement_typo_sensitivity` profile whose 18.9 mm DONN/direct path is not
+matched to that lens control.
+
+The `inspect` action exercises the Supporting Equation (S18) phase-only input
+encoding and saves its amplitude-recovery audit. The `assess` action, even
+when invoked with `--mode coherent`, benchmarks both one 400×400 coherent
+forward/backward step and a streamed 400×400 IC-DONN step with `Nr=20` and
+chunk size 4. See the
+[equation map, four evidence labels, independent action commands, artifacts,
+and claim boundary](docs/huang2026-visible-baseline.md).
 
 ## Results
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 from torch.nn import functional as F
@@ -288,3 +288,259 @@ def reconstruction_loss(
         total = total + weights.fourier * components["fourier"]
     components["total"] = total
     return total, components
+
+
+def huang2026_intensity_mse(
+    output_intensity: torch.Tensor,
+    target_intensity: torch.Tensor,
+    *,
+    return_components: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Raw detector-intensity MSE from main-text equation (11).
+
+    No per-image normalization, PCC term, clipping, or contrast transform is
+    applied.  A singleton channel axis is accepted on either tensor so the
+    optical ``(B,H,W)`` output can be compared with a dataset ``(B,1,H,W)``
+    target without implicit broadcasting.
+    """
+
+    output, target = _huang2026_aligned_intensities(
+        output_intensity,
+        target_intensity,
+    )
+    loss = F.mse_loss(output, target)
+    if not return_components:
+        return loss
+    return loss, {"intensity_mse": loss, "total": loss}
+
+
+def huang2026_incoherent_mse(
+    output_intensity: torch.Tensor,
+    target_intensity: torch.Tensor,
+    *,
+    input_is_ensemble: bool = True,
+    ensemble_dim: int = 1,
+    return_components: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """IC-DONN loss from Supporting equations (S11) and (S14).
+
+    With ``input_is_ensemble=True``, ``output_intensity`` contains the
+    independent coherent-realization intensities and is averaged exactly once
+    along ``ensemble_dim`` before MSE.  With ``False``, the caller explicitly
+    declares that the tensor is already the full-``Nr`` ensemble average.
+    Chunk orchestration must therefore sum all chunk intensities and divide by
+    the total ``Nr`` before calling the averaged form; averaging per-chunk
+    losses is not equivalent.
+    """
+
+    if not isinstance(input_is_ensemble, bool):
+        raise TypeError("input_is_ensemble must be a bool")
+    if input_is_ensemble:
+        if output_intensity.ndim < 3:
+            raise ValueError(
+                "ensemble output_intensity must include batch, realization, and "
+                "spatial dimensions"
+            )
+        normalized_dim = _huang2026_normalized_dim(
+            ensemble_dim,
+            output_intensity.ndim,
+            name="ensemble_dim",
+        )
+        if normalized_dim == 0:
+            raise ValueError("ensemble_dim must not be the batch dimension")
+        if output_intensity.shape[normalized_dim] <= 0:
+            raise ValueError("ensemble dimension must not be empty")
+        averaged_intensity = output_intensity.mean(dim=normalized_dim)
+    else:
+        averaged_intensity = output_intensity
+    loss = huang2026_intensity_mse(
+        averaged_intensity,
+        target_intensity,
+        return_components=False,
+    )
+    if not return_components:
+        return loss
+    return loss, {"incoherent_intensity_mse": loss, "total": loss}
+
+
+def huang2026_multiwavelength_mse(
+    output_intensities: torch.Tensor
+    | Sequence[torch.Tensor]
+    | Mapping[Any, torch.Tensor],
+    target_intensities: torch.Tensor
+    | Sequence[torch.Tensor]
+    | Mapping[Any, torch.Tensor],
+    *,
+    wavelength_dim: int = 1,
+    return_components: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Sum wavelength-resolved MSE terms from Supporting equation (S24).
+
+    ``output_intensities`` may be a tensor with an explicit wavelength axis, a
+    sequence, or a mapping keyed by wavelength.  ``target_intensities`` may
+    use the same container or be one common target tensor broadcast across
+    wavelengths.  The wavelength terms are summed, never averaged or
+    PCC-weighted.
+    """
+
+    output_items, tensor_wavelength_dim = _huang2026_wavelength_items(
+        output_intensities,
+        wavelength_dim=wavelength_dim,
+        name="output_intensities",
+    )
+    target_items = _huang2026_targets_for_wavelengths(
+        target_intensities,
+        output_items=output_items,
+        output_container=output_intensities,
+        tensor_wavelength_dim=tensor_wavelength_dim,
+        wavelength_dim=wavelength_dim,
+    )
+    per_wavelength: list[tuple[Any, torch.Tensor]] = []
+    for (output_key, output), (target_key, target) in zip(
+        output_items,
+        target_items,
+        strict=True,
+    ):
+        if output_key != target_key:
+            raise ValueError("output and target wavelength keys do not match")
+        per_wavelength.append(
+            (
+                output_key,
+                huang2026_intensity_mse(
+                    output,
+                    target,
+                    return_components=False,
+                ),
+            )
+        )
+    if not per_wavelength:
+        raise ValueError("multi-wavelength loss requires at least one wavelength")
+    total = torch.stack([loss for _key, loss in per_wavelength]).sum()
+    if not return_components:
+        return total
+    components = {
+        f"wavelength_{_huang2026_component_key(key)}_mse": loss
+        for key, loss in per_wavelength
+    }
+    components["total"] = total
+    return total, components
+
+
+def _huang2026_aligned_intensities(
+    output_intensity: torch.Tensor,
+    target_intensity: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(output_intensity, torch.Tensor) or not isinstance(
+        target_intensity,
+        torch.Tensor,
+    ):
+        raise TypeError("output_intensity and target_intensity must be tensors")
+    if torch.is_complex(output_intensity) or torch.is_complex(target_intensity):
+        raise TypeError("intensity tensors must be real-valued")
+    output = output_intensity
+    target = target_intensity
+    if output.ndim + 1 == target.ndim and target.shape[1] == 1:
+        target = target.squeeze(1)
+    elif target.ndim + 1 == output.ndim and output.shape[1] == 1:
+        output = output.squeeze(1)
+    if output.shape != target.shape:
+        raise ValueError(
+            "output_intensity and target_intensity must have matching shapes "
+            "apart from one singleton channel axis"
+        )
+    if output.ndim < 2:
+        raise ValueError("intensity tensors must include batch and spatial dimensions")
+    return output, target.to(device=output.device, dtype=output.dtype)
+
+
+def _huang2026_normalized_dim(dim: int, ndim: int, *, name: str) -> int:
+    if isinstance(dim, bool) or not isinstance(dim, int):
+        raise TypeError(f"{name} must be an integer")
+    normalized = dim + ndim if dim < 0 else dim
+    if normalized < 0 or normalized >= ndim:
+        raise ValueError(f"{name} is out of range for a {ndim}-dimensional tensor")
+    return normalized
+
+
+def _huang2026_wavelength_items(
+    values: torch.Tensor | Sequence[torch.Tensor] | Mapping[Any, torch.Tensor],
+    *,
+    wavelength_dim: int,
+    name: str,
+) -> tuple[list[tuple[Any, torch.Tensor]], int | None]:
+    if isinstance(values, torch.Tensor):
+        if values.ndim < 3:
+            raise ValueError(f"{name} tensor must include a wavelength dimension")
+        normalized_dim = _huang2026_normalized_dim(
+            wavelength_dim,
+            values.ndim,
+            name="wavelength_dim",
+        )
+        if normalized_dim == 0:
+            raise ValueError("wavelength_dim must not be the batch dimension")
+        return list(enumerate(values.unbind(dim=normalized_dim))), normalized_dim
+    if isinstance(values, Mapping):
+        if not values:
+            raise ValueError(f"{name} mapping must not be empty")
+        items = list(values.items())
+    elif isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+        if not values:
+            raise ValueError(f"{name} sequence must not be empty")
+        items = list(enumerate(values))
+    else:
+        raise TypeError(f"{name} must be a tensor, sequence, or mapping")
+    if any(not isinstance(value, torch.Tensor) for _key, value in items):
+        raise TypeError(f"{name} entries must be tensors")
+    return items, None
+
+
+def _huang2026_targets_for_wavelengths(
+    targets: torch.Tensor | Sequence[torch.Tensor] | Mapping[Any, torch.Tensor],
+    *,
+    output_items: list[tuple[Any, torch.Tensor]],
+    output_container: torch.Tensor | Sequence[torch.Tensor] | Mapping[Any, torch.Tensor],
+    tensor_wavelength_dim: int | None,
+    wavelength_dim: int,
+) -> list[tuple[Any, torch.Tensor]]:
+    output_keys = [key for key, _value in output_items]
+    if isinstance(targets, Mapping):
+        if list(targets) != output_keys:
+            if set(targets) != set(output_keys):
+                raise ValueError("output and target wavelength mapping keys must match")
+        return [(key, targets[key]) for key in output_keys]
+    if isinstance(targets, Sequence) and not isinstance(
+        targets,
+        (str, bytes, torch.Tensor),
+    ):
+        if len(targets) != len(output_items):
+            raise ValueError("output and target wavelength sequences must have equal length")
+        if any(not isinstance(value, torch.Tensor) for value in targets):
+            raise TypeError("target_intensities entries must be tensors")
+        return [
+            (key, target)
+            for (key, _output), target in zip(output_items, targets, strict=True)
+        ]
+    if not isinstance(targets, torch.Tensor):
+        raise TypeError("target_intensities must be a tensor, sequence, or mapping")
+
+    if isinstance(output_container, torch.Tensor):
+        assert tensor_wavelength_dim is not None
+        if targets.shape == output_container.shape:
+            return list(
+                enumerate(targets.unbind(dim=tensor_wavelength_dim))
+            )
+        if targets.ndim == output_container.ndim:
+            normalized_target_dim = _huang2026_normalized_dim(
+                wavelength_dim,
+                targets.ndim,
+                name="wavelength_dim",
+            )
+            if targets.shape[normalized_target_dim] == 1:
+                common_target = targets.select(normalized_target_dim, 0)
+                return [(key, common_target) for key in output_keys]
+    return [(key, targets) for key in output_keys]
+
+
+def _huang2026_component_key(key: Any) -> str:
+    value = str(key)
+    return "".join(character if character.isalnum() else "_" for character in value)

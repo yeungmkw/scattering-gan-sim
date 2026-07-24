@@ -1,0 +1,339 @@
+{
+  "schema_version": 1,
+  "schema_version_evidence": "project_choice",
+  "profile_id": "huang2026_visible",
+  "profile_id_evidence": "project_choice",
+  "mode": "coherent",
+  "mode_evidence": "paper_confirmed",
+  "status": {
+    "implementation": "numerical_reproduction_inspired_baseline",
+    "implementation_evidence": "project_choice",
+    "claim_level": "small_run_or_numerical_baseline_until_locally_validated",
+    "claim_level_evidence": "project_choice"
+  },
+  "paper": {
+    "title": "Optical Computational Imaging Through Unknown Random Diffusers in Visible Spectrum",
+    "title_evidence": "paper_confirmed",
+    "doi": "10.1002/lpor.202501168",
+    "doi_evidence": "paper_confirmed",
+    "main_equations": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12
+    ],
+    "main_equations_evidence": "paper_confirmed",
+    "supporting_notes": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S6",
+      "S7",
+      "S8",
+      "S9",
+      "S10"
+    ],
+    "supporting_notes_evidence": "paper_confirmed"
+  },
+  "grid": {
+    "shape": [
+      400,
+      400
+    ],
+    "shape_evidence": "paper_confirmed",
+    "pixel_pitch_m": 8e-06,
+    "pixel_pitch_m_evidence": "paper_confirmed",
+    "asm_pad_factor": 1,
+    "asm_pad_factor_evidence": "project_choice",
+    "asm_crop": "center_same",
+    "asm_crop_evidence": "project_choice",
+    "complex_dtype": "complex64",
+    "complex_dtype_evidence": "project_choice"
+  },
+  "illumination": {
+    "wavelengths_nm": [
+      660.0
+    ],
+    "wavelengths_nm_evidence": "paper_confirmed",
+    "incident_field": "mnist_amplitude_on_zero_phase_field",
+    "incident_field_evidence": "paper_confirmed",
+    "propagation": "angular_spectrum",
+    "propagation_evidence": "paper_confirmed"
+  },
+  "input": {
+    "dataset": "MNIST",
+    "dataset_evidence": "paper_confirmed",
+    "original_shape": [
+      28,
+      28
+    ],
+    "original_shape_evidence": "paper_confirmed",
+    "resized_shape": [
+      320,
+      320
+    ],
+    "resized_shape_evidence": "paper_confirmed",
+    "canvas_shape": [
+      400,
+      400
+    ],
+    "canvas_shape_evidence": "paper_confirmed",
+    "resize_method": "bilinear",
+    "resize_method_evidence": "paper_confirmed",
+    "align_corners": false,
+    "align_corners_evidence": "project_choice",
+    "padding": "centered_zero",
+    "padding_evidence": "paper_confirmed",
+    "encoding": "optical_field_amplitude",
+    "encoding_evidence": "paper_confirmed",
+    "target_intensity_convention": "squared_preprocessed_field_amplitude",
+    "target_intensity_convention_evidence": "paper_inferred",
+    "training_objects": 60000,
+    "training_objects_evidence": "paper_confirmed",
+    "blind_test_objects": 10000,
+    "blind_test_objects_evidence": "paper_confirmed"
+  },
+  "diffuser": {
+    "material": "glass",
+    "material_evidence": "paper_confirmed",
+    "refractive_index": 1.52,
+    "refractive_index_evidence": "paper_confirmed",
+    "refractive_index_difference": 0.52,
+    "refractive_index_difference_evidence": "paper_confirmed",
+    "height_mean_m": 6.3e-05,
+    "height_mean_m_evidence": "paper_confirmed",
+    "height_std_m": 1.4e-05,
+    "height_std_m_evidence": "paper_confirmed",
+    "height_distribution_stage": "prefilter_random_field_W_before_gaussian_convolution",
+    "height_distribution_stage_evidence": "paper_confirmed",
+    "smoothing": "gaussian",
+    "smoothing_evidence": "paper_confirmed",
+    "gaussian_kernel_truncate_sigma": 4.0,
+    "gaussian_kernel_truncate_sigma_evidence": "project_choice",
+    "gaussian_boundary": "reflect",
+    "gaussian_boundary_evidence": "project_choice",
+    "correlation_length_pixels": 10.0,
+    "correlation_length_pixels_evidence": "project_choice",
+    "correlation_model": "exp_minus_pi_r_squared_over_lc_squared",
+    "correlation_model_evidence": "paper_confirmed",
+    "height_to_phase": "two_pi_delta_n_height_over_wavelength",
+    "height_to_phase_evidence": "paper_confirmed",
+    "generation": "independent_online_diffuser_each_training_iteration",
+    "generation_evidence": "paper_confirmed",
+    "train_seed_namespace": "huang2026_train",
+    "train_seed_namespace_evidence": "project_choice",
+    "blind_test_seed_namespace": "huang2026_blind_test",
+    "blind_test_seed_namespace_evidence": "project_choice"
+  },
+  "geometry": {
+    "active_profile": "paper_default",
+    "active_profile_evidence": "project_choice",
+    "profiles": {
+      "paper_default": {
+        "object_to_diffuser_m": 0.0295,
+        "object_to_diffuser_m_evidence": "paper_inferred",
+        "diffuser_to_first_layer_m": 0.0295,
+        "diffuser_to_first_layer_m_evidence": "paper_inferred",
+        "adjacent_layer_distances_m": [
+          0.0295,
+          0.0295
+        ],
+        "adjacent_layer_distances_m_evidence": "paper_confirmed",
+        "last_layer_to_detector_m": 0.0712,
+        "last_layer_to_detector_m_evidence": "paper_confirmed",
+        "total_path_m": 0.1892,
+        "total_path_m_evidence": "paper_inferred",
+        "lens_focal_length_m": 0.0473,
+        "lens_focal_length_m_evidence": "paper_confirmed"
+      },
+      "supplement_typo_sensitivity": {
+        "object_to_diffuser_m": 0.00295,
+        "object_to_diffuser_m_evidence": "suspected_paper_typo",
+        "diffuser_to_first_layer_m": 0.00295,
+        "diffuser_to_first_layer_m_evidence": "suspected_paper_typo",
+        "adjacent_layer_distances_m": [
+          0.00295,
+          0.00295
+        ],
+        "adjacent_layer_distances_m_evidence": "suspected_paper_typo",
+        "last_layer_to_detector_m": 0.0071,
+        "last_layer_to_detector_m_evidence": "suspected_paper_typo",
+        "total_path_m": 0.0189,
+        "total_path_m_evidence": "suspected_paper_typo",
+        "lens_focal_length_m": 0.0473,
+        "lens_focal_length_m_evidence": "paper_confirmed"
+      }
+    }
+  },
+  "d2nn": {
+    "layers": 3,
+    "layers_evidence": "paper_confirmed",
+    "phase_modulation": "exp_j_phi",
+    "phase_modulation_evidence": "paper_confirmed",
+    "phase_initialization": "uniform_0_to_2pi",
+    "phase_initialization_evidence": "project_choice",
+    "detector_output": "raw_intensity",
+    "detector_output_evidence": "paper_confirmed",
+    "per_sample_minmax_normalization": false,
+    "per_sample_minmax_normalization_evidence": "project_choice"
+  },
+  "coherence": {
+    "model": "coherent_single_realization",
+    "model_evidence": "paper_confirmed",
+    "coherence_length_pixels": 4.0,
+    "coherence_length_pixels_evidence": "paper_confirmed",
+    "nr_training": 1,
+    "nr_training_evidence": "paper_confirmed",
+    "nr_blind_test": 1,
+    "nr_blind_test_evidence": "paper_confirmed",
+    "chunk_size": 1,
+    "chunk_size_evidence": "project_choice"
+  },
+  "multiwavelength": {
+    "enabled": false,
+    "enabled_evidence": "paper_confirmed",
+    "phase_response": "ideal_continuous",
+    "phase_response_evidence": "project_choice",
+    "measured_lut_available": false,
+    "measured_lut_available_evidence": "paper_confirmed"
+  },
+  "slm": {
+    "input_encoding": "supporting_equation_s18",
+    "input_encoding_evidence": "paper_confirmed",
+    "reference_wavelength_nm": 660.0,
+    "reference_wavelength_nm_evidence": "project_choice",
+    "phase_quantization_levels": null,
+    "phase_quantization_levels_evidence": "project_choice",
+    "phase_range_rad": null,
+    "phase_range_rad_evidence": "project_choice",
+    "phase_lut": null,
+    "phase_lut_evidence": "project_choice",
+    "spatial_smoothing_sigma_pixels": 0.0,
+    "spatial_smoothing_sigma_pixels_evidence": "project_choice",
+    "abrupt_phase_jump_error": false,
+    "abrupt_phase_jump_error_evidence": "project_choice",
+    "abrupt_phase_jump_threshold_rad": 3.141592653589793,
+    "abrupt_phase_jump_threshold_rad_evidence": "project_choice",
+    "abrupt_phase_jump_strength": 0.5,
+    "abrupt_phase_jump_strength_evidence": "project_choice"
+  },
+  "detector": {
+    "shot_noise": false,
+    "shot_noise_evidence": "project_choice",
+    "read_noise_std": 0.0,
+    "read_noise_std_evidence": "project_choice",
+    "gain": 1.0,
+    "gain_evidence": "project_choice",
+    "saturation": null,
+    "saturation_evidence": "project_choice",
+    "transmission": 1.0,
+    "transmission_evidence": "project_choice"
+  },
+  "training": {
+    "optimizer": "Adam",
+    "optimizer_evidence": "project_choice",
+    "learning_rate": 0.01,
+    "learning_rate_evidence": "project_choice",
+    "batch_size": 4,
+    "batch_size_evidence": "project_choice",
+    "epochs": 100,
+    "epochs_evidence": "project_choice",
+    "loss": "detector_intensity_mse",
+    "loss_evidence": "paper_confirmed",
+    "checkpoint_interval_updates": 100,
+    "checkpoint_interval_updates_evidence": "project_choice"
+  },
+  "evaluation": {
+    "primary_metric": "per_image_pcc",
+    "primary_metric_evidence": "paper_confirmed",
+    "aggregation": [
+      "mean",
+      "sample_std",
+      "standard_error",
+      "normal_95_percent_ci",
+      "minimum",
+      "maximum"
+    ],
+    "aggregation_evidence": "project_choice",
+    "groupings": [
+      "diffuser",
+      "correlation_length",
+      "wavelength",
+      "illumination_mode",
+      "misalignment"
+    ],
+    "groupings_evidence": "project_choice"
+  },
+  "misalignment": {
+    "lateral_test_pixels": [
+      0,
+      5,
+      -5,
+      10,
+      -10
+    ],
+    "lateral_test_pixels_evidence": "project_choice",
+    "lateral_layer_index": 1,
+    "lateral_layer_index_evidence": "project_choice",
+    "lateral_experimental_range_pixels": [
+      4,
+      12
+    ],
+    "lateral_experimental_range_pixels_evidence": "paper_confirmed",
+    "axial_test_mm": [
+      0.0,
+      0.5,
+      -0.5,
+      1.0,
+      -1.0
+    ],
+    "axial_test_mm_evidence": "project_choice",
+    "axial_segment_index": 2,
+    "axial_segment_index_evidence": "project_choice",
+    "axial_experimental_range_mm": [
+      0.05,
+      0.1
+    ],
+    "axial_experimental_range_mm_evidence": "paper_confirmed",
+    "boundary": "zero",
+    "boundary_evidence": "project_choice"
+  },
+  "execution": {
+    "seed": 42,
+    "seed_evidence": "project_choice",
+    "device": "auto",
+    "device_evidence": "project_choice",
+    "full_scale_requires_explicit_execution_label": true,
+    "full_scale_requires_explicit_execution_label_evidence": "project_choice"
+  },
+  "claim_boundary": {
+    "included": [
+      "thin_phase_diffuser",
+      "scalar_angular_spectrum_propagation",
+      "phase_only_diffractive_layers",
+      "ideal_detector_by_default"
+    ],
+    "included_evidence": "project_choice",
+    "omitted": [
+      "volumetric_multiple_scattering",
+      "polarization",
+      "measured_slm_lut",
+      "hardware_calibration",
+      "fabrication",
+      "experimental_alignment_by_default"
+    ],
+    "omitted_evidence": "project_choice",
+    "result_status": "numerical_baseline_not_hardware_reproduction",
+    "result_status_evidence": "project_choice"
+  }
+}

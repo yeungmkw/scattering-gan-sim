@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "schema_version_evidence": "project_choice",
+  "extends": "huang2026_visible_coherent.json",
+  "extends_evidence": "project_choice",
+  "profile_id": "huang2026_visible",
+  "profile_id_evidence": "project_choice",
+  "mode": "incoherent",
+  "mode_evidence": "paper_confirmed",
+  "illumination": {
+    "wavelengths_nm": [
+      660.0
+    ],
+    "wavelengths_nm_evidence": "paper_confirmed",
+    "incident_field": "mnist_amplitude_times_gaussian_schell_complex_random_screen",
+    "incident_field_evidence": "paper_confirmed"
+  },
+  "diffuser": {
+    "correlation_length_pixels": 4.0,
+    "correlation_length_pixels_evidence": "paper_confirmed"
+  },
+  "coherence": {
+    "model": "gaussian_schell_complex_random_screen",
+    "model_evidence": "paper_confirmed",
+    "coherence_length_pixels": 4.0,
+    "coherence_length_pixels_evidence": "paper_confirmed",
+    "frequency_noise": "circular_complex_unit_gaussian",
+    "frequency_noise_evidence": "paper_confirmed",
+    "power_spectrum": "two_pi_delta_squared_exp_minus_pi_squared_delta_squared_frequency_squared",
+    "power_spectrum_evidence": "paper_confirmed",
+    "screen_power_normalization": "unit_mean_power",
+    "screen_power_normalization_evidence": "project_choice",
+    "nr_training": 20,
+    "nr_training_evidence": "paper_confirmed",
+    "nr_blind_test": 2000,
+    "nr_blind_test_evidence": "paper_confirmed",
+    "chunk_size": 20,
+    "chunk_size_evidence": "project_choice"
+  },
+  "training": {
+    "loss": "ensemble_mean_detector_intensity_mse",
+    "loss_evidence": "paper_confirmed"
+  },
+  "claim_boundary": {
+    "result_status": "numerical_ic_donn_baseline_not_hardware_reproduction",
+    "result_status_evidence": "project_choice"
+  }
+}

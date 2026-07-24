@@ -366,3 +366,132 @@ def reconstruction_metrics(prediction: torch.Tensor, target: torch.Tensor) -> di
             "ssim": float(ssim_index(prediction, target).mean().item()),
             "pearson": float(pearson_correlation(prediction, target).item()),
         }
+
+
+def huang2026_pcc_per_image(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Return Huang per-image PCC with a harmless singleton-channel alignment."""
+
+    if (
+        prediction.ndim + 1 == target.ndim
+        and target.ndim >= 4
+        and target.shape[1] == 1
+    ):
+        target = target[:, 0]
+    elif (
+        target.ndim + 1 == prediction.ndim
+        and prediction.ndim >= 4
+        and prediction.shape[1] == 1
+    ):
+        prediction = prediction[:, 0]
+    return pearson_per_image(prediction, target, eps=eps)
+
+
+def per_image_pcc(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Generic alias for :func:`huang2026_pcc_per_image`."""
+
+    return huang2026_pcc_per_image(prediction, target, eps=eps)
+
+
+def huang2026_dataset_statistics(
+    values: ScalarValues,
+) -> dict[str, float | int | list[float] | None]:
+    """Return mean/sample-SD/SE/95%-CI/min/max for image-level values."""
+
+    return scalar_summary(values)
+
+
+def huang2026_pcc_statistics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> dict[str, float | int | list[float] | None]:
+    """Summarize per-image PCC without adding PCC to the training loss."""
+
+    return huang2026_dataset_statistics(
+        huang2026_pcc_per_image(prediction, target, eps=eps)
+    )
+
+
+def huang2026_grouped_statistics(
+    values: ScalarValues,
+    *,
+    diffuser_seeds: Sequence[Hashable] | torch.Tensor | None = None,
+    correlation_lengths: Sequence[Hashable] | torch.Tensor | None = None,
+    wavelengths: Sequence[Hashable] | torch.Tensor | None = None,
+    illumination_modes: Sequence[Hashable] | torch.Tensor | None = None,
+    misalignments: Sequence[Hashable] | torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Summarize Huang 2026 metrics globally and by declared conditions.
+
+    Every supplied grouping vector aligns one-to-one with ``values``.  Group
+    rows preserve first-appearance order and retain the original scalar or
+    hashable condition value, which keeps numeric wavelengths and explicit
+    misalignment tuples machine-readable.  The dataset-level sampling units
+    are images; each group likewise summarizes its image distribution.
+    """
+
+    vector = _as_float64_vector(values)
+    if vector.numel() == 0:
+        raise ValueError("cannot summarize an empty metric distribution")
+    return {
+        "dataset": huang2026_dataset_statistics(vector),
+        "per_diffuser": _huang2026_group_rows(
+            vector,
+            diffuser_seeds,
+            field_name="diffuser_seed",
+        ),
+        "per_correlation_length": _huang2026_group_rows(
+            vector,
+            correlation_lengths,
+            field_name="correlation_length",
+        ),
+        "per_wavelength": _huang2026_group_rows(
+            vector,
+            wavelengths,
+            field_name="wavelength",
+        ),
+        "per_illumination_mode": _huang2026_group_rows(
+            vector,
+            illumination_modes,
+            field_name="illumination_mode",
+        ),
+        "per_misalignment": _huang2026_group_rows(
+            vector,
+            misalignments,
+            field_name="misalignment",
+        ),
+    }
+
+
+def _huang2026_group_rows(
+    values: torch.Tensor,
+    identifiers: Sequence[Hashable] | torch.Tensor | None,
+    *,
+    field_name: str,
+) -> list[dict[str, Any]]:
+    if identifiers is None:
+        return []
+    normalized_ids = _as_id_list(identifiers, name=field_name)
+    if len(normalized_ids) != int(values.numel()):
+        raise ValueError(f"{field_name} identifiers and values must have the same length")
+    grouped_indices: dict[Hashable, list[int]] = {}
+    for index, identifier in enumerate(normalized_ids):
+        grouped_indices.setdefault(identifier, []).append(index)
+    return [
+        {
+            field_name: identifier,
+            "statistics": huang2026_dataset_statistics(values[indices]),
+        }
+        for identifier, indices in grouped_indices.items()
+    ]

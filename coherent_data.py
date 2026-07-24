@@ -15,7 +15,7 @@ import math
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from torch.nn import functional as F
@@ -39,6 +39,9 @@ from data import build_torchvision_dataset
 
 LUO2022_ASSIGNMENT_SCHEMA = "luo2022-fixed-depth-assignment-v1"
 LUO2022_INTENSITY_CACHE_SCHEMA = "luo2022-intensity-cache-v1"
+HUANG2026_VISIBLE_SAMPLE_SCHEMA = "huang2026-visible-sample-v1"
+HUANG2026_TRAIN_SPLIT = "train"
+HUANG2026_BLIND_TEST_SPLIT = "blind_test"
 _ASSIGNMENT_FIELDS = (
     "object_id",
     "label",
@@ -765,6 +768,677 @@ def build_coherent_mnist_datasets(
             d2nn_seed=seed + 7919,
         ),
     )
+
+
+def prepare_huang2026_visible_amplitude(
+    image: torch.Tensor,
+    *,
+    input_shape: tuple[int, int] = (28, 28),
+    resized_shape: tuple[int, int] = (320, 320),
+    canvas_shape: tuple[int, int] = (400, 400),
+) -> torch.Tensor:
+    """Prepare the visible-light input amplitude from Supporting Note S3.
+
+    The paper path is exactly MNIST ``28 x 28`` -> bilinear ``320 x 320`` ->
+    centered zero padding on a ``400 x 400`` canvas.  The three shapes are
+    parameters only so reduced-scale validation can exercise the identical
+    operation.  Values are optical-field amplitudes: this function performs
+    no square root, min-max normalization, clipping, or detachment.
+    """
+
+    expected_input = _validate_huang2026_shape(input_shape, name="input_shape")
+    resized_size = _validate_huang2026_shape(resized_shape, name="resized_shape")
+    canvas_size = _validate_huang2026_shape(canvas_shape, name="canvas_shape")
+    if resized_size[0] > canvas_size[0] or resized_size[1] > canvas_size[1]:
+        raise ValueError("resized_shape must fit inside canvas_shape")
+
+    if image.ndim == 2:
+        image = image.unsqueeze(0).unsqueeze(0)
+    elif image.ndim == 3:
+        if image.shape[0] != 1:
+            raise ValueError("three-dimensional image must have shape (1, H, W)")
+        image = image.unsqueeze(0)
+    if image.ndim != 4 or image.shape[1] != 1:
+        raise ValueError("image must have shape (H, W), (1, H, W), or (B, 1, H, W)")
+    if tuple(image.shape[-2:]) != expected_input:
+        raise ValueError(
+            f"image spatial shape {tuple(image.shape[-2:])} does not match input_shape "
+            f"{expected_input}"
+        )
+    if not torch.is_floating_point(image):
+        image = image.to(dtype=torch.float32)
+
+    resized = F.interpolate(
+        image,
+        size=resized_size,
+        mode="bilinear",
+        align_corners=False,
+    )
+    pad_height = canvas_size[0] - resized_size[0]
+    pad_width = canvas_size[1] - resized_size[1]
+    top = pad_height // 2
+    bottom = pad_height - top
+    left = pad_width // 2
+    right = pad_width - left
+    return F.pad(resized, (left, right, top, bottom), mode="constant", value=0.0)
+
+
+class Huang2026OnlineDiffuserSampler:
+    """Deterministic online diffuser schedule with split-separated seed space.
+
+    Seeds are functions of ``(split, base_seed, iteration, object_id)``.
+    Training seeds occupy ``[0, 2**62)`` and blind-test seeds occupy
+    ``[2**62, 2**63)``, making the two namespaces disjoint by construction.
+    An optional ``diffuser_factory`` is called online and its tensor is
+    returned without detaching it; otherwise this class is a lightweight seed
+    and metadata scheduler for :class:`d2nn.CorrelatedHeightPhaseDiffuser`.
+    """
+
+    def __init__(
+        self,
+        *,
+        split: str,
+        base_seed: int = 0,
+        correlation_length_pixels: float,
+        wavelengths: float | Sequence[float] = (660e-9,),
+        diffuser_factory: Callable[..., torch.Tensor | Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.split = _normalize_huang2026_split(split)
+        self.base_seed = _validate_huang2026_nonnegative_int(base_seed, name="base_seed")
+        self.correlation_length_pixels = _validate_huang2026_positive_float(
+            correlation_length_pixels,
+            name="correlation_length_pixels",
+        )
+        self.wavelengths = _normalize_huang2026_wavelengths(wavelengths)
+        self.diffuser_factory = diffuser_factory
+
+    def seed_for(self, *, iteration: int, object_id: int) -> int:
+        """Return the reproducible diffuser seed for one online sample."""
+
+        return _huang2026_domain_seed(
+            domain="diffuser",
+            split=self.split,
+            base_seed=self.base_seed,
+            iteration=iteration,
+            object_id=object_id,
+            realization=0,
+        )
+
+    def metadata(self, *, iteration: int, object_id: int) -> dict[str, Any]:
+        """Return portable metadata for one diffuser realization."""
+
+        iteration_value = _validate_huang2026_nonnegative_int(iteration, name="iteration")
+        object_value = _validate_huang2026_nonnegative_int(object_id, name="object_id")
+        return {
+            "split": self.split,
+            "iteration": iteration_value,
+            "object_id": object_value,
+            "diffuser_seed": self.seed_for(
+                iteration=iteration_value,
+                object_id=object_value,
+            ),
+            "correlation_length_pixels": self.correlation_length_pixels,
+            "wavelengths_m": list(self.wavelengths),
+        }
+
+    def sample(
+        self,
+        *,
+        iteration: int,
+        object_id: int,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> dict[str, Any]:
+        """Generate one diffuser online, or return its seed record.
+
+        The injected factory protocol is keyword-only:
+        ``seed``, ``correlation_length_pixels``, ``wavelengths``, ``split``,
+        and optionally ``device``/``dtype``.  A tensor result is exposed as
+        ``diffuser_height_m`` so one physical diffuser can be converted at
+        every wavelength without resampling it.  A mapping result is merged
+        after checking that it does not overwrite provenance fields.
+        """
+
+        record = self.metadata(iteration=iteration, object_id=object_id)
+        if self.diffuser_factory is None:
+            return record
+        factory_kwargs: dict[str, Any] = {
+            "seed": record["diffuser_seed"],
+            "correlation_length_pixels": self.correlation_length_pixels,
+            "wavelengths": self.wavelengths,
+            "split": self.split,
+        }
+        if device is not None:
+            factory_kwargs["device"] = torch.device(device)
+        if dtype is not None:
+            factory_kwargs["dtype"] = dtype
+        generated = self.diffuser_factory(**factory_kwargs)
+        if isinstance(generated, torch.Tensor):
+            record["diffuser_height_m"] = generated
+            return record
+        if not isinstance(generated, Mapping):
+            raise TypeError("diffuser_factory must return a tensor or mapping")
+        overlap = set(record).intersection(generated)
+        if overlap:
+            raise ValueError(
+                "diffuser_factory must not overwrite sampler metadata fields: "
+                f"{sorted(overlap)}"
+            )
+        record.update(generated)
+        return record
+
+
+class Huang2026CoherenceSampler:
+    """Gaussian-Schell circular-complex screen sampler for Supporting Note S1.
+
+    The frequency-domain filter is the square root of the Gaussian power
+    spectrum in equation (S8), with spatial coherence length
+    ``coherence_length_pixels``.  The discrete spectrum is normalized to unit
+    *expected* mean power; individual realizations are not rescaled, preserving
+    the circular-Gaussian distribution.  Screens are created from a CPU
+    generator for device-independent seed replay and then moved to the
+    requested device.
+    """
+
+    def __init__(
+        self,
+        field_shape: tuple[int, int],
+        *,
+        split: str,
+        base_seed: int = 0,
+        coherence_length_pixels: float = 4.0,
+    ) -> None:
+        self.field_shape = _validate_huang2026_shape(field_shape, name="field_shape")
+        self.split = _normalize_huang2026_split(split)
+        self.base_seed = _validate_huang2026_nonnegative_int(base_seed, name="base_seed")
+        self.coherence_length_pixels = _validate_huang2026_positive_float(
+            coherence_length_pixels,
+            name="coherence_length_pixels",
+        )
+
+    def seed_for(self, *, iteration: int, object_id: int, realization: int) -> int:
+        """Return one reproducible complex-screen seed."""
+
+        return _huang2026_domain_seed(
+            domain="coherence",
+            split=self.split,
+            base_seed=self.base_seed,
+            iteration=iteration,
+            object_id=object_id,
+            realization=realization,
+        )
+
+    def metadata(
+        self,
+        *,
+        iteration: int,
+        object_id: int,
+        realization: int,
+    ) -> dict[str, Any]:
+        return {
+            "split": self.split,
+            "iteration": _validate_huang2026_nonnegative_int(
+                iteration,
+                name="iteration",
+            ),
+            "object_id": _validate_huang2026_nonnegative_int(
+                object_id,
+                name="object_id",
+            ),
+            "realization": _validate_huang2026_nonnegative_int(
+                realization,
+                name="realization",
+            ),
+            "coherence_seed": self.seed_for(
+                iteration=iteration,
+                object_id=object_id,
+                realization=realization,
+            ),
+            "coherence_length_pixels": self.coherence_length_pixels,
+        }
+
+    def sample(
+        self,
+        *,
+        iteration: int,
+        object_id: int,
+        realization: int,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.complex64,
+    ) -> torch.Tensor:
+        """Return one unit-power Gaussian-Schell complex random screen."""
+
+        if dtype not in {torch.complex64, torch.complex128}:
+            raise TypeError("dtype must be torch.complex64 or torch.complex128")
+        seed = self.seed_for(
+            iteration=iteration,
+            object_id=object_id,
+            realization=realization,
+        )
+        real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        real_noise = torch.randn(
+            self.field_shape,
+            generator=generator,
+            dtype=real_dtype,
+        )
+        imaginary_noise = torch.randn(
+            self.field_shape,
+            generator=generator,
+            dtype=real_dtype,
+        )
+        circular_noise = torch.complex(real_noise, imaginary_noise) / math.sqrt(2.0)
+
+        frequency_y = torch.fft.fftfreq(self.field_shape[0], dtype=real_dtype)
+        frequency_x = torch.fft.fftfreq(self.field_shape[1], dtype=real_dtype)
+        grid_y, grid_x = torch.meshgrid(frequency_y, frequency_x, indexing="ij")
+        spectral_amplitude = torch.exp(
+            -0.5
+            * (math.pi * self.coherence_length_pixels) ** 2
+            * (grid_x.square() + grid_y.square())
+        )
+        spectral_amplitude = spectral_amplitude / spectral_amplitude.square().mean().sqrt()
+        screen = torch.fft.ifft2(
+            circular_noise * spectral_amplitude.to(dtype=dtype),
+            norm="ortho",
+        )
+        return screen.to(device=torch.device(device), dtype=dtype)
+
+    def sample_ensemble(
+        self,
+        *,
+        iteration: int,
+        object_id: int,
+        num_realizations: int,
+        start_realization: int = 0,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.complex64,
+    ) -> torch.Tensor:
+        """Return ``Nr`` screens; callers may invoke this in bounded chunks."""
+
+        count = _validate_huang2026_positive_int(
+            num_realizations,
+            name="num_realizations",
+        )
+        start = _validate_huang2026_nonnegative_int(
+            start_realization,
+            name="start_realization",
+        )
+        return torch.stack(
+            [
+                self.sample(
+                    iteration=iteration,
+                    object_id=object_id,
+                    realization=start + offset,
+                    device=device,
+                    dtype=dtype,
+                )
+                for offset in range(count)
+            ],
+            dim=0,
+        )
+
+
+class Huang2026VisibleDataset(Dataset[dict[str, Any]]):
+    """Online MNIST amplitude records for the Huang et al. 2026 baseline.
+
+    The dataset does not materialize detector outputs.  It emits an amplitude,
+    its clean intensity target, an online diffuser seed (and optional factory
+    tensor), and wavelength-aware provenance.  ``sample_at`` makes the training
+    iteration explicit; ``__getitem__`` also accepts ``(iteration, index)`` so
+    a DataLoader sampler can carry iteration identity without mutable worker
+    state.
+    """
+
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        *,
+        split: str,
+        correlation_length_pixels: float,
+        base_seed: int = 0,
+        input_shape: tuple[int, int] = (28, 28),
+        resized_shape: tuple[int, int] = (320, 320),
+        canvas_shape: tuple[int, int] = (400, 400),
+        illumination_mode: str = "coherent",
+        wavelengths: float | Sequence[float] = (660e-9,),
+        diffuser_sampler: Huang2026OnlineDiffuserSampler | None = None,
+        coherence_sampler: Huang2026CoherenceSampler | None = None,
+        object_ids: Sequence[int] | torch.Tensor | None = None,
+    ) -> None:
+        self.base_dataset = base_dataset
+        self.split = _normalize_huang2026_split(split)
+        self.base_seed = _validate_huang2026_nonnegative_int(base_seed, name="base_seed")
+        self.input_shape = _validate_huang2026_shape(input_shape, name="input_shape")
+        self.resized_shape = _validate_huang2026_shape(
+            resized_shape,
+            name="resized_shape",
+        )
+        self.canvas_shape = _validate_huang2026_shape(
+            canvas_shape,
+            name="canvas_shape",
+        )
+        self.illumination_mode = _normalize_huang2026_illumination_mode(
+            illumination_mode
+        )
+        self.wavelengths = _normalize_huang2026_wavelengths(wavelengths)
+        self.correlation_length_pixels = _validate_huang2026_positive_float(
+            correlation_length_pixels,
+            name="correlation_length_pixels",
+        )
+        self.diffuser_sampler = diffuser_sampler or Huang2026OnlineDiffuserSampler(
+            split=self.split,
+            base_seed=self.base_seed,
+            correlation_length_pixels=self.correlation_length_pixels,
+            wavelengths=self.wavelengths,
+        )
+        if self.diffuser_sampler.split != self.split:
+            raise ValueError("diffuser_sampler split must match dataset split")
+        if self.diffuser_sampler.correlation_length_pixels != self.correlation_length_pixels:
+            raise ValueError(
+                "diffuser_sampler correlation length must match dataset configuration"
+            )
+        if self.diffuser_sampler.wavelengths != self.wavelengths:
+            raise ValueError("diffuser_sampler wavelengths must match dataset wavelengths")
+
+        if coherence_sampler is None and self.illumination_mode == "incoherent":
+            coherence_sampler = Huang2026CoherenceSampler(
+                self.canvas_shape,
+                split=self.split,
+                base_seed=self.base_seed,
+                coherence_length_pixels=4.0,
+            )
+        if coherence_sampler is not None:
+            if coherence_sampler.split != self.split:
+                raise ValueError("coherence_sampler split must match dataset split")
+            if coherence_sampler.field_shape != self.canvas_shape:
+                raise ValueError(
+                    "coherence_sampler field_shape must match dataset canvas_shape"
+                )
+        self.coherence_sampler = coherence_sampler
+        self.iteration = 0
+
+        if object_ids is None:
+            self.object_ids: tuple[int, ...] | None = None
+        else:
+            if isinstance(object_ids, torch.Tensor):
+                if object_ids.ndim != 1:
+                    raise ValueError("object_ids tensor must be one-dimensional")
+                normalized_ids = tuple(
+                    int(value) for value in object_ids.detach().cpu().tolist()
+                )
+            else:
+                normalized_ids = tuple(int(value) for value in object_ids)
+            if len(normalized_ids) != len(base_dataset):
+                raise ValueError("object_ids must have the same length as base_dataset")
+            if any(value < 0 for value in normalized_ids):
+                raise ValueError("object_ids must be non-negative")
+            if len(set(normalized_ids)) != len(normalized_ids):
+                raise ValueError("object_ids must be unique")
+            self.object_ids = normalized_ids
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def set_iteration(self, iteration: int) -> None:
+        """Set the explicit iteration used by integer indexing."""
+
+        self.iteration = _validate_huang2026_nonnegative_int(
+            iteration,
+            name="iteration",
+        )
+
+    def __getitem__(self, index: int | tuple[int, int]) -> dict[str, Any]:
+        if isinstance(index, tuple):
+            if len(index) != 2:
+                raise ValueError("tuple index must be (iteration, object_index)")
+            iteration, object_index = index
+            return self.sample_at(object_index, iteration=iteration)
+        return self.sample_at(index, iteration=self.iteration)
+
+    def sample_at(self, index: int, *, iteration: int) -> dict[str, Any]:
+        """Return one online record for an explicit iteration and object."""
+
+        index_value = int(index)
+        if index_value < 0:
+            index_value += len(self)
+        if index_value < 0 or index_value >= len(self):
+            raise IndexError(index)
+        iteration_value = _validate_huang2026_nonnegative_int(
+            iteration,
+            name="iteration",
+        )
+        base_item = self.base_dataset[index_value]
+        image, label = _unpack_image_label(base_item)
+        amplitude = prepare_huang2026_visible_amplitude(
+            image,
+            input_shape=self.input_shape,
+            resized_shape=self.resized_shape,
+            canvas_shape=self.canvas_shape,
+        )[0]
+        object_id = self._object_id(index_value, base_item)
+        diffuser_record = self.diffuser_sampler.sample(
+            iteration=iteration_value,
+            object_id=object_id,
+            device=amplitude.device,
+            dtype=amplitude.dtype,
+        )
+        diffuser_seed = int(diffuser_record["diffuser_seed"])
+        wavelength_tensor = torch.tensor(
+            self.wavelengths,
+            dtype=torch.float64,
+            device=amplitude.device,
+        )
+        metadata: dict[str, Any] = {
+            "schema_version": HUANG2026_VISIBLE_SAMPLE_SCHEMA,
+            "split": self.split,
+            "object_id": object_id,
+            "iteration": iteration_value,
+            "diffuser_seed": diffuser_seed,
+            "correlation_length_pixels": self.correlation_length_pixels,
+            "diffuser_correlation_length_pixels": self.correlation_length_pixels,
+            "illumination_mode": self.illumination_mode,
+            "wavelength": (
+                self.wavelengths[0]
+                if len(self.wavelengths) == 1
+                else list(self.wavelengths)
+            ),
+            "wavelengths_m": list(self.wavelengths),
+        }
+        sample: dict[str, Any] = {
+            "amplitude": amplitude,
+            "target_intensity": amplitude.square(),
+            "label": torch.tensor(int(label), dtype=torch.long),
+            "object_id": torch.tensor(object_id, dtype=torch.long),
+            "iteration": torch.tensor(iteration_value, dtype=torch.long),
+            "diffuser_seed": torch.tensor(diffuser_seed, dtype=torch.long),
+            "correlation_length_pixels": torch.tensor(
+                self.correlation_length_pixels,
+                dtype=torch.float64,
+            ),
+            "diffuser_correlation_length_pixels": torch.tensor(
+                self.correlation_length_pixels,
+                dtype=torch.float64,
+            ),
+            "illumination_mode": self.illumination_mode,
+            "wavelength": (
+                wavelength_tensor[0] if len(self.wavelengths) == 1 else wavelength_tensor
+            ),
+            "wavelengths_m": wavelength_tensor,
+            "metadata": metadata,
+        }
+        sampler_metadata_fields = {
+            "split",
+            "iteration",
+            "object_id",
+            "diffuser_seed",
+            "correlation_length_pixels",
+            "wavelengths_m",
+        }
+        sample.update(
+            {
+                key: value
+                for key, value in diffuser_record.items()
+                if key not in sampler_metadata_fields
+            }
+        )
+        if self.coherence_sampler is not None:
+            coherence_metadata = self.coherence_sampler.metadata(
+                iteration=iteration_value,
+                object_id=object_id,
+                realization=0,
+            )
+            sample["coherence_seed"] = torch.tensor(
+                coherence_metadata["coherence_seed"],
+                dtype=torch.long,
+            )
+            sample["coherence_length_pixels"] = torch.tensor(
+                self.coherence_sampler.coherence_length_pixels,
+                dtype=torch.float64,
+            )
+            metadata.update(
+                {
+                    "coherence_seed": coherence_metadata["coherence_seed"],
+                    "coherence_length_pixels": (
+                        self.coherence_sampler.coherence_length_pixels
+                    ),
+                }
+            )
+        return sample
+
+    def _object_id(self, index: int, base_item: Any) -> int:
+        if self.object_ids is not None:
+            return self.object_ids[index]
+        if isinstance(base_item, Mapping) and "object_id" in base_item:
+            value = base_item["object_id"]
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise ValueError("base item object_id tensor must be scalar")
+                value = value.item()
+            return _validate_huang2026_nonnegative_int(value, name="object_id")
+        return index
+
+
+def _normalize_huang2026_split(split: str) -> str:
+    normalized = str(split).strip().lower().replace("-", "_")
+    aliases = {
+        "train": HUANG2026_TRAIN_SPLIT,
+        "training": HUANG2026_TRAIN_SPLIT,
+        "blind": HUANG2026_BLIND_TEST_SPLIT,
+        "test": HUANG2026_BLIND_TEST_SPLIT,
+        "blind_test": HUANG2026_BLIND_TEST_SPLIT,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as error:
+        raise ValueError("split must be 'train' or 'blind_test'") from error
+
+
+def _normalize_huang2026_illumination_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower().replace("-", "")
+    aliases = {
+        "coherent": "coherent",
+        "incoherent": "incoherent",
+        "multiwavelength": "multiwavelength",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as error:
+        raise ValueError(
+            "illumination_mode must be coherent, incoherent, or multiwavelength"
+        ) from error
+
+
+def _normalize_huang2026_wavelengths(
+    wavelengths: float | Sequence[float],
+) -> tuple[float, ...]:
+    if isinstance(wavelengths, (int, float)):
+        values = (float(wavelengths),)
+    else:
+        values = tuple(float(value) for value in wavelengths)
+    if not values:
+        raise ValueError("wavelengths must not be empty")
+    if any(not math.isfinite(value) or value <= 0.0 for value in values):
+        raise ValueError("wavelengths must contain finite positive values")
+    if len(set(values)) != len(values):
+        raise ValueError("wavelengths must not contain duplicates")
+    return values
+
+
+def _validate_huang2026_shape(
+    shape: Sequence[int],
+    *,
+    name: str,
+) -> tuple[int, int]:
+    values = tuple(shape)
+    if (
+        len(values) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in values)
+        or any(value <= 0 for value in values)
+    ):
+        raise ValueError(f"{name} must contain two positive integers")
+    return int(values[0]), int(values[1])
+
+
+def _validate_huang2026_nonnegative_int(value: Any, *, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a non-negative integer") from error
+    if normalized != value or normalized < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return normalized
+
+
+def _validate_huang2026_positive_int(value: Any, *, name: str) -> int:
+    normalized = _validate_huang2026_nonnegative_int(value, name=name)
+    if normalized == 0:
+        raise ValueError(f"{name} must be positive")
+    return normalized
+
+
+def _validate_huang2026_positive_float(value: Any, *, name: str) -> float:
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite positive value") from error
+    if not math.isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"{name} must be a finite positive value")
+    return normalized
+
+
+def _huang2026_domain_seed(
+    *,
+    domain: str,
+    split: str,
+    base_seed: int,
+    iteration: int,
+    object_id: int,
+    realization: int,
+) -> int:
+    split_value = _normalize_huang2026_split(split)
+    seed_value = _validate_huang2026_nonnegative_int(base_seed, name="base_seed")
+    iteration_value = _validate_huang2026_nonnegative_int(
+        iteration,
+        name="iteration",
+    )
+    object_value = _validate_huang2026_nonnegative_int(object_id, name="object_id")
+    realization_value = _validate_huang2026_nonnegative_int(
+        realization,
+        name="realization",
+    )
+    digest = hashlib.sha256(
+        (
+            f"huang2026-visible/{domain}/v1\0{seed_value}\0"
+            f"{iteration_value}\0{object_value}\0{realization_value}"
+        ).encode("utf-8")
+    ).digest()
+    payload = int.from_bytes(digest[:8], byteorder="big") & ((1 << 62) - 1)
+    namespace_bit = 0 if split_value == HUANG2026_TRAIN_SPLIT else 1 << 62
+    return namespace_bit | payload
 
 
 def _normalize_image(image: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:

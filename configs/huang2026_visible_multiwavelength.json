@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "schema_version_evidence": "project_choice",
+  "extends": "huang2026_visible_coherent.json",
+  "extends_evidence": "project_choice",
+  "profile_id": "huang2026_visible",
+  "profile_id_evidence": "project_choice",
+  "mode": "multiwavelength",
+  "mode_evidence": "paper_confirmed",
+  "illumination": {
+    "wavelengths_nm": [
+      491.0,
+      532.0,
+      660.0
+    ],
+    "wavelengths_nm_evidence": "paper_confirmed",
+    "incident_field": "parallel_wavelength_channels_with_shared_mnist_amplitude",
+    "incident_field_evidence": "paper_confirmed"
+  },
+  "diffuser": {
+    "correlation_length_pixels": 20.0,
+    "correlation_length_pixels_evidence": "paper_confirmed"
+  },
+  "multiwavelength": {
+    "enabled": true,
+    "enabled_evidence": "paper_confirmed",
+    "wavelength_aggregation": "separate_output_intensities",
+    "wavelength_aggregation_evidence": "paper_confirmed",
+    "loss": "sum_of_per_wavelength_intensity_mse",
+    "loss_evidence": "paper_confirmed",
+    "phase_response": "ideal_continuous_wavelength_scaled",
+    "phase_response_evidence": "project_choice",
+    "measured_lut_available": false,
+    "measured_lut_available_evidence": "paper_confirmed",
+    "lut_contract": "optional_per_wavelength_drive_phase_pairs",
+    "lut_contract_evidence": "project_choice"
+  },
+  "training": {
+    "loss": "sum_per_wavelength_detector_intensity_mse",
+    "loss_evidence": "paper_confirmed"
+  },
+  "claim_boundary": {
+    "result_status": "numerical_mwdonn_baseline_with_ideal_project_choice_slm_response",
+    "result_status_evidence": "project_choice"
+  }
+}

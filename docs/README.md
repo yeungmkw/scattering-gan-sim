@@ -16,6 +16,11 @@ Recommended reading order:
    controls, integrity boundary, and completed follow-on boundary.
 4. `luo2022-fixed4-backend-results.md`: the completed R0/B0/R1/R2 fixed-depth
    comparison, matched GAN branch, costs, and claim boundary.
+5. `huang2026-visible-baseline.md`: the visible-light coherent, incoherent,
+   multi-wavelength, control, Supporting Equation (S18) SLM input-encoding,
+   resource, and misalignment numerical contracts. It defines the four public
+   evidence labels and keeps training convergence separate from blind-diffuser
+   generalization.
 
 The executable Luo 2022 R0 source of truth is
 [`configs/luo2022_r0.json`](../configs/luo2022_r0.json). The completed

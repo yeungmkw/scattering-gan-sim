@@ -14,18 +14,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import hashlib
 import json
 import math
 import os
 import platform
+import random
 import shutil
 import tempfile
 import time
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from io import StringIO
 from itertools import combinations
@@ -47,6 +49,9 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset
 
 from coherent_data import (
+    Huang2026CoherenceSampler,
+    Huang2026OnlineDiffuserSampler,
+    Huang2026VisibleDataset,
     Luo2022CachedIntensityDataset,
     Luo2022IntensityCacheWriter,
     build_luo2022_fixed_depth_assignment,
@@ -54,16 +59,28 @@ from coherent_data import (
     canonical_sha256,
     make_luo2022_frozen_scale,
     materialize_coherent_dataset,
+    prepare_huang2026_visible_amplitude,
     prepare_luo2022_amplitude,
     verify_luo2022_intensity_cache,
 )
 from d2nn import (
     AngularSpectrumPropagator,
     CoherentOpticsConfig,
+    CorrelatedHeightPhaseDiffuser,
+    DetectorResponse,
+    Huang2026DiffuserConfig,
+    Huang2026IncoherentDONN,
+    Huang2026MultiWavelengthDONN,
+    Huang2026ThreeLayerDONN,
+    Huang2026VisibleOpticsConfig,
     Luo2022FourLayerD2NN,
     Luo2022OpticsConfig,
+    MisalignmentTransform,
     RayleighSommerfeldPropagator,
+    SLMPhaseResponse,
     SingleLayerD2NN,
+    ThinLensOperator,
+    VisibleDirectPropagationOperator,
     amplitude_to_complex_field,
     apply_amplitude_particles,
     apply_phase_screen,
@@ -84,6 +101,9 @@ from d2nn import (
 from data import build_torchvision_dataset
 from losses import (
     ReconstructionLossWeights,
+    huang2026_incoherent_mse,
+    huang2026_intensity_mse,
+    huang2026_multiwavelength_mse,
     luo2022_d2nn_components_per_pair,
     luo2022_d2nn_energy_breakdown_per_pair,
     luo2022_d2nn_loss,
@@ -93,6 +113,8 @@ from losses import (
 )
 from metrics import (
     digit_group_statistics,
+    huang2026_grouped_statistics,
+    huang2026_pcc_per_image,
     pair_level_tail_statistics,
     paired_diffuser_delta_statistics,
     per_image_reconstruction_metrics,
@@ -127,6 +149,14 @@ DEFAULT_ADVERSARIAL_WEIGHT = 0.01
 DEFAULT_SAMPLE_EVERY = 1
 DEFAULT_LUO2022_CONFIG = Path("configs/luo2022_r0.json")
 DEFAULT_LUO2022_BACKEND_CONFIG = Path("configs/luo2022_fixed4_backend.json")
+DEFAULT_HUANG2026_CONFIGS = {
+    "coherent": Path("configs/huang2026_visible_coherent.json"),
+    "incoherent": Path("configs/huang2026_visible_incoherent.json"),
+    "multiwavelength": Path("configs/huang2026_visible_multiwavelength.json"),
+}
+HUANG2026_PROFILE_ID = "huang2026_visible"
+HUANG2026_CHECKPOINT_PROTOCOL = "huang2026_visible_checkpoint_v1"
+HUANG2026_RUN_PROTOCOL = "huang2026_visible_run_v1"
 LUO2022_BACKEND_SCHEMA_VERSION = 1
 LUO2022_BACKEND_CACHE_PROTOCOL = "luo2022_fixed4_raw_intensity_cache_v1"
 LUO2022_BACKEND_TRAINING_PROTOCOL = "luo2022_fixed4_backend_training_v1"
@@ -360,7 +390,17 @@ def build_parser() -> argparse.ArgumentParser:
     d2nn_parser.add_argument("--output-dir", default="outputs/d2nn_inspection")
     d2nn_parser.add_argument("--download", action="store_true")
     d2nn_parser.add_argument("--corruption", choices=("phase", "particles"), default="phase")
-    d2nn_parser.add_argument("--profile", choices=("legacy", "luo2022_r0"), default="legacy")
+    d2nn_parser.add_argument(
+        "--profile",
+        choices=("legacy", "luo2022_r0", HUANG2026_PROFILE_ID),
+        default="legacy",
+    )
+    d2nn_parser.add_argument(
+        "--mode",
+        choices=("coherent", "incoherent", "multiwavelength"),
+        default="coherent",
+        help="Huang 2026 illumination/spectral mode.",
+    )
     d2nn_parser.add_argument(
         "--action",
         choices=(
@@ -374,6 +414,8 @@ def build_parser() -> argparse.ArgumentParser:
             "backend-cache",
             "backend-train",
             "backend-evaluate",
+            "control",
+            "misalignment",
         ),
         default="inspect",
     )
@@ -385,6 +427,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Public fixed-four-layer B0/R1/R2 ablation contract.",
     )
     d2nn_parser.add_argument("--small-run", action="store_true")
+    d2nn_parser.add_argument(
+        "--execution-label",
+        choices=("small", "full"),
+        default=None,
+        help="Explicit Huang 2026 execution status label; --small-run is an alias for small.",
+    )
     d2nn_parser.add_argument("--device", default="cpu")
     d2nn_parser.add_argument("--seed", type=int, default=None)
     d2nn_parser.add_argument("--grid-size", type=int, default=None)
@@ -396,6 +444,50 @@ def build_parser() -> argparse.ArgumentParser:
     d2nn_parser.add_argument("--diffusers-per-epoch", type=int, default=None)
     d2nn_parser.add_argument("--eval-diffusers", type=int, default=None)
     d2nn_parser.add_argument("--lr", type=float, default=None)
+    d2nn_parser.add_argument(
+        "--diffuser-correlation-length",
+        type=float,
+        default=None,
+        help="Huang diffuser correlation length in detector pixels.",
+    )
+    d2nn_parser.add_argument(
+        "--nr",
+        type=int,
+        default=None,
+        help="Number of coherent realizations used for Huang incoherent intensity averaging.",
+    )
+    d2nn_parser.add_argument(
+        "--geometry-profile",
+        choices=("paper_default", "supplement_typo_sensitivity"),
+        default="paper_default",
+        help="The 2.95/7.1 mm profile is an explicit suspected-supplementary-typo sensitivity only.",
+    )
+    d2nn_parser.add_argument(
+        "--wavelengths",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="NM",
+        help="Huang wavelengths in nanometres (default: profile values).",
+    )
+    d2nn_parser.add_argument(
+        "--control",
+        choices=("direct", "lens", "donn"),
+        nargs="+",
+        default=("direct", "lens", "donn"),
+        help="Huang operators included by --action control.",
+    )
+    d2nn_parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=None,
+        help="Huang optimizer-update interval for atomic latest checkpoints.",
+    )
+    d2nn_parser.add_argument(
+        "--evaluation-only",
+        action="store_true",
+        help="Load a Huang checkpoint and evaluate without optimizer updates.",
+    )
     d2nn_parser.add_argument("--max-train-batches", type=int, default=None)
     d2nn_parser.add_argument("--max-eval-batches", type=int, default=None)
     d2nn_parser.add_argument(
@@ -404,7 +496,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Execution-only diffuser chunk size. Gradients are accumulated across chunks "
-            "before one optimizer update, preserving the configured fields per update."
+            "before one optimizer update, preserving the configured fields per update; "
+            "for Huang IC-DONN it bounds coherent-realization screen chunks without "
+            "changing the Nr ensemble average."
         ),
     )
     d2nn_parser.add_argument(
@@ -419,7 +513,10 @@ def build_parser() -> argparse.ArgumentParser:
     d2nn_parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume the Luo 2022 run from OUTPUT_DIR/checkpoints/latest.pt.",
+        help=(
+            "Resume a compatible Luo 2022 or Huang 2026 training run from "
+            "OUTPUT_DIR/checkpoints/latest.pt."
+        ),
     )
     d2nn_parser.add_argument(
         "--posthoc-output-dir",
@@ -457,8 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Completed frozen R0 run directory for --action diagnose or control-ladder; "
-            "defaults to --output-dir."
+            "Completed source run: frozen R0 for diagnose/control-ladder, or a trained "
+            "Huang run for evaluate/control/misalignment. Defaults to --output-dir."
         ),
     )
     d2nn_parser.add_argument(
@@ -649,6 +746,8 @@ def add_training_args(parser: argparse.ArgumentParser, *, default_output: str) -
 
 def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "d2nn":
+        if args.profile == HUANG2026_PROFILE_ID:
+            return run_huang2026_visible(args)
         if args.profile == "luo2022_r0":
             if args.action == "backend-cache":
                 if args.run_dir is None:
@@ -2608,6 +2707,7 @@ def run_luo2022_training(
             "runtime_config": "config.json",
             "source_config": "source_config.json",
             "history": "history.json",
+            "history_journal": "history.jsonl",
             "metrics": "metrics.json",
             "checkpoint": "checkpoints/luo2022_d2nn.pt",
             "resume_checkpoint": "checkpoints/latest.pt",
@@ -9762,6 +9862,3517 @@ def read_json(path: Path) -> Any:
 
 def read_optional_json(path: Path) -> Any:
     return read_json(path) if path.exists() else None
+
+
+def _huang2026_config_path(args: argparse.Namespace) -> Path:
+    """Resolve the mode-specific public contract without changing Luo defaults."""
+
+    configured = Path(args.config_path)
+    if configured == DEFAULT_LUO2022_CONFIG:
+        return DEFAULT_HUANG2026_CONFIGS[args.mode]
+    return configured
+
+
+def load_huang2026_contract(path: Path) -> dict[str, Any]:
+    """Load a Huang JSON contract with optional relative public-contract inheritance."""
+
+    allowed_evidence = {
+        "paper_confirmed",
+        "paper_inferred",
+        "project_choice",
+        "suspected_paper_typo",
+    }
+
+    def _validate_evidence_pairs(node: Mapping[str, Any], *, location: str) -> None:
+        for key, value in node.items():
+            if key.endswith("_evidence"):
+                continue
+            if isinstance(value, Mapping):
+                _validate_evidence_pairs(value, location=f"{location}.{key}")
+                continue
+            evidence_key = f"{key}_evidence"
+            if evidence_key not in node:
+                raise ValueError(
+                    f"Huang config leaf {location}.{key} is missing {evidence_key}"
+                )
+            evidence = node[evidence_key]
+            if not isinstance(evidence, str) or not evidence:
+                raise ValueError(
+                    f"Huang config evidence {location}.{evidence_key} must be non-empty"
+                )
+            if evidence not in allowed_evidence:
+                raise ValueError(
+                    f"Huang config evidence {location}.{evidence_key} must be one of "
+                    f"{sorted(allowed_evidence)}"
+                )
+
+    def _merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+        merged = dict(base)
+        for key, value in override.items():
+            if (
+                key in merged
+                and isinstance(merged[key], Mapping)
+                and isinstance(value, Mapping)
+            ):
+                merged[key] = _merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _load(current: Path, stack: tuple[Path, ...]) -> dict[str, Any]:
+        resolved = current.resolve()
+        if resolved in stack:
+            raise ValueError("cyclic Huang config inheritance")
+        payload = load_config(resolved)
+        _validate_evidence_pairs(payload, location=resolved.name)
+        inherited = payload.get("extends")
+        if inherited is None:
+            return payload
+        if not isinstance(inherited, str) or not inherited:
+            raise ValueError("Huang config extends must be a non-empty relative filename")
+        inherited_path = Path(inherited)
+        if inherited_path.is_absolute():
+            raise ValueError("Huang config extends must be relative to the child config")
+        base = _load(resolved.parent / inherited_path, (*stack, resolved))
+        merged = _merge(base, payload)
+        # A resolved contract is portable on its own. Retaining the child
+        # ``extends`` directive would make a run snapshot depend on a sibling
+        # file that is deliberately not copied into the artifact directory.
+        merged.pop("extends", None)
+        merged.pop("extends_evidence", None)
+        return merged
+
+    contract = _load(path, ())
+    if contract.get("schema_version") != 1:
+        raise ValueError("Huang config schema_version must be 1")
+    if contract.get("profile_id") != HUANG2026_PROFILE_ID:
+        raise ValueError("Huang config profile_id mismatch")
+    if contract.get("mode") not in {"coherent", "incoherent", "multiwavelength"}:
+        raise ValueError("Huang config mode is invalid")
+    return contract
+
+
+def _huang2026_config_value(
+    contract: Mapping[str, Any],
+    dotted_path: str,
+    *,
+    default: Any = None,
+) -> Any:
+    """Read a Huang contract leaf, accepting either raw or evidence-wrapped values."""
+
+    value: Any = contract
+    for part in dotted_path.split("."):
+        if not isinstance(value, Mapping) or part not in value:
+            return default
+        value = value[part]
+    if isinstance(value, Mapping) and "value" in value:
+        return value["value"]
+    return value
+
+
+def _huang2026_jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _huang2026_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_huang2026_jsonable(item) for item in value]
+    return value
+
+
+def _huang2026_portable_path(path: Path) -> str:
+    """Return a repository-relative config identifier without host paths."""
+
+    repository_root = Path(__file__).resolve().parent
+    try:
+        return path.resolve().relative_to(repository_root).as_posix()
+    except ValueError:
+        return path.name
+
+
+def build_huang2026_runtime_config(
+    contract: Mapping[str, Any],
+    args: argparse.Namespace,
+    *,
+    config_path: Path,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Bind a public Huang contract to an explicitly labeled execution.
+
+    Full paper-scale values remain available through the public contract, but
+    this repository's acceptance run uses the reduced ``small`` binding. The
+    binding never changes the optical distance profile silently.
+    """
+
+    if args.small_run and args.execution_label == "full":
+        raise ValueError("--small-run conflicts with --execution-label full")
+    if args.execution_label is None and not args.small_run and args.action == "train":
+        raise ValueError(
+            "Huang paper-scale training requires explicit --execution-label full; "
+            "use --execution-label small for the reduced validation"
+        )
+    execution_label = args.execution_label or ("small" if args.small_run else "full")
+    small_run = execution_label == "small"
+    seed = int(
+        args.seed
+        if args.seed is not None
+        else _huang2026_config_value(contract, "execution.seed", default=42)
+    )
+    paper_shape = tuple(
+        int(value)
+        for value in _huang2026_config_value(contract, "grid.shape", default=(400, 400))
+    )
+    field_size = int(
+        args.grid_size
+        if args.grid_size is not None
+        else (32 if small_run else paper_shape[0])
+    )
+    field_shape = (field_size, field_size)
+    paper_resized_shape = tuple(
+        int(value)
+        for value in _huang2026_config_value(
+            contract,
+            "input.resized_shape",
+            default=(320, 320),
+        )
+    )
+    resized_size = int(
+        args.input_size
+        if args.input_size is not None
+        else (24 if small_run else paper_resized_shape[0])
+    )
+    if resized_size > field_size:
+        raise ValueError("Huang resized input must fit inside the optical field")
+    wavelengths_nm = (
+        [float(value) for value in args.wavelengths]
+        if args.wavelengths is not None
+        else [
+            float(value)
+            for value in _huang2026_config_value(
+                contract,
+                "illumination.wavelengths_nm",
+                default=(
+                    [491.0, 532.0, 660.0]
+                    if args.mode == "multiwavelength"
+                    else [660.0]
+                ),
+            )
+        ]
+    )
+    if not wavelengths_nm or any(value <= 0 for value in wavelengths_nm):
+        raise ValueError("Huang wavelengths must contain positive nanometre values")
+    if args.mode != "multiwavelength" and len(wavelengths_nm) != 1:
+        raise ValueError(
+            "Huang coherent and incoherent modes require exactly one wavelength"
+        )
+    if len(set(wavelengths_nm)) != len(wavelengths_nm):
+        raise ValueError("Huang wavelengths must be unique")
+    evaluation_action = args.action in {"evaluate", "control", "misalignment"} or bool(
+        args.evaluation_only
+    )
+    configured_nr = _huang2026_config_value(
+        contract,
+        "coherence.nr_blind_test"
+        if evaluation_action
+        else "coherence.nr_training",
+        default=2000 if evaluation_action else 20,
+    )
+    nr = int(args.nr if args.nr is not None else (4 if small_run else configured_nr))
+    if nr <= 0:
+        raise ValueError("--nr must be positive")
+    configured_chunk = _huang2026_config_value(
+        contract,
+        "coherence.chunk_size",
+        default=min(nr, 20),
+    )
+    coherence_chunk_size = int(
+        args.diffuser_chunk_size
+        if args.diffuser_chunk_size is not None
+        else min(nr, int(configured_chunk))
+    )
+    if coherence_chunk_size <= 0:
+        raise ValueError("Huang coherence chunk size must be positive")
+    if args.geometry_profile not in {"paper_default", "supplement_typo_sensitivity"}:
+        raise ValueError("unknown Huang geometry profile")
+    correlation_length_pixels = float(
+        args.diffuser_correlation_length
+        if args.diffuser_correlation_length is not None
+        else _huang2026_config_value(
+            contract,
+            "diffuser.correlation_length_pixels",
+            default=10.0 if args.mode != "incoherent" else 4.0,
+        )
+    )
+    if correlation_length_pixels <= 0:
+        raise ValueError("diffuser correlation length must be positive")
+
+    def _runtime_int(argument: int | None, path: str, small_default: int) -> int:
+        configured = int(_huang2026_config_value(contract, path, default=small_default))
+        return int(argument if argument is not None else (small_default if small_run else configured))
+
+    epochs = _runtime_int(args.epochs, "training.epochs", 2)
+    batch_size = _runtime_int(args.batch_size, "training.batch_size", 2)
+    train_limit = _runtime_int(args.train_limit, "input.training_objects", 8)
+    eval_limit = _runtime_int(args.eval_limit, "input.blind_test_objects", 4)
+    checkpoint_interval = int(
+        args.checkpoint_interval
+        if args.checkpoint_interval is not None
+        else _huang2026_config_value(contract, "training.checkpoint_interval_updates", default=1)
+    )
+    learning_rate = float(
+        args.lr
+        if args.lr is not None
+        else _huang2026_config_value(contract, "training.learning_rate", default=1e-2)
+    )
+    if min(epochs, batch_size, train_limit, eval_limit, checkpoint_interval) <= 0:
+        raise ValueError("Huang training counts and checkpoint interval must be positive")
+    for name, value in (
+        ("max_train_batches", args.max_train_batches),
+        ("max_eval_batches", args.max_eval_batches),
+    ):
+        if value is not None and int(value) <= 0:
+            raise ValueError(f"Huang {name} must be positive when provided")
+    if learning_rate <= 0:
+        raise ValueError("Huang learning rate must be positive")
+
+    return {
+        "protocol": HUANG2026_RUN_PROTOCOL,
+        "profile_id": HUANG2026_PROFILE_ID,
+        "source_config": _huang2026_portable_path(config_path),
+        "source_profile_id": _huang2026_config_value(
+            contract,
+            "profile_id",
+            default=HUANG2026_PROFILE_ID,
+        ),
+        "source_contract_sha256": canonical_sha256(contract),
+        "mode": args.mode,
+        "action": "evaluate" if args.evaluation_only else args.action,
+        "execution_label": execution_label,
+        "status_label": "small run" if small_run else "paper-scale execution",
+        "seed": seed,
+        "device": str(device),
+        "field_shape": list(field_shape),
+        "resized_shape": [resized_size, resized_size],
+        "pixel_pitch_m": float(
+            _huang2026_config_value(contract, "grid.pixel_pitch_m", default=8e-6)
+        ),
+        "numerics": {
+            "asm_pad_factor": int(
+                _huang2026_config_value(contract, "grid.asm_pad_factor", default=1)
+            ),
+            "asm_crop": str(
+                _huang2026_config_value(contract, "grid.asm_crop", default="center_same")
+            ),
+            "complex_dtype": str(
+                _huang2026_config_value(contract, "grid.complex_dtype", default="complex64")
+            ),
+        },
+        "wavelengths_nm": wavelengths_nm,
+        "diffuser": {
+            "refractive_index": float(
+                _huang2026_config_value(contract, "diffuser.refractive_index", default=1.52)
+            ),
+            "refractive_index_difference": float(
+                _huang2026_config_value(
+                    contract,
+                    "diffuser.refractive_index_difference",
+                    default=0.52,
+                )
+            ),
+            "height_mean_m": float(
+                _huang2026_config_value(contract, "diffuser.height_mean_m", default=63e-6)
+            ),
+            "height_std_m": float(
+                _huang2026_config_value(contract, "diffuser.height_std_m", default=14e-6)
+            ),
+            "height_distribution_stage": str(
+                _huang2026_config_value(
+                    contract,
+                    "diffuser.height_distribution_stage",
+                    default=(
+                        "prefilter_random_field_W_before_gaussian_convolution"
+                    ),
+                )
+            ),
+            "correlation_length_pixels": correlation_length_pixels,
+            "gaussian_kernel_truncate_sigma": float(
+                _huang2026_config_value(
+                    contract,
+                    "diffuser.gaussian_kernel_truncate_sigma",
+                    default=4.0,
+                )
+            ),
+            "gaussian_boundary": str(
+                _huang2026_config_value(
+                    contract,
+                    "diffuser.gaussian_boundary",
+                    default="reflect",
+                )
+            ),
+        },
+        "geometry_profile": args.geometry_profile,
+        "geometry": _huang2026_jsonable(
+            _huang2026_config_value(
+                contract,
+                f"geometry.profiles.{args.geometry_profile}",
+                default={},
+            )
+        ),
+        "d2nn": {
+            "layers": int(_huang2026_config_value(contract, "d2nn.layers", default=3)),
+            "phase_initialization": str(
+                _huang2026_config_value(
+                    contract,
+                    "d2nn.phase_initialization",
+                    default="uniform_0_to_2pi",
+                )
+            ),
+            "phase_modulation": str(
+                _huang2026_config_value(
+                    contract,
+                    "d2nn.phase_modulation",
+                    default="exp_j_phi",
+                )
+            ),
+        },
+        "slm": _huang2026_jsonable(contract.get("slm", {})),
+        "detector": _huang2026_jsonable(contract.get("detector", {})),
+        "multiwavelength": _huang2026_jsonable(
+            contract.get("multiwavelength", {})
+        ),
+        "misalignment": _huang2026_jsonable(
+            contract.get("misalignment", {})
+        ),
+        "coherence": {
+            "coherence_length_pixels": float(
+                _huang2026_config_value(
+                    contract,
+                    "coherence.coherence_length_pixels",
+                    default=4.0,
+                )
+            ),
+            "nr": nr,
+            "nr_training_contract": int(
+                args.nr
+                if args.nr is not None and not evaluation_action
+                else (
+                    4
+                    if small_run
+                    else _huang2026_config_value(
+                        contract,
+                        "coherence.nr_training",
+                        default=20,
+                    )
+                )
+            ),
+            "nr_blind_test_contract": int(
+                4
+                if small_run
+                else _huang2026_config_value(
+                    contract,
+                    "coherence.nr_blind_test",
+                    default=2000,
+                )
+            ),
+            "chunk_size": min(nr, coherence_chunk_size),
+        },
+        "training": {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "train_limit": train_limit,
+            "eval_limit": eval_limit,
+            "learning_rate": learning_rate,
+            "optimizer": str(
+                _huang2026_config_value(contract, "training.optimizer", default="Adam")
+            ),
+            "checkpoint_interval_updates": checkpoint_interval,
+            "max_train_batches": args.max_train_batches,
+            "max_eval_batches": args.max_eval_batches,
+        },
+        "controls": list(args.control),
+        "resume": bool(args.resume),
+        "evaluation_only": bool(args.evaluation_only),
+        "download": bool(args.download),
+        "paper_scale_reference": {
+            "field_shape": list(paper_shape),
+            "resized_shape": list(paper_resized_shape),
+            "training_objects": 60000,
+            "blind_test_objects": 10000,
+            "nr_training": 20,
+            "nr_blind_test": 2000,
+        },
+    }
+
+
+def huang2026_epoch_order(*, sample_count: int, seed: int, epoch: int) -> list[int]:
+    """Return the deterministic object order used by resumable Huang training."""
+
+    if sample_count <= 0:
+        raise ValueError("sample_count must be positive")
+    if epoch < 0:
+        raise ValueError("epoch must be non-negative")
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed) + 104729 * int(epoch) + 202601168)
+    return torch.randperm(sample_count, generator=generator).tolist()
+
+
+def _huang2026_resume_contract(runtime_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Project runtime metadata onto fields that must match for strict resume."""
+
+    training = runtime_config["training"]
+    return {
+        "protocol": runtime_config["protocol"],
+        "profile_id": runtime_config["profile_id"],
+        "source_contract_sha256": runtime_config["source_contract_sha256"],
+        "mode": runtime_config["mode"],
+        "execution_label": runtime_config["execution_label"],
+        "seed": runtime_config["seed"],
+        "field_shape": runtime_config["field_shape"],
+        "resized_shape": runtime_config["resized_shape"],
+        "pixel_pitch_m": runtime_config["pixel_pitch_m"],
+        "numerics": runtime_config["numerics"],
+        "wavelengths_nm": runtime_config["wavelengths_nm"],
+        "diffuser": runtime_config["diffuser"],
+        "geometry_profile": runtime_config["geometry_profile"],
+        "geometry": runtime_config["geometry"],
+        "d2nn": runtime_config["d2nn"],
+        "slm": runtime_config["slm"],
+        "detector": runtime_config["detector"],
+        "multiwavelength": runtime_config["multiwavelength"],
+        "coherence_length_pixels": runtime_config["coherence"]["coherence_length_pixels"],
+        "nr_training": runtime_config["coherence"]["nr_training_contract"],
+        "coherence_chunk_size": runtime_config["coherence"]["chunk_size"],
+        "optimizer": training["optimizer"],
+        "learning_rate": training["learning_rate"],
+        "batch_size": training["batch_size"],
+        "train_limit": training["train_limit"],
+        "eval_limit": training["eval_limit"],
+        "epochs": training["epochs"],
+        "max_train_batches": training["max_train_batches"],
+        "max_eval_batches": training["max_eval_batches"],
+        "checkpoint_interval_updates": training["checkpoint_interval_updates"],
+    }
+
+
+def huang2026_resume_fingerprint(runtime_config: Mapping[str, Any]) -> str:
+    return canonical_sha256(_huang2026_resume_contract(runtime_config))
+
+
+def _huang2026_model_contract(runtime_config: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "protocol": runtime_config["protocol"],
+        "profile_id": runtime_config["profile_id"],
+        "source_contract_sha256": runtime_config["source_contract_sha256"],
+        "mode": runtime_config["mode"],
+        "field_shape": runtime_config["field_shape"],
+        "pixel_pitch_m": runtime_config["pixel_pitch_m"],
+        "numerics": runtime_config["numerics"],
+        "wavelengths_nm": runtime_config["wavelengths_nm"],
+        "diffuser_material": {
+            "refractive_index": runtime_config["diffuser"]["refractive_index"],
+            "refractive_index_difference": runtime_config["diffuser"][
+                "refractive_index_difference"
+            ],
+        },
+        "geometry_profile": runtime_config["geometry_profile"],
+        "geometry": runtime_config["geometry"],
+        "d2nn": runtime_config["d2nn"],
+        "slm": runtime_config["slm"],
+        "detector": runtime_config["detector"],
+        "multiwavelength": runtime_config["multiwavelength"],
+    }
+
+
+def huang2026_model_fingerprint(runtime_config: Mapping[str, Any]) -> str:
+    return canonical_sha256(_huang2026_model_contract(runtime_config))
+
+
+def _huang2026_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_huang2026_rng_state(state: Mapping[str, Any]) -> None:
+    random.setstate(state["python"])
+    numpy_state = state["numpy"]
+    if isinstance(numpy_state, list):
+        numpy_state = tuple(numpy_state)
+    np.random.set_state(numpy_state)
+    torch.set_rng_state(state["torch_cpu"])
+    if "torch_cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _update_huang2026_integrity_hash(
+    digest: Any,
+    value: Any,
+) -> None:
+    """Hash nested checkpoint data without relying on pickle byte stability."""
+
+    if value is None:
+        digest.update(b"N")
+    elif isinstance(value, bool):
+        digest.update(b"B1" if value else b"B0")
+    elif isinstance(value, int):
+        digest.update(b"I" + str(value).encode("ascii") + b";")
+    elif isinstance(value, float):
+        digest.update(b"F" + value.hex().encode("ascii") + b";")
+    elif isinstance(value, str):
+        encoded = value.encode("utf-8")
+        digest.update(b"S" + str(len(encoded)).encode("ascii") + b":" + encoded)
+    elif isinstance(value, bytes):
+        digest.update(b"Y" + str(len(value)).encode("ascii") + b":" + value)
+    elif isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(
+            (
+                f"T{tensor.dtype}:{tuple(tensor.shape)}:"
+            ).encode("ascii")
+        )
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    elif isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        digest.update(
+            f"A{array.dtype}:{array.shape}:".encode("ascii")
+        )
+        digest.update(array.tobytes())
+    elif isinstance(value, np.generic):
+        _update_huang2026_integrity_hash(digest, value.item())
+    elif isinstance(value, Mapping):
+        digest.update(b"M")
+        keys = sorted(
+            value,
+            key=lambda key: (type(key).__name__, repr(key)),
+        )
+        for key in keys:
+            if key == "integrity_sha256":
+                continue
+            _update_huang2026_integrity_hash(digest, key)
+            _update_huang2026_integrity_hash(digest, value[key])
+        digest.update(b"m")
+    elif isinstance(value, (tuple, list)):
+        digest.update(b"Q" if isinstance(value, tuple) else b"L")
+        for item in value:
+            _update_huang2026_integrity_hash(digest, item)
+        digest.update(b"q" if isinstance(value, tuple) else b"l")
+    else:
+        raise TypeError(
+            f"unsupported Huang checkpoint integrity value: {type(value).__name__}"
+        )
+
+
+def _huang2026_checkpoint_integrity(payload: Mapping[str, Any]) -> str:
+    digest = hashlib.sha256()
+    _update_huang2026_integrity_hash(digest, payload)
+    return digest.hexdigest()
+
+
+def _huang2026_batches_per_epoch(runtime_config: Mapping[str, Any]) -> int:
+    training = (
+        runtime_config["training"]
+        if isinstance(runtime_config.get("training"), Mapping)
+        else runtime_config
+    )
+    count = math.ceil(int(training["train_limit"]) / int(training["batch_size"]))
+    maximum = training["max_train_batches"]
+    return count if maximum is None else min(count, int(maximum))
+
+
+def _validate_huang2026_checkpoint_state(
+    checkpoint: Mapping[str, Any],
+    runtime_config: Mapping[str, Any],
+) -> None:
+    """Reject internally inconsistent positions, history, and tensor state."""
+
+    next_epoch = int(checkpoint["next_epoch"])
+    next_batch = int(checkpoint["next_batch_index"])
+    global_step = int(checkpoint["global_step"])
+    training = (
+        runtime_config["training"]
+        if isinstance(runtime_config.get("training"), Mapping)
+        else runtime_config
+    )
+    epochs = int(training["epochs"])
+    batches_per_epoch = _huang2026_batches_per_epoch(runtime_config)
+    if not 0 <= next_epoch <= epochs:
+        raise ValueError("invalid Huang checkpoint next_epoch")
+    if next_epoch == epochs:
+        if next_batch != 0:
+            raise ValueError("completed Huang checkpoint must have next_batch_index=0")
+        expected_step = epochs * batches_per_epoch
+    else:
+        if not 0 <= next_batch <= batches_per_epoch:
+            raise ValueError("invalid Huang checkpoint next_batch_index")
+        expected_step = next_epoch * batches_per_epoch + next_batch
+    if global_step != expected_step:
+        raise ValueError(
+            "Huang checkpoint global_step is inconsistent with epoch/batch position"
+        )
+
+    history = checkpoint.get("history")
+    if not isinstance(history, Sequence):
+        raise ValueError("Huang checkpoint history must be a sequence")
+    summaries = [
+        record
+        for record in history
+        if isinstance(record, Mapping)
+        and record.get("kind") == "epoch_summary"
+    ]
+    summary_epochs = [int(record["epoch"]) for record in summaries]
+    if summary_epochs != list(range(len(summary_epochs))):
+        raise ValueError("Huang checkpoint epoch summaries are not contiguous")
+    if len(summary_epochs) != next_epoch:
+        raise ValueError("Huang checkpoint epoch summaries do not match next_epoch")
+    history_state = checkpoint.get("history_state")
+    if not isinstance(history_state, Mapping) or int(
+        history_state.get("update_count", -1)
+    ) != global_step:
+        raise ValueError("Huang checkpoint history state does not match global_step")
+    current_count = int(history_state.get("current_epoch_count", -1))
+    current_epoch = int(history_state.get("current_epoch", -1))
+    if next_epoch == epochs or next_batch == 0:
+        if current_count != 0 or current_epoch != next_epoch:
+            raise ValueError("Huang checkpoint completed epoch accumulator is invalid")
+    elif current_epoch != next_epoch or current_count != next_batch:
+        raise ValueError("Huang checkpoint epoch accumulator is inconsistent")
+    if global_step > 0:
+        for name in ("first_loss", "last_loss"):
+            value = history_state.get(name)
+            if value is None or not math.isfinite(float(value)):
+                raise ValueError(f"Huang checkpoint history state {name} is invalid")
+
+    model_state = checkpoint.get("model_state")
+    if not isinstance(model_state, Mapping) or not model_state:
+        raise ValueError("Huang checkpoint model_state is missing")
+    for name, tensor in model_state.items():
+        if not isinstance(tensor, torch.Tensor) or not bool(
+            torch.isfinite(tensor).all()
+        ):
+            raise ValueError(f"Huang checkpoint model tensor {name!r} is invalid")
+
+
+def save_huang2026_checkpoint(
+    path: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    detector: DetectorResponse | None = None,
+    runtime_config: Mapping[str, Any],
+    next_epoch: int,
+    next_batch_index: int,
+    global_step: int,
+    history: Sequence[Mapping[str, Any]],
+    history_state: Mapping[str, Any] | None = None,
+    history_commit: Mapping[str, Any] | None = None,
+    training_reference: Mapping[str, Any] | None = None,
+    sample_records_commit: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically save an update-addressable Huang checkpoint."""
+
+    if min(next_epoch, next_batch_index, global_step) < 0:
+        raise ValueError("checkpoint positions must be non-negative")
+    payload = {
+        "protocol": HUANG2026_CHECKPOINT_PROTOCOL,
+        "resume_fingerprint": huang2026_resume_fingerprint(runtime_config),
+        "resume_contract": _huang2026_resume_contract(runtime_config),
+        "model_fingerprint": huang2026_model_fingerprint(runtime_config),
+        "model_contract": _huang2026_model_contract(runtime_config),
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "detector_state": (
+            detector.state_dict() if detector is not None else None
+        ),
+        "next_epoch": int(next_epoch),
+        "next_batch_index": int(next_batch_index),
+        "global_step": int(global_step),
+        "history": [dict(record) for record in history],
+        "history_state": (
+            dict(history_state)
+            if history_state is not None
+            else {
+                "update_count": int(global_step),
+                "first_loss": None,
+                "last_loss": None,
+                "current_epoch": int(next_epoch),
+                "current_epoch_count": 0,
+                "current_epoch_loss_sum": 0.0,
+                "current_epoch_loss_minimum": None,
+                "current_epoch_loss_maximum": None,
+            }
+        ),
+        "history_commit": (
+            dict(history_commit)
+            if history_commit is not None
+            else {
+                "byte_count": 0,
+                "record_count": 0,
+                "chain_sha256": "00" * 32,
+            }
+        ),
+        "training_reference": (
+            dict(training_reference) if training_reference is not None else {}
+        ),
+        "sample_records_commit": (
+            dict(sample_records_commit)
+            if sample_records_commit is not None
+            else {
+                "byte_count": 0,
+                "record_count": 0,
+                "chain_sha256": "00" * 32,
+            }
+        ),
+        "rng_state": _huang2026_rng_state(),
+    }
+    _validate_huang2026_checkpoint_state(payload, runtime_config)
+    payload["integrity_sha256"] = _huang2026_checkpoint_integrity(payload)
+    _atomic_torch_save(path, payload)
+    return payload
+
+
+def load_huang2026_checkpoint(
+    path: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    detector: DetectorResponse | None = None,
+    runtime_config: Mapping[str, Any],
+    restore_rng: bool,
+    strict_resume: bool = True,
+) -> dict[str, Any]:
+    """Load a Huang checkpoint and reject any incompatible resume contract."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Huang checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("Huang checkpoint must contain a mapping")
+    if checkpoint.get("protocol") != HUANG2026_CHECKPOINT_PROTOCOL:
+        raise ValueError("unsupported Huang checkpoint protocol")
+    recorded_integrity = checkpoint.get("integrity_sha256")
+    if (
+        not isinstance(recorded_integrity, str)
+        or recorded_integrity != _huang2026_checkpoint_integrity(checkpoint)
+    ):
+        raise ValueError("Huang checkpoint integrity validation failed")
+    if canonical_sha256(checkpoint.get("resume_contract")) != checkpoint.get(
+        "resume_fingerprint"
+    ):
+        raise ValueError("Huang checkpoint resume contract fingerprint is invalid")
+    if canonical_sha256(checkpoint.get("model_contract")) != checkpoint.get(
+        "model_fingerprint"
+    ):
+        raise ValueError("Huang checkpoint model contract fingerprint is invalid")
+    fingerprint_name = "resume_fingerprint" if strict_resume else "model_fingerprint"
+    expected_fingerprint = (
+        huang2026_resume_fingerprint(runtime_config)
+        if strict_resume
+        else huang2026_model_fingerprint(runtime_config)
+    )
+    if checkpoint.get(fingerprint_name) != expected_fingerprint:
+        raise ValueError(
+            "Huang checkpoint contract mismatch; use a compatible model binding"
+            if not strict_resume
+            else (
+                "Huang checkpoint resume contract mismatch; use the exact training "
+                "configuration and execution binding"
+            )
+        )
+    _validate_huang2026_checkpoint_state(
+        checkpoint,
+        checkpoint["resume_contract"],
+    )
+    model.load_state_dict(checkpoint["model_state"], strict=True)
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+    if detector is not None:
+        detector_state = checkpoint.get("detector_state")
+        if not isinstance(detector_state, Mapping):
+            raise ValueError("Huang checkpoint detector state is missing")
+        detector.load_state_dict(detector_state, strict=True)
+    if restore_rng:
+        _restore_huang2026_rng_state(checkpoint["rng_state"])
+    for name in ("next_epoch", "next_batch_index", "global_step"):
+        if int(checkpoint[name]) < 0:
+            raise ValueError(f"invalid Huang checkpoint {name}")
+    return dict(checkpoint)
+
+
+def _huang2026_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _huang2026_checkpoint_binding(
+    path: Path,
+    *,
+    source_kind: str,
+) -> dict[str, Any]:
+    """Bind an action to immutable checkpoint content without exposing paths."""
+
+    if source_kind not in {"shared_output_dir", "external_run_dir", "training_run"}:
+        raise ValueError("unknown Huang checkpoint source kind")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, Mapping) or checkpoint.get(
+        "integrity_sha256"
+    ) != _huang2026_checkpoint_integrity(checkpoint):
+        raise ValueError("Huang checkpoint binding failed integrity validation")
+    return {
+        "logical_name": "checkpoints/latest.pt",
+        "source_kind": source_kind,
+        "file_sha256": _huang2026_file_sha256(path),
+        "payload_integrity_sha256": checkpoint["integrity_sha256"],
+        "model_fingerprint": checkpoint["model_fingerprint"],
+        "resume_fingerprint": checkpoint["resume_fingerprint"],
+        "global_step": int(checkpoint["global_step"]),
+    }
+
+
+def _prepare_huang2026_output(output_dir: Path, *, resume: bool) -> None:
+    """Create an independent run tree without deleting a resumable run."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if resume:
+        if not (output_dir / "checkpoints" / "latest.pt").is_file():
+            raise FileNotFoundError("--resume requires checkpoints/latest.pt")
+        return
+    owned_files = (
+        "config.json",
+        "contract.json",
+        "source_config.json",
+        "history.json",
+        "manifest.json",
+        "metrics.json",
+        "sample_records.jsonl",
+        "resource_assessment.json",
+        "slm_encoding.json",
+        "control_metrics.json",
+        "misalignment_metrics.json",
+    )
+    occupied = [
+        output_dir / filename
+        for filename in owned_files
+        if (output_dir / filename).exists()
+    ]
+    for directory_name in ("checkpoints", "samples"):
+        directory = output_dir / directory_name
+        if directory.exists() and any(directory.iterdir()):
+            occupied.append(directory)
+    if occupied:
+        raise FileExistsError(
+            "Huang output directory already owns run artifacts; choose an "
+            "independent --output-dir or use --resume"
+        )
+    for dirname in ("checkpoints", "samples"):
+        (output_dir / dirname).mkdir(exist_ok=True)
+
+
+def _write_huang2026_sample_records(
+    path: Path,
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    """Atomically rewrite deterministic per-object optical metadata as JSONL."""
+
+    buffer = StringIO()
+    for record in records:
+        buffer.write(
+            json.dumps(
+                _huang2026_jsonable(record),
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
+        buffer.write("\n")
+    _atomic_write_huang2026_text(path, buffer.getvalue())
+
+
+def _huang2026_journal_line(record: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            _huang2026_jsonable(record),
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _huang2026_journal_chain(previous_hex: str, line: bytes) -> str:
+    if len(previous_hex) != 64:
+        raise ValueError("Huang journal chain must be a SHA256 hex digest")
+    digest = hashlib.sha256()
+    digest.update(bytes.fromhex(previous_hex))
+    digest.update(line)
+    return digest.hexdigest()
+
+
+def _append_huang2026_journal(
+    path: Path,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    previous_commit: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Append JSONL records with a rolling hash chain and durable byte position."""
+
+    expected_bytes = int(previous_commit["byte_count"])
+    expected_count = int(previous_commit["record_count"])
+    chain = str(previous_commit["chain_sha256"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current_size = path.stat().st_size if path.exists() else 0
+    if current_size != expected_bytes:
+        raise ValueError(
+            "Huang sample-record journal size changed outside the checkpoint protocol"
+        )
+    with path.open("ab") as handle:
+        for record in records:
+            line = _huang2026_journal_line(record)
+            handle.write(line)
+            chain = _huang2026_journal_chain(chain, line)
+            expected_count += 1
+        handle.flush()
+        os.fsync(handle.fileno())
+        byte_count = handle.tell()
+    return {
+        "byte_count": byte_count,
+        "record_count": expected_count,
+        "chain_sha256": chain,
+    }
+
+
+def _append_huang2026_sample_records(
+    path: Path,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    previous_commit: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _append_huang2026_journal(
+        path,
+        records,
+        previous_commit=previous_commit,
+    )
+
+
+def _restore_huang2026_history_journal(
+    path: Path,
+    *,
+    commit: Mapping[str, Any],
+    checkpoint_history: Sequence[Mapping[str, Any]],
+    global_step: int,
+) -> dict[str, Any]:
+    """Validate and trim the append-only update/epoch history journal."""
+
+    byte_count = int(commit["byte_count"])
+    record_count = int(commit["record_count"])
+    expected_chain = str(commit["chain_sha256"])
+    if not path.is_file() or path.stat().st_size < byte_count:
+        raise ValueError("Huang committed history journal is missing or truncated")
+    chain = "00" * 32
+    parsed_count = 0
+    expected_update_step = 0
+    parsed_summaries: list[dict[str, Any]] = []
+    with path.open("r+b") as handle:
+        committed = handle.read(byte_count)
+        if len(committed) != byte_count or (
+            committed and not committed.endswith(b"\n")
+        ):
+            raise ValueError("Huang committed history prefix is incomplete")
+        for raw_line in committed.splitlines(keepends=True):
+            try:
+                record = json.loads(raw_line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("Huang history journal contains invalid JSON") from error
+            kind = record.get("kind")
+            if kind == "update":
+                if int(record.get("global_step", -1)) != expected_update_step:
+                    raise ValueError("Huang history update steps are not contiguous")
+                expected_update_step += 1
+            elif kind == "epoch_summary":
+                parsed_summaries.append(record)
+            else:
+                raise ValueError("Huang history journal contains an unknown record kind")
+            chain = _huang2026_journal_chain(chain, raw_line)
+            parsed_count += 1
+        if (
+            parsed_count != record_count
+            or chain != expected_chain
+            or expected_update_step != global_step
+            or parsed_summaries
+            != [dict(record) for record in checkpoint_history]
+        ):
+            raise ValueError("Huang history journal integrity validation failed")
+        if path.stat().st_size > byte_count:
+            handle.truncate(byte_count)
+            handle.flush()
+            os.fsync(handle.fileno())
+    return {
+        "byte_count": byte_count,
+        "record_count": record_count,
+        "chain_sha256": chain,
+    }
+
+
+def _huang2026_expected_training_records(
+    runtime_config: Mapping[str, Any],
+    *,
+    global_step: int,
+) -> Iterator[tuple[int, int]]:
+    training = runtime_config["training"]
+    batch_size = int(training["batch_size"])
+    sample_count = int(training["train_limit"])
+    batches_per_epoch = _huang2026_batches_per_epoch(runtime_config)
+    emitted_steps = 0
+    epoch = 0
+    while emitted_steps < global_step:
+        order = huang2026_epoch_order(
+            sample_count=sample_count,
+            seed=int(runtime_config["seed"]),
+            epoch=epoch,
+        )
+        for batch_index in range(batches_per_epoch):
+            if emitted_steps >= global_step:
+                break
+            start = batch_index * batch_size
+            for object_id in order[start : start + batch_size]:
+                yield emitted_steps, int(object_id)
+            emitted_steps += 1
+        epoch += 1
+
+
+def _restore_huang2026_sample_record_journal(
+    path: Path,
+    *,
+    commit: Mapping[str, Any],
+    runtime_config: Mapping[str, Any],
+    dataset: Huang2026VisibleDataset,
+    global_step: int,
+) -> dict[str, Any]:
+    """Verify the committed prefix and discard only uncommitted crash-tail bytes."""
+
+    byte_count = int(commit["byte_count"])
+    record_count = int(commit["record_count"])
+    expected_chain = str(commit["chain_sha256"])
+    if global_step == 0 and byte_count == 0:
+        if path.exists() and path.stat().st_size:
+            with path.open("r+b") as handle:
+                handle.truncate(0)
+                handle.flush()
+                os.fsync(handle.fileno())
+        return {
+            "byte_count": 0,
+            "record_count": 0,
+            "chain_sha256": "00" * 32,
+        }
+    if not path.is_file() or path.stat().st_size < byte_count:
+        raise ValueError("Huang committed sample-record journal is missing or truncated")
+    training = runtime_config["training"]
+    batch_size = int(training["batch_size"])
+    sample_count = int(training["train_limit"])
+    batches_per_epoch = _huang2026_batches_per_epoch(runtime_config)
+    batch_sizes = [
+        min(batch_size, sample_count - batch_index * batch_size)
+        for batch_index in range(batches_per_epoch)
+    ]
+    complete_epochs, partial_batches = divmod(global_step, batches_per_epoch)
+    expected_record_count = (
+        complete_epochs * sum(batch_sizes)
+        + sum(batch_sizes[:partial_batches])
+    )
+    if expected_record_count != record_count:
+        raise ValueError(
+            "Huang sample-record count is inconsistent with checkpoint position"
+        )
+    expected_records = _huang2026_expected_training_records(
+        runtime_config,
+        global_step=global_step,
+    )
+    chain = "00" * 32
+    parsed_count = 0
+    with path.open("r+b") as handle:
+        committed = handle.read(byte_count)
+        if len(committed) != byte_count or (
+            committed and not committed.endswith(b"\n")
+        ):
+            raise ValueError("Huang committed sample-record prefix is incomplete")
+        for raw_line in committed.splitlines(keepends=True):
+            try:
+                record = json.loads(raw_line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("Huang sample-record journal contains invalid JSON") from error
+            try:
+                expected_step, expected_object_id = next(expected_records)
+            except StopIteration as error:
+                raise ValueError(
+                    "Huang sample-record journal contains duplicate records"
+                ) from error
+            if (
+                int(record.get("global_step", -1)) != expected_step
+                or int(record.get("iteration", -1)) != expected_step
+                or int(record.get("object_id", -1)) != expected_object_id
+                or record.get("split") != "train"
+            ):
+                raise ValueError(
+                    "Huang sample-record journal does not match deterministic order"
+                )
+            expected_seed = dataset.diffuser_sampler.seed_for(
+                iteration=expected_step,
+                object_id=expected_object_id,
+            )
+            if int(record.get("diffuser_seed", -1)) != expected_seed:
+                raise ValueError("Huang sample-record diffuser seed is inconsistent")
+            chain = _huang2026_journal_chain(chain, raw_line)
+            parsed_count += 1
+        if parsed_count != record_count or chain != expected_chain:
+            raise ValueError("Huang sample-record journal integrity validation failed")
+        try:
+            next(expected_records)
+        except StopIteration:
+            pass
+        else:
+            raise ValueError("Huang sample-record journal is missing committed records")
+        if path.stat().st_size > byte_count:
+            handle.truncate(byte_count)
+            handle.flush()
+            os.fsync(handle.fileno())
+    return {
+        "byte_count": byte_count,
+        "record_count": record_count,
+        "chain_sha256": chain,
+    }
+
+
+def _atomic_write_huang2026_text(path: Path, contents: str) -> None:
+    """Small shared atomic text writer kept outside every frozen Luo contract."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+        raise
+
+
+def _build_huang2026_datasets(
+    runtime_config: Mapping[str, Any],
+) -> tuple[Huang2026VisibleDataset, Huang2026VisibleDataset]:
+    """Build online train/blind-test MNIST datasets without optical materialization."""
+
+    train_limit = int(runtime_config["training"]["train_limit"])
+    eval_limit = int(runtime_config["training"]["eval_limit"])
+    train_base = build_torchvision_dataset(
+        name="MNIST",
+        root=DEFAULT_DATA_ROOT,
+        train=True,
+        image_size=28,
+        download=bool(runtime_config["download"]),
+    )
+    eval_base = build_torchvision_dataset(
+        name="MNIST",
+        root=DEFAULT_DATA_ROOT,
+        train=False,
+        image_size=28,
+        download=bool(runtime_config["download"]),
+    )
+    train_base = Subset(train_base, range(min(train_limit, len(train_base))))
+    eval_base = Subset(eval_base, range(min(eval_limit, len(eval_base))))
+    wavelengths = tuple(float(value) * 1e-9 for value in runtime_config["wavelengths_nm"])
+    field_shape = tuple(int(value) for value in runtime_config["field_shape"])
+    common = {
+        "base_seed": int(runtime_config["seed"]),
+        "input_shape": (28, 28),
+        "resized_shape": tuple(int(value) for value in runtime_config["resized_shape"]),
+        "canvas_shape": field_shape,
+        "illumination_mode": str(runtime_config["mode"]),
+        "wavelengths": wavelengths,
+        "correlation_length_pixels": float(
+            runtime_config["diffuser"]["correlation_length_pixels"]
+        ),
+    }
+    coherence_length = float(runtime_config["coherence"]["coherence_length_pixels"])
+    train_coherence = (
+        Huang2026CoherenceSampler(
+            field_shape,
+            split="train",
+            base_seed=int(runtime_config["seed"]),
+            coherence_length_pixels=coherence_length,
+        )
+        if runtime_config["mode"] == "incoherent"
+        else None
+    )
+    eval_coherence = (
+        Huang2026CoherenceSampler(
+            field_shape,
+            split="blind_test",
+            base_seed=int(runtime_config["seed"]),
+            coherence_length_pixels=coherence_length,
+        )
+        if runtime_config["mode"] == "incoherent"
+        else None
+    )
+    return (
+        Huang2026VisibleDataset(
+            train_base,
+            split="train",
+            coherence_sampler=train_coherence,
+            **common,
+        ),
+        Huang2026VisibleDataset(
+            eval_base,
+            split="blind_test",
+            coherence_sampler=eval_coherence,
+            **common,
+        ),
+    )
+
+
+def _huang2026_batch_records(
+    dataset: Huang2026VisibleDataset,
+    indices: Sequence[int],
+    *,
+    iteration: int,
+) -> dict[str, Any]:
+    records = [dataset.sample_at(int(index), iteration=iteration) for index in indices]
+    if not records:
+        raise ValueError("Huang batch must contain at least one object")
+    tensor_keys = (
+        "amplitude",
+        "target_intensity",
+        "label",
+        "object_id",
+        "iteration",
+        "diffuser_seed",
+        "correlation_length_pixels",
+        "diffuser_correlation_length_pixels",
+        "wavelengths_m",
+    )
+    batch: dict[str, Any] = {}
+    for key in tensor_keys:
+        values = [record[key] for record in records]
+        batch[key] = torch.stack(values, dim=0)
+    batch["illumination_mode"] = [record["illumination_mode"] for record in records]
+    batch["metadata"] = [dict(record["metadata"]) for record in records]
+    if "coherence_seed" in records[0]:
+        batch["coherence_seed"] = torch.stack(
+            [record["coherence_seed"] for record in records],
+            dim=0,
+        )
+        batch["coherence_length_pixels"] = torch.stack(
+            [record["coherence_length_pixels"] for record in records],
+            dim=0,
+        )
+    return batch
+
+
+def _huang2026_sample_metadata_rows(
+    batch: Mapping[str, Any],
+    *,
+    global_step: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for metadata in batch["metadata"]:
+        row = dict(metadata)
+        row["global_step"] = int(global_step)
+        rows.append(row)
+    return rows
+
+
+def _huang2026_complex_field(
+    amplitude: torch.Tensor,
+    *,
+    device: torch.device,
+    complex_dtype: torch.dtype,
+) -> torch.Tensor:
+    if amplitude.ndim != 4 or amplitude.shape[1] != 1:
+        raise ValueError("Huang amplitude batch must have shape (B,1,H,W)")
+    real_dtype = torch.float64 if complex_dtype == torch.complex128 else torch.float32
+    real = amplitude[:, 0].to(device=device, dtype=real_dtype)
+    return torch.complex(real, torch.zeros_like(real)).to(dtype=complex_dtype)
+
+
+def _huang2026_complex_dtype(runtime_config: Mapping[str, Any]) -> torch.dtype:
+    name = str(runtime_config["numerics"]["complex_dtype"]).lower()
+    if name == "complex64":
+        return torch.complex64
+    if name == "complex128":
+        return torch.complex128
+    raise ValueError("Huang complex_dtype must be complex64 or complex128")
+
+
+def _huang2026_optics_config(
+    runtime_config: Mapping[str, Any],
+    *,
+    wavelength_m: float | None = None,
+) -> Huang2026VisibleOpticsConfig:
+    geometry = runtime_config["geometry"]
+    if not isinstance(geometry, Mapping) or not geometry:
+        raise ValueError("Huang runtime geometry profile is incomplete")
+    adjacent = geometry["adjacent_layer_distances_m"]
+    optics = Huang2026VisibleOpticsConfig(
+        field_shape=tuple(int(value) for value in runtime_config["field_shape"]),
+        wavelength=float(
+            wavelength_m
+            if wavelength_m is not None
+            else float(runtime_config["wavelengths_nm"][0]) * 1e-9
+        ),
+        pixel_size=float(runtime_config["pixel_pitch_m"]),
+        object_to_diffuser_distance=float(geometry["object_to_diffuser_m"]),
+        diffuser_to_first_layer_distance=float(
+            geometry["diffuser_to_first_layer_m"]
+        ),
+        layer_distances=tuple(float(value) for value in adjacent),
+        last_layer_to_detector_distance=float(
+            geometry["last_layer_to_detector_m"]
+        ),
+        lens_focal_length=float(geometry["lens_focal_length_m"]),
+        num_layers=int(runtime_config["d2nn"]["layers"]),
+        pad_factor=int(runtime_config["numerics"]["asm_pad_factor"]),
+        geometry_profile=(
+            "paper_consistent_default"
+            if runtime_config["geometry_profile"] == "paper_default"
+            else str(runtime_config["geometry_profile"])
+        ),
+    )
+    configured_total = float(geometry["total_path_m"])
+    if not math.isclose(
+        optics.total_optical_path,
+        configured_total,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("Huang geometry total_path_m does not match its segments")
+    lens_total = 4.0 * optics.lens_focal_length
+    if runtime_config["geometry_profile"] == "paper_default" and not math.isclose(
+        optics.total_optical_path,
+        lens_total,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("Huang paper_default path must match the published 4f control")
+    if runtime_config[
+        "geometry_profile"
+    ] == "supplement_typo_sensitivity" and math.isclose(
+        optics.total_optical_path,
+        lens_total,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("Huang typo sensitivity must remain distinct from the 4f path")
+    return optics
+
+
+def _huang2026_diffuser(
+    runtime_config: Mapping[str, Any],
+) -> CorrelatedHeightPhaseDiffuser:
+    values = runtime_config["diffuser"]
+    config = Huang2026DiffuserConfig(
+        field_shape=tuple(int(value) for value in runtime_config["field_shape"]),
+        pixel_size=float(runtime_config["pixel_pitch_m"]),
+        refractive_index=float(values["refractive_index"]),
+        refractive_index_difference=float(values["refractive_index_difference"]),
+        height_mean=float(values["height_mean_m"]),
+        height_std=float(values["height_std_m"]),
+        correlation_length=(
+            float(values["correlation_length_pixels"])
+            * float(runtime_config["pixel_pitch_m"])
+        ),
+        gaussian_truncate=float(values["gaussian_kernel_truncate_sigma"]),
+        boundary=str(values["gaussian_boundary"]),
+    )
+    return CorrelatedHeightPhaseDiffuser(config)
+
+
+def _huang2026_slm_response(
+    runtime_config: Mapping[str, Any],
+) -> SLMPhaseResponse:
+    slm = runtime_config["slm"]
+    quantization = slm.get("phase_quantization_levels")
+    phase_range = slm.get("phase_range_rad")
+    lut_payload = slm.get("phase_lut")
+    lut: dict[float, tuple[Sequence[float], Sequence[float]]] | None = None
+    if isinstance(lut_payload, Mapping):
+        lut = {}
+        for wavelength_key, record in lut_payload.items():
+            if str(wavelength_key).endswith("_evidence"):
+                continue
+            if not isinstance(record, Mapping):
+                raise ValueError("SLM LUT records must be mappings")
+            wavelength_m = float(wavelength_key)
+            if wavelength_m > 1e-5:
+                wavelength_m *= 1e-9
+            lut[wavelength_m] = (record["drive"], record["phase_rad"])
+    abrupt_enabled = bool(slm.get("abrupt_phase_jump_error", False))
+    return SLMPhaseResponse(
+        reference_wavelength=float(
+            slm.get("reference_wavelength_nm", 660.0)
+        )
+        * 1e-9,
+        lut=lut,
+        phase_quantization_levels=(
+            None if quantization is None else int(quantization)
+        ),
+        phase_range=(
+            None
+            if phase_range is None
+            else (float(phase_range[0]), float(phase_range[1]))
+        ),
+        spatial_smoothing_sigma_pixels=float(
+            slm.get("spatial_smoothing_sigma_pixels", 0.0)
+        ),
+        abrupt_jump_threshold=(
+            float(slm.get("abrupt_phase_jump_threshold_rad", math.pi))
+            if abrupt_enabled
+            else None
+        ),
+        abrupt_jump_strength=(
+            float(slm.get("abrupt_phase_jump_strength", 0.5))
+            if abrupt_enabled
+            else 0.0
+        ),
+    )
+
+
+def _huang2026_detector_response(
+    runtime_config: Mapping[str, Any],
+) -> DetectorResponse:
+    detector = runtime_config["detector"]
+    return DetectorResponse(
+        shot_noise=bool(detector.get("shot_noise", False)),
+        read_noise_std=float(detector.get("read_noise_std", 0.0)),
+        gain=float(detector.get("gain", 1.0)),
+        saturation=(
+            None
+            if detector.get("saturation") is None
+            else float(detector["saturation"])
+        ),
+        transmission=float(detector.get("transmission", 1.0)),
+        seed=int(runtime_config["seed"]) + 4301,
+    )
+
+
+def _build_huang2026_model(
+    runtime_config: Mapping[str, Any],
+) -> torch.nn.Module:
+    optics = _huang2026_optics_config(runtime_config)
+    phase_initialization = str(runtime_config["d2nn"]["phase_initialization"])
+    phase_seed = int(runtime_config["seed"]) + 1709
+    response = _huang2026_slm_response(runtime_config)
+    delta_n = float(runtime_config["diffuser"]["refractive_index_difference"])
+    if runtime_config["mode"] == "multiwavelength":
+        return Huang2026MultiWavelengthDONN(
+            optics,
+            wavelengths=tuple(
+                float(value) * 1e-9 for value in runtime_config["wavelengths_nm"]
+            ),
+            phase_initialization=phase_initialization,
+            phase_seed=phase_seed,
+            slm_response=response,
+            refractive_index_difference=delta_n,
+        )
+    coherent = Huang2026ThreeLayerDONN(
+        optics,
+        phase_initialization=phase_initialization,
+        phase_seed=phase_seed,
+        slm_response=response,
+        refractive_index_difference=delta_n,
+    )
+    if runtime_config["mode"] == "incoherent":
+        return Huang2026IncoherentDONN(coherent)
+    return coherent
+
+
+def _huang2026_phase_parameter(model: torch.nn.Module) -> torch.nn.Parameter:
+    if isinstance(model, Huang2026IncoherentDONN):
+        return model.coherent_model.phase
+    phase = getattr(model, "phase", None)
+    if not isinstance(phase, torch.nn.Parameter):
+        raise TypeError("Huang model does not expose its shared phase parameter")
+    return phase
+
+
+def _huang2026_coherence_screens(
+    dataset: Huang2026VisibleDataset,
+    batch: Mapping[str, Any],
+    *,
+    iteration: int,
+    nr: int,
+    start_realization: int = 0,
+    device: torch.device,
+    complex_dtype: torch.dtype,
+) -> torch.Tensor:
+    sampler = dataset.coherence_sampler
+    if sampler is None:
+        raise ValueError("incoherent dataset is missing a coherence sampler")
+    screens = [
+        sampler.sample_ensemble(
+            iteration=iteration,
+            object_id=int(object_id),
+            num_realizations=nr,
+            start_realization=start_realization,
+            device=device,
+            dtype=complex_dtype,
+        )
+        for object_id in batch["object_id"].detach().cpu().tolist()
+    ]
+    return torch.stack(screens, dim=0)
+
+
+def _huang2026_forward_batch(
+    model: torch.nn.Module,
+    dataset: Huang2026VisibleDataset,
+    batch: Mapping[str, Any],
+    runtime_config: Mapping[str, Any],
+    *,
+    iteration: int,
+    device: torch.device,
+    diffuser: CorrelatedHeightPhaseDiffuser,
+    detector: DetectorResponse,
+    misalignment: MisalignmentTransform | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    complex_dtype = _huang2026_complex_dtype(runtime_config)
+    object_field = _huang2026_complex_field(
+        batch["amplitude"],
+        device=device,
+        complex_dtype=complex_dtype,
+    )
+    target = batch["target_intensity"][:, 0].to(
+        device=device,
+        dtype=object_field.real.dtype,
+    )
+    heights = diffuser.sample_height(
+        batch["diffuser_seed"],
+        device=device,
+        dtype=object_field.real.dtype,
+    )
+    if isinstance(model, Huang2026IncoherentDONN):
+        def _generate_screens(start: int, count: int) -> torch.Tensor:
+            return _huang2026_coherence_screens(
+                dataset,
+                batch,
+                iteration=iteration,
+                nr=count,
+                start_realization=start,
+                device=device,
+                complex_dtype=complex_dtype,
+            )
+
+        output = model.forward_from_screen_generator(
+            object_field,
+            heights,
+            num_realizations=int(runtime_config["coherence"]["nr"]),
+            chunk_size=int(runtime_config["coherence"]["chunk_size"]),
+            screen_generator=_generate_screens,
+            misalignment=misalignment,
+            detector=detector,
+        )
+    elif isinstance(model, Huang2026MultiWavelengthDONN):
+        output = model(
+            object_field,
+            heights,
+            misalignment=misalignment,
+            detector=detector,
+        )
+    elif isinstance(model, Huang2026ThreeLayerDONN):
+        output = model(
+            object_field,
+            heights,
+            misalignment=misalignment,
+            detector=detector,
+        )
+    else:
+        raise TypeError("unsupported Huang model")
+    return output, target, object_field, heights
+
+
+def _huang2026_loss(
+    output: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    if mode == "coherent":
+        return huang2026_intensity_mse(output, target)
+    if mode == "incoherent":
+        return huang2026_incoherent_mse(
+            output,
+            target,
+            input_is_ensemble=False,
+        )
+    if mode == "multiwavelength":
+        return huang2026_multiwavelength_mse(output, target)
+    raise ValueError("unknown Huang mode")
+
+
+def _huang2026_primary_output(output: torch.Tensor) -> torch.Tensor:
+    if output.ndim == 4:
+        return output[:, 0]
+    if output.ndim != 3:
+        raise ValueError("Huang output must have shape (B,H,W) or (B,W,H,W)")
+    return output
+
+
+def _save_huang2026_sample_grid(
+    output_path: Path,
+    *,
+    target: torch.Tensor,
+    corrupted: torch.Tensor,
+    reconstruction: torch.Tensor,
+) -> None:
+    primary = _huang2026_primary_output(reconstruction)
+    save_coherent_grid(
+        [
+            ("clean target", target[:, None]),
+            ("corrupted intensity", corrupted[:, None]),
+            ("reconstruction", primary[:, None]),
+            ("absolute error", (primary - target).abs()[:, None]),
+        ],
+        output_path,
+    )
+
+
+def evaluate_huang2026_model(
+    model: torch.nn.Module,
+    dataset: Huang2026VisibleDataset,
+    runtime_config: Mapping[str, Any],
+    *,
+    device: torch.device,
+    diffuser: CorrelatedHeightPhaseDiffuser,
+    detector: DetectorResponse,
+    output_dir: Path | None = None,
+    misalignment: MisalignmentTransform | None = None,
+    misalignment_label: str = "ideal",
+) -> dict[str, Any]:
+    """Evaluate image-level PCC and every configured Huang grouping."""
+
+    model.eval()
+    batch_size = int(runtime_config["training"]["batch_size"])
+    max_batches = runtime_config["training"]["max_eval_batches"]
+    indices = list(range(len(dataset)))
+    batches = [
+        indices[start : start + batch_size]
+        for start in range(0, len(indices), batch_size)
+    ]
+    if max_batches is not None:
+        batches = batches[: int(max_batches)]
+    pcc_values: list[float] = []
+    diffuser_seeds: list[int] = []
+    correlation_lengths: list[float] = []
+    wavelengths: list[float] = []
+    illumination_modes: list[str] = []
+    misalignments: list[str] = []
+    weighted_loss_sum = 0.0
+    loss_object_count = 0
+    evaluation_records: list[dict[str, Any]] = []
+    sample_payload: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Mapping[str, Any],
+        int,
+        Mapping[str, torch.Tensor],
+    ] | None = None
+    with torch.no_grad():
+        for _batch_index, object_indices in enumerate(batches):
+            # One fixed blind-test namespace keeps a given object/diffuser pair
+            # invariant to evaluation batch size and chunk boundaries.
+            iteration = 1_000_000_000
+            batch = _huang2026_batch_records(
+                dataset,
+                object_indices,
+                iteration=iteration,
+            )
+            sample_detector_state = (
+                {
+                    name: value.detach().clone()
+                    for name, value in detector.state_dict().items()
+                }
+                if sample_payload is None
+                else {}
+            )
+            for metadata in batch["metadata"]:
+                record = dict(metadata)
+                record["misalignment"] = misalignment_label
+                evaluation_records.append(record)
+            output, target, object_field, heights = _huang2026_forward_batch(
+                model,
+                dataset,
+                batch,
+                runtime_config,
+                iteration=iteration,
+                device=device,
+                diffuser=diffuser,
+                detector=detector,
+                misalignment=misalignment,
+            )
+            loss = _huang2026_loss(
+                output,
+                target,
+                mode=str(runtime_config["mode"]),
+            )
+            weighted_loss_sum += float(loss) * len(object_indices)
+            loss_object_count += len(object_indices)
+            if output.ndim == 4:
+                wavelength_count = output.shape[1]
+                expanded_target = target[:, None].expand_as(output)
+                pcc = huang2026_pcc_per_image(
+                    output.flatten(0, 1),
+                    expanded_target.flatten(0, 1),
+                )
+                pcc_values.extend(float(value) for value in pcc.detach().cpu())
+                for object_offset, seed in enumerate(
+                    batch["diffuser_seed"].detach().cpu().tolist()
+                ):
+                    for wavelength_nm in runtime_config["wavelengths_nm"]:
+                        diffuser_seeds.append(int(seed))
+                        correlation_lengths.append(
+                            float(runtime_config["diffuser"]["correlation_length_pixels"])
+                        )
+                        wavelengths.append(float(wavelength_nm))
+                        illumination_modes.append(str(runtime_config["mode"]))
+                        misalignments.append(misalignment_label)
+                assert len(object_indices) * wavelength_count == int(pcc.numel())
+            else:
+                pcc = huang2026_pcc_per_image(output, target)
+                pcc_values.extend(float(value) for value in pcc.detach().cpu())
+                diffuser_seeds.extend(
+                    int(value)
+                    for value in batch["diffuser_seed"].detach().cpu().tolist()
+                )
+                correlation_lengths.extend(
+                    [
+                        float(runtime_config["diffuser"]["correlation_length_pixels"])
+                    ]
+                    * len(object_indices)
+                )
+                wavelengths.extend(
+                    [float(runtime_config["wavelengths_nm"][0])] * len(object_indices)
+                )
+                illumination_modes.extend(
+                    [str(runtime_config["mode"])] * len(object_indices)
+                )
+                misalignments.extend([misalignment_label] * len(object_indices))
+            if sample_payload is None:
+                sample_payload = (
+                    target,
+                    output,
+                    object_field,
+                    heights,
+                    batch,
+                    iteration,
+                    sample_detector_state,
+                )
+
+    if not pcc_values:
+        raise ValueError("Huang evaluation produced no images")
+    grouped = huang2026_grouped_statistics(
+        pcc_values,
+        diffuser_seeds=diffuser_seeds,
+        correlation_lengths=correlation_lengths,
+        wavelengths=wavelengths,
+        illumination_modes=illumination_modes,
+        misalignments=misalignments,
+    )
+    result = {
+        "metric": "per_image_pcc",
+        "loss": {
+            "aggregation": "object_count_weighted_mean_of_batch_loss",
+            "mean": weighted_loss_sum / loss_object_count,
+            "object_count": loss_object_count,
+        },
+        "pcc": grouped,
+        "image_channel_count": len(pcc_values),
+        "object_count": loss_object_count,
+        "misalignment": misalignment_label,
+    }
+    if output_dir is not None and sample_payload is not None:
+        (
+            target,
+            output,
+            object_field,
+            heights,
+            sample_batch,
+            sample_iteration,
+            sample_detector_state,
+        ) = sample_payload
+        direct = VisibleDirectPropagationOperator(
+            _huang2026_optics_config(runtime_config),
+            refractive_index_difference=float(
+                runtime_config["diffuser"]["refractive_index_difference"]
+            ),
+        ).to(device)
+        final_detector_state = {
+            name: value.detach().clone()
+            for name, value in detector.state_dict().items()
+        }
+        detector.load_state_dict(sample_detector_state, strict=True)
+        try:
+            corrupted = _huang2026_control_operator_output(
+                direct,
+                object_field=object_field,
+                diffuser_height=heights,
+                dataset=dataset,
+                batch=sample_batch,
+                runtime_config=runtime_config,
+                iteration=sample_iteration,
+                device=device,
+                detector=detector,
+            )
+        finally:
+            detector.load_state_dict(final_detector_state, strict=True)
+        _save_huang2026_sample_grid(
+            output_dir / "samples" / f"{misalignment_label}_evaluation.png",
+            target=target,
+            corrupted=corrupted,
+            reconstruction=output,
+        )
+        records_name = f"{misalignment_label}_evaluation_sample_records.jsonl"
+        _write_huang2026_sample_records(
+            output_dir / records_name,
+            evaluation_records,
+        )
+        result["sample_records"] = records_name
+        result["sample_panel_condition"] = {
+            "mode": runtime_config["mode"],
+            "nr": (
+                int(runtime_config["coherence"]["nr"])
+                if runtime_config["mode"] == "incoherent"
+                else 1
+            ),
+            "displayed_wavelength_nm": float(
+                runtime_config["wavelengths_nm"][0]
+            ),
+            "multiwavelength_display_policy": (
+                "first configured wavelength"
+                if runtime_config["mode"] == "multiwavelength"
+                else "not_applicable"
+            ),
+        }
+    return result
+
+
+def _huang2026_manifest(
+    runtime_config: Mapping[str, Any],
+    *,
+    action: str,
+    artifacts: Mapping[str, Any],
+    phase_update_norm: float | None = None,
+) -> dict[str, Any]:
+    recorded_runtime = _huang2026_jsonable(runtime_config)
+    if isinstance(recorded_runtime, dict):
+        # ``--resume`` is invocation state, not part of the scientific run
+        # binding. Keeping the canonical value makes resumed and uninterrupted
+        # completion manifests byte-for-byte comparable with config.json.
+        recorded_runtime["resume"] = False
+    return {
+        "schema_version": 1,
+        "protocol": HUANG2026_RUN_PROTOCOL,
+        "profile_id": HUANG2026_PROFILE_ID,
+        "status_label": runtime_config["status_label"],
+        "action": action,
+        "mode": runtime_config["mode"],
+        "source_contract_sha256": runtime_config["source_contract_sha256"],
+        "runtime": recorded_runtime,
+        "phase_update_norm": phase_update_norm,
+        "artifacts": _huang2026_jsonable(artifacts),
+        "paper_equations": {
+            "diffuser": ["main_1", "main_2"],
+            "propagation": ["main_3", "main_4", "main_5", "main_6", "main_7"],
+            "coherence": ["main_8", "main_9", "main_10", "S1", "S7", "S8", "S13"],
+            "loss": ["main_11", "S11", "S14", "S24"],
+            "backpropagation": ["S12", "S15"],
+            "pcc": ["main_12"],
+            "lens": ["S16", "S17"],
+            "slm_encoding": ["S18"],
+            "misalignment": ["S19", "Note_S7"],
+            "multiwavelength": ["S22", "S23", "S24", "S25", "S26", "S27"],
+        },
+        "physical_effects_included": [
+            "scalar coherent angular-spectrum propagation",
+            "wavelength-dependent thin random-height phase diffuser",
+            "three trainable phase-only layers",
+            "raw detector intensity",
+            "online diffuser generation with disjoint train/blind-test seeds",
+            (
+                "Gaussian-Schell complex-screen intensity ensemble"
+                if runtime_config["mode"] == "incoherent"
+                else "single coherent realization"
+            ),
+            (
+                "separate visible-wavelength propagation channels"
+                if runtime_config["mode"] == "multiwavelength"
+                else "single visible wavelength"
+            ),
+        ],
+        "physical_effects_omitted_or_disabled": [
+            "volumetric multiple scattering",
+            "polarization",
+            "measured numeric SLM response LUT",
+            "hardware calibration",
+            "fabrication tolerances",
+            "detector noise unless explicitly configured",
+            "misalignment unless explicitly assessed",
+        ],
+        "claim_boundary": "numerical reproduction-inspired baseline; not a hardware reproduction",
+        "repository": run_metadata(),
+    }
+
+
+def _huang2026_fixed_probe_loss(
+    model: torch.nn.Module,
+    dataset: Huang2026VisibleDataset,
+    runtime_config: Mapping[str, Any],
+    *,
+    device: torch.device,
+    diffuser: CorrelatedHeightPhaseDiffuser,
+    detector: DetectorResponse,
+) -> float:
+    count = min(int(runtime_config["training"]["batch_size"]), len(dataset))
+    batch = _huang2026_batch_records(
+        dataset,
+        list(range(count)),
+        iteration=3_000_000_000,
+    )
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        output, target, _field, _height = _huang2026_forward_batch(
+            model,
+            dataset,
+            batch,
+            runtime_config,
+            iteration=3_000_000_000,
+            device=device,
+            diffuser=diffuser,
+            detector=detector,
+        )
+        loss = _huang2026_loss(
+            output,
+            target,
+            mode=str(runtime_config["mode"]),
+        )
+    model.train(was_training)
+    return float(loss.detach().cpu())
+
+
+def train_huang2026_model(
+    runtime_config: Mapping[str, Any],
+    *,
+    contract: Mapping[str, Any],
+    config_path: Path,
+    output_dir: Path,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Train with the Supporting (S12) phase-gradient chain and strict resume.
+
+    PyTorch autograd differentiates the detector-intensity MSE through every
+    complex propagation and phase-only layer before the configured Adam step.
+    """
+
+    _prepare_huang2026_output(output_dir, resume=bool(runtime_config["resume"]))
+    seed_everything(int(runtime_config["seed"]))
+    train_dataset, eval_dataset = _build_huang2026_datasets(runtime_config)
+    model = _build_huang2026_model(runtime_config).to(device)
+    optimizer_name = str(runtime_config["training"]["optimizer"]).lower()
+    if optimizer_name != "adam":
+        raise ValueError("the current Huang runtime supports the configured Adam optimizer")
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(runtime_config["training"]["learning_rate"]),
+    )
+    diffuser = _huang2026_diffuser(runtime_config).to(device)
+    detector = _huang2026_detector_response(runtime_config).to(device)
+    phase = _huang2026_phase_parameter(model)
+    checkpoint_path = output_dir / "checkpoints" / "latest.pt"
+    records_path = output_dir / "sample_records.jsonl"
+    history_path = output_dir / "history.jsonl"
+    history: list[dict[str, Any]] = []
+    history_state: dict[str, Any] = {
+        "update_count": 0,
+        "first_loss": None,
+        "last_loss": None,
+        "current_epoch": 0,
+        "current_epoch_count": 0,
+        "current_epoch_loss_sum": 0.0,
+        "current_epoch_loss_minimum": None,
+        "current_epoch_loss_maximum": None,
+    }
+    history_commit: dict[str, Any] = {
+        "byte_count": 0,
+        "record_count": 0,
+        "chain_sha256": "00" * 32,
+    }
+    pending_history_records: list[dict[str, Any]] = []
+    pending_sample_records: list[dict[str, Any]] = []
+    sample_records_commit: dict[str, Any] = {
+        "byte_count": 0,
+        "record_count": 0,
+        "chain_sha256": "00" * 32,
+    }
+    start_epoch = 0
+    start_batch_index = 0
+    global_step = 0
+    training_reference: dict[str, Any]
+    if runtime_config["resume"]:
+        checkpoint = load_huang2026_checkpoint(
+            checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            detector=detector,
+            runtime_config=runtime_config,
+            restore_rng=True,
+        )
+        start_epoch = int(checkpoint["next_epoch"])
+        start_batch_index = int(checkpoint["next_batch_index"])
+        global_step = int(checkpoint["global_step"])
+        history = [dict(record) for record in checkpoint["history"]]
+        history_state = dict(checkpoint["history_state"])
+        history_commit = _restore_huang2026_history_journal(
+            history_path,
+            commit=checkpoint["history_commit"],
+            checkpoint_history=history,
+            global_step=global_step,
+        )
+        training_reference = dict(checkpoint.get("training_reference", {}))
+        if (
+            "initial_phase" not in training_reference
+            or "fixed_training_probe_initial_loss" not in training_reference
+            or "fixed_blind_probe_initial_loss" not in training_reference
+        ):
+            raise ValueError(
+                "Huang checkpoint is missing strict training reference data"
+            )
+        sample_records_commit = _restore_huang2026_sample_record_journal(
+            records_path,
+            commit=checkpoint.get("sample_records_commit", {}),
+            runtime_config=runtime_config,
+            dataset=train_dataset,
+            global_step=global_step,
+        )
+    else:
+        write_json(output_dir / "config.json", _huang2026_jsonable(runtime_config))
+        write_json(output_dir / "contract.json", _huang2026_jsonable(contract))
+        shutil.copyfile(config_path, output_dir / "source_config.json")
+        write_json(
+            output_dir / "manifest.json",
+            _huang2026_manifest(
+                runtime_config,
+                action="train_in_progress",
+                artifacts={
+                    "config": "config.json",
+                    "contract": "contract.json",
+                    "source_config": "source_config.json",
+                    "checkpoint": "checkpoints/latest.pt",
+                },
+            ),
+        )
+        training_reference = {
+            "initial_phase": phase.detach().cpu().clone(),
+            "fixed_training_probe_initial_loss": _huang2026_fixed_probe_loss(
+                model,
+                train_dataset,
+                runtime_config,
+                device=device,
+                diffuser=diffuser,
+                detector=detector,
+            ),
+            "fixed_blind_probe_initial_loss": _huang2026_fixed_probe_loss(
+                model,
+                eval_dataset,
+                runtime_config,
+                device=device,
+                diffuser=diffuser,
+                detector=detector,
+            ),
+            "max_phase_gradient_norms": [
+                0.0
+            ] * int(runtime_config["d2nn"]["layers"]),
+        }
+        records_path.touch(exist_ok=False)
+        history_path.touch(exist_ok=False)
+    phase_reference = training_reference["initial_phase"].to(
+        device=phase.device,
+        dtype=phase.dtype,
+    )
+    epochs = int(runtime_config["training"]["epochs"])
+    batch_size = int(runtime_config["training"]["batch_size"])
+    max_train_batches = runtime_config["training"]["max_train_batches"]
+    checkpoint_interval = int(
+        runtime_config["training"]["checkpoint_interval_updates"]
+    )
+    last_gradient_norms = [
+        float(value)
+        for value in training_reference.get(
+            "last_phase_gradient_norms",
+            [0.0] * int(runtime_config["d2nn"]["layers"]),
+        )
+    ]
+    max_gradient_norms = [
+        float(value)
+        for value in training_reference.get(
+            "max_phase_gradient_norms",
+            [0.0] * int(runtime_config["d2nn"]["layers"]),
+        )
+    ]
+
+    for epoch in range(start_epoch, epochs):
+        order = huang2026_epoch_order(
+            sample_count=len(train_dataset),
+            seed=int(runtime_config["seed"]),
+            epoch=epoch,
+        )
+        batch_indices = [
+            order[start : start + batch_size]
+            for start in range(0, len(order), batch_size)
+        ]
+        if max_train_batches is not None:
+            batch_indices = batch_indices[: int(max_train_batches)]
+        first_batch = start_batch_index if epoch == start_epoch else 0
+        if first_batch > len(batch_indices):
+            raise ValueError("checkpoint batch position exceeds deterministic epoch")
+        for batch_index in range(first_batch, len(batch_indices)):
+            batch = _huang2026_batch_records(
+                train_dataset,
+                batch_indices[batch_index],
+                iteration=global_step,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            output, target, _object_field, _heights = _huang2026_forward_batch(
+                model,
+                train_dataset,
+                batch,
+                runtime_config,
+                iteration=global_step,
+                device=device,
+                diffuser=diffuser,
+                detector=detector,
+            )
+            loss = _huang2026_loss(
+                output,
+                target,
+                mode=str(runtime_config["mode"]),
+            )
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError("non-finite Huang training loss")
+            loss.backward()
+            if phase.grad is None or not bool(torch.isfinite(phase.grad).all()):
+                raise FloatingPointError("Huang phase layers received no finite gradient")
+            last_gradient_norms = [
+                float(layer_gradient.detach().norm().cpu())
+                for layer_gradient in phase.grad
+            ]
+            if any(not math.isfinite(value) for value in last_gradient_norms):
+                raise FloatingPointError("non-finite Huang layer gradient")
+            max_gradient_norms = [
+                max(previous, current)
+                for previous, current in zip(
+                    max_gradient_norms,
+                    last_gradient_norms,
+                    strict=True,
+                )
+            ]
+            training_reference["max_phase_gradient_norms"] = max_gradient_norms
+            training_reference["last_phase_gradient_norms"] = last_gradient_norms
+            optimizer.step()
+            loss_value = float(loss.detach().cpu())
+            update_record = {
+                "kind": "update",
+                "epoch": epoch,
+                "batch_index": batch_index,
+                "global_step": global_step,
+                "loss": loss_value,
+                "phase_gradient_norms": last_gradient_norms,
+            }
+            pending_history_records.append(update_record)
+            if history_state["first_loss"] is None:
+                history_state["first_loss"] = loss_value
+            history_state["last_loss"] = loss_value
+            history_state["update_count"] = global_step + 1
+            history_state["current_epoch"] = epoch
+            history_state["current_epoch_count"] = (
+                int(history_state["current_epoch_count"]) + 1
+            )
+            history_state["current_epoch_loss_sum"] = (
+                float(history_state["current_epoch_loss_sum"]) + loss_value
+            )
+            current_minimum = history_state["current_epoch_loss_minimum"]
+            current_maximum = history_state["current_epoch_loss_maximum"]
+            history_state["current_epoch_loss_minimum"] = (
+                loss_value
+                if current_minimum is None
+                else min(float(current_minimum), loss_value)
+            )
+            history_state["current_epoch_loss_maximum"] = (
+                loss_value
+                if current_maximum is None
+                else max(float(current_maximum), loss_value)
+            )
+            pending_sample_records.extend(
+                _huang2026_sample_metadata_rows(
+                    batch,
+                    global_step=global_step,
+                )
+            )
+            global_step += 1
+            # A periodic checkpoint at the last batch stays positioned at the
+            # current epoch with ``next_batch == len(batch_indices)``. Resume
+            # then deterministically rebuilds the epoch summary before the
+            # epoch-boundary checkpoint advances to the next epoch.
+            next_epoch = epoch
+            next_batch = batch_index + 1
+            if global_step % checkpoint_interval == 0:
+                history_commit = _append_huang2026_journal(
+                    history_path,
+                    pending_history_records,
+                    previous_commit=history_commit,
+                )
+                sample_records_commit = _append_huang2026_sample_records(
+                    records_path,
+                    pending_sample_records,
+                    previous_commit=sample_records_commit,
+                )
+                pending_history_records.clear()
+                pending_sample_records.clear()
+                save_huang2026_checkpoint(
+                    checkpoint_path,
+                    model=model,
+                    optimizer=optimizer,
+                    detector=detector,
+                    runtime_config=runtime_config,
+                    next_epoch=next_epoch,
+                    next_batch_index=next_batch,
+                    global_step=global_step,
+                    history=history,
+                    history_state=history_state,
+                    history_commit=history_commit,
+                    training_reference=training_reference,
+                    sample_records_commit=sample_records_commit,
+                )
+        start_batch_index = 0
+        epoch_count = int(history_state["current_epoch_count"])
+        if epoch_count <= 0 or int(history_state["current_epoch"]) != epoch:
+            raise ValueError("Huang epoch accumulator is empty or misaligned")
+        epoch_summary = {
+            "epoch": epoch,
+            "kind": "epoch_summary",
+            "mean_loss": (
+                float(history_state["current_epoch_loss_sum"]) / epoch_count
+            ),
+            "minimum_loss": float(
+                history_state["current_epoch_loss_minimum"]
+            ),
+            "maximum_loss": float(
+                history_state["current_epoch_loss_maximum"]
+            ),
+            "update_count": epoch_count,
+        }
+        if len(history) != epoch:
+            raise ValueError("Huang epoch summary history is not contiguous")
+        history.append(epoch_summary)
+        pending_history_records.append(epoch_summary)
+        history_commit = _append_huang2026_journal(
+            history_path,
+            pending_history_records,
+            previous_commit=history_commit,
+        )
+        sample_records_commit = _append_huang2026_sample_records(
+            records_path,
+            pending_sample_records,
+            previous_commit=sample_records_commit,
+        )
+        pending_history_records.clear()
+        pending_sample_records.clear()
+        history_state.update(
+            {
+                "current_epoch": epoch + 1,
+                "current_epoch_count": 0,
+                "current_epoch_loss_sum": 0.0,
+                "current_epoch_loss_minimum": None,
+                "current_epoch_loss_maximum": None,
+            }
+        )
+        save_huang2026_checkpoint(
+            checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            detector=detector,
+            runtime_config=runtime_config,
+            next_epoch=epoch + 1,
+            next_batch_index=0,
+            global_step=global_step,
+            history=history,
+            history_state=history_state,
+            history_commit=history_commit,
+            training_reference=training_reference,
+            sample_records_commit=sample_records_commit,
+        )
+
+    write_json(
+        output_dir / "history.json",
+        {
+            "protocol": "huang2026_visible_history_v1",
+            "update_journal": "history.jsonl",
+            "update_count": global_step,
+            "first_loss": history_state["first_loss"],
+            "last_loss": history_state["last_loss"],
+            "epoch_summaries": _huang2026_jsonable(history),
+            "journal_commit": history_commit,
+        },
+    )
+    evaluation_runtime = json.loads(
+        json.dumps(_huang2026_jsonable(runtime_config), allow_nan=False)
+    )
+    evaluation_runtime["coherence"]["nr"] = int(
+        runtime_config["coherence"]["nr_blind_test_contract"]
+    )
+    evaluation_runtime["coherence"]["chunk_size"] = min(
+        int(evaluation_runtime["coherence"]["nr"]),
+        int(runtime_config["coherence"]["chunk_size"]),
+    )
+    metrics = evaluate_huang2026_model(
+        model,
+        eval_dataset,
+        evaluation_runtime,
+        device=device,
+        diffuser=diffuser,
+        detector=detector,
+        output_dir=output_dir,
+    )
+    write_json(output_dir / "metrics.json", metrics)
+    phase_update_norm = float((phase.detach() - phase_reference).norm().cpu())
+    per_layer_phase_update_norms = [
+        float(value)
+        for value in (phase.detach() - phase_reference)
+        .flatten(start_dim=1)
+        .norm(dim=1)
+        .cpu()
+    ]
+    fixed_training_probe_final_loss = _huang2026_fixed_probe_loss(
+        model,
+        train_dataset,
+        runtime_config,
+        device=device,
+        diffuser=diffuser,
+        detector=detector,
+    )
+    fixed_blind_probe_final_loss = _huang2026_fixed_probe_loss(
+        model,
+        eval_dataset,
+        runtime_config,
+        device=device,
+        diffuser=diffuser,
+        detector=detector,
+    )
+    epoch_means = [
+        float(record["mean_loss"])
+        for record in history
+        if record.get("kind") == "epoch_summary"
+    ]
+    optimization_loss_decreased = (
+        epoch_means[-1] < epoch_means[0]
+        if len(epoch_means) >= 2
+        else (
+            float(history_state["last_loss"]) < float(history_state["first_loss"])
+            if global_step >= 2
+            else False
+        )
+    )
+    training_summary = {
+        "updates": global_step,
+        "initial_loss": history_state["first_loss"],
+        "final_loss": history_state["last_loss"],
+        "first_epoch_mean_loss": epoch_means[0] if epoch_means else None,
+        "last_epoch_mean_loss": epoch_means[-1] if epoch_means else None,
+        "fixed_training_probe_initial_loss": float(
+            training_reference["fixed_training_probe_initial_loss"]
+        ),
+        "fixed_training_probe_final_loss": fixed_training_probe_final_loss,
+        "fixed_training_probe_loss_decreased": (
+            fixed_training_probe_final_loss
+            < float(training_reference["fixed_training_probe_initial_loss"])
+        ),
+        "fixed_blind_probe_initial_loss": float(
+            training_reference["fixed_blind_probe_initial_loss"]
+        ),
+        "fixed_blind_probe_final_loss": fixed_blind_probe_final_loss,
+        "fixed_blind_probe_loss_decreased": (
+            fixed_blind_probe_final_loss
+            < float(training_reference["fixed_blind_probe_initial_loss"])
+        ),
+        "loss_decreased": optimization_loss_decreased,
+        "loss_decrease_definition": (
+            "last_epoch_mean_training_objective_below_first_epoch_mean"
+            if len(epoch_means) >= 2
+            else "last_update_training_objective_below_first_update"
+        ),
+        "phase_update_norm": phase_update_norm,
+        "per_layer_phase_update_norms": per_layer_phase_update_norms,
+        "last_phase_gradient_norms": last_gradient_norms,
+        "maximum_phase_gradient_norms": max_gradient_norms,
+        "all_layers_received_nonzero_finite_gradient": all(
+            math.isfinite(value) and value > 1e-12
+            for value in max_gradient_norms
+        ),
+        "all_layers_updated": all(
+            math.isfinite(value) and value > 1e-12
+            for value in per_layer_phase_update_norms
+        ),
+    }
+    manifest = _huang2026_manifest(
+        runtime_config,
+        action="train_complete",
+        phase_update_norm=phase_update_norm,
+        artifacts={
+            "config": "config.json",
+            "contract": "contract.json",
+            "source_config": "source_config.json",
+            "history": "history.json",
+            "history_journal": "history.jsonl",
+            "metrics": "metrics.json",
+            "checkpoint": "checkpoints/latest.pt",
+            "sample_records": "sample_records.jsonl",
+            "evaluation_sample_records": (
+                "ideal_evaluation_sample_records.jsonl"
+            ),
+            "sample_grid": "samples/ideal_evaluation.png",
+        },
+    )
+    manifest["training_summary"] = training_summary
+    manifest["checkpoint_binding"] = _huang2026_checkpoint_binding(
+        checkpoint_path,
+        source_kind="training_run",
+    )
+    write_json(output_dir / "manifest.json", manifest)
+    return {
+        "profile_id": HUANG2026_PROFILE_ID,
+        "mode": runtime_config["mode"],
+        "status_label": runtime_config["status_label"],
+        "training": training_summary,
+        "metrics": metrics,
+        "output_dir": str(output_dir),
+    }
+
+
+def _load_huang2026_model_for_evaluation(
+    runtime_config: Mapping[str, Any],
+    *,
+    output_dir: Path,
+    device: torch.device,
+) -> torch.nn.Module:
+    model = _build_huang2026_model(runtime_config).to(device)
+    load_huang2026_checkpoint(
+        output_dir / "checkpoints" / "latest.pt",
+        model=model,
+        optimizer=None,
+        runtime_config=runtime_config,
+        restore_rng=False,
+        strict_resume=False,
+    )
+    return model
+
+
+def run_huang2026_evaluation(
+    runtime_config: Mapping[str, Any],
+    *,
+    output_dir: Path,
+    device: torch.device,
+    checkpoint_dir: Path | None = None,
+) -> dict[str, Any]:
+    _train_dataset, eval_dataset = _build_huang2026_datasets(runtime_config)
+    model = _load_huang2026_model_for_evaluation(
+        runtime_config,
+        output_dir=checkpoint_dir or output_dir,
+        device=device,
+    )
+    diffuser = _huang2026_diffuser(runtime_config).to(device)
+    detector = _huang2026_detector_response(runtime_config).to(device)
+    metrics = evaluate_huang2026_model(
+        model,
+        eval_dataset,
+        runtime_config,
+        device=device,
+        diffuser=diffuser,
+        detector=detector,
+        output_dir=output_dir,
+    )
+    write_json(output_dir / "metrics.json", metrics)
+    return {
+        "profile_id": HUANG2026_PROFILE_ID,
+        "mode": runtime_config["mode"],
+        "metrics": metrics,
+        "output_dir": str(output_dir),
+    }
+
+
+def _huang2026_control_operator_output(
+    operator: VisibleDirectPropagationOperator | ThinLensOperator,
+    *,
+    object_field: torch.Tensor,
+    diffuser_height: torch.Tensor,
+    dataset: Huang2026VisibleDataset,
+    batch: Mapping[str, Any],
+    runtime_config: Mapping[str, Any],
+    iteration: int,
+    device: torch.device,
+    detector: DetectorResponse,
+) -> torch.Tensor:
+    mode = str(runtime_config["mode"])
+    if mode == "coherent":
+        return operator(object_field, diffuser_height, detector=detector)
+    if mode == "multiwavelength":
+        return torch.stack(
+            [
+                operator(
+                    object_field,
+                    diffuser_height,
+                    wavelength=float(wavelength_nm) * 1e-9,
+                    detector=detector,
+                )
+                for wavelength_nm in runtime_config["wavelengths_nm"]
+            ],
+            dim=1,
+        )
+    nr = int(runtime_config["coherence"]["nr"])
+    chunk_size = int(runtime_config["coherence"]["chunk_size"])
+    intensity_sum: torch.Tensor | None = None
+    for start in range(0, nr, chunk_size):
+        count = min(chunk_size, nr - start)
+        chunk = _huang2026_coherence_screens(
+            dataset,
+            batch,
+            iteration=iteration,
+            nr=count,
+            start_realization=start,
+            device=device,
+            complex_dtype=object_field.dtype,
+        )
+        fields = (object_field[:, None] * chunk).flatten(0, 1)
+        heights = diffuser_height[:, None].expand(-1, count, -1, -1).flatten(0, 1)
+        values = operator(fields, heights, detector=None).reshape(
+            object_field.shape[0],
+            count,
+            *object_field.shape[-2:],
+        )
+        chunk_sum = values.sum(dim=1)
+        intensity_sum = chunk_sum if intensity_sum is None else intensity_sum + chunk_sum
+    assert intensity_sum is not None
+    return detector(intensity_sum / nr)
+
+
+def run_huang2026_controls(
+    runtime_config: Mapping[str, Any],
+    *,
+    output_dir: Path,
+    device: torch.device,
+    checkpoint_dir: Path | None = None,
+) -> dict[str, Any]:
+    requested = tuple(dict.fromkeys(str(name) for name in runtime_config["controls"]))
+    if not requested or any(
+        name not in {"direct", "lens", "donn"} for name in requested
+    ):
+        raise ValueError("controls must select direct, lens, and/or donn")
+    _train_dataset, eval_dataset = _build_huang2026_datasets(runtime_config)
+    model = (
+        _load_huang2026_model_for_evaluation(
+            runtime_config,
+            output_dir=checkpoint_dir or output_dir,
+            device=device,
+        )
+        if "donn" in requested
+        else None
+    )
+    diffuser = _huang2026_diffuser(runtime_config).to(device)
+    detector = _huang2026_detector_response(runtime_config).to(device)
+    batch_size = min(int(runtime_config["training"]["batch_size"]), len(eval_dataset))
+    iteration = 2_000_000_000
+    batch = _huang2026_batch_records(
+        eval_dataset,
+        list(range(batch_size)),
+        iteration=iteration,
+    )
+    object_field = _huang2026_complex_field(
+        batch["amplitude"],
+        device=device,
+        complex_dtype=_huang2026_complex_dtype(runtime_config),
+    )
+    target = batch["target_intensity"][:, 0].to(
+        device=device,
+        dtype=object_field.real.dtype,
+    )
+    heights = diffuser.sample_height(
+        batch["diffuser_seed"],
+        device=device,
+        dtype=object_field.real.dtype,
+    )
+    optics = _huang2026_optics_config(runtime_config)
+    delta_n = float(runtime_config["diffuser"]["refractive_index_difference"])
+    direct_operator = (
+        VisibleDirectPropagationOperator(
+            optics,
+            refractive_index_difference=delta_n,
+        ).to(device)
+        if "direct" in requested
+        else None
+    )
+    lens_operator = (
+        ThinLensOperator(
+            optics,
+            refractive_index_difference=delta_n,
+        ).to(device)
+        if "lens" in requested
+        else None
+    )
+    outputs: dict[str, torch.Tensor] = {}
+    detector_initial_state = {
+        name: value.detach().clone()
+        for name, value in detector.state_dict().items()
+    }
+
+    def _reset_control_detector() -> None:
+        detector.load_state_dict(detector_initial_state, strict=True)
+
+    with torch.no_grad():
+        if direct_operator is not None:
+            _reset_control_detector()
+            outputs["direct"] = _huang2026_control_operator_output(
+                direct_operator,
+                object_field=object_field,
+                diffuser_height=heights,
+                dataset=eval_dataset,
+                batch=batch,
+                runtime_config=runtime_config,
+                iteration=iteration,
+                device=device,
+                detector=detector,
+            )
+        if lens_operator is not None:
+            _reset_control_detector()
+            outputs["lens"] = _huang2026_control_operator_output(
+                lens_operator,
+                object_field=object_field,
+                diffuser_height=heights,
+                dataset=eval_dataset,
+                batch=batch,
+                runtime_config=runtime_config,
+                iteration=iteration,
+                device=device,
+                detector=detector,
+            )
+        if model is not None:
+            _reset_control_detector()
+            donn_output, _target, _field, _height = _huang2026_forward_batch(
+                model,
+                eval_dataset,
+                batch,
+                runtime_config,
+                iteration=iteration,
+                device=device,
+                diffuser=diffuser,
+                detector=detector,
+            )
+            outputs["donn"] = donn_output
+    selected = {name: outputs[name] for name in requested}
+    expected_donn_class = {
+        "coherent": "Huang2026ThreeLayerDONN",
+        "incoherent": "Huang2026IncoherentDONN",
+        "multiwavelength": "Huang2026MultiWavelengthDONN",
+    }[str(runtime_config["mode"])]
+    operator_bindings = {
+        "direct": "VisibleDirectPropagationOperator",
+        "lens": "ThinLensOperator",
+        "donn": type(model).__name__ if model is not None else expected_donn_class,
+    }
+    control_metrics: dict[str, Any] = {}
+    for name, value in selected.items():
+        if value.ndim == 4:
+            expanded_target = target[:, None].expand_as(value)
+            pcc = huang2026_pcc_per_image(
+                value.flatten(0, 1),
+                expanded_target.flatten(0, 1),
+            )
+        else:
+            pcc = huang2026_pcc_per_image(value, target)
+        control_metrics[name] = {
+            "pcc": scalar_summary(pcc),
+            "operator_class": operator_bindings[name],
+        }
+    panels: list[tuple[str, torch.Tensor]] = [("clean target", target[:, None])]
+    for name in ("direct", "lens", "donn"):
+        if name in selected:
+            panels.append(
+                (name, _huang2026_primary_output(selected[name])[:, None])
+            )
+    save_coherent_grid(panels, output_dir / "samples" / "controls.png")
+    control_records: list[dict[str, Any]] = []
+    for metadata in batch["metadata"]:
+        record = dict(metadata)
+        record["control_paths"] = list(requested)
+        control_records.append(record)
+    _write_huang2026_sample_records(
+        output_dir / "control_sample_records.jsonl",
+        control_records,
+    )
+    result = {
+        "protocol": "huang2026_visible_controls_v1",
+        "same_object_diffuser_detector_domain": True,
+        "detector_noise_realization_matched_across_controls": True,
+        "nominal_total_path_m": optics.total_optical_path,
+        "lens_4f_total_path_m": 4.0 * optics.lens_focal_length,
+        "nominal_total_path_matched": math.isclose(
+            optics.total_optical_path,
+            4.0 * optics.lens_focal_length,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ),
+        "path_boundary": {
+            "paper_default": (
+                "DONN, direct, and 4f lens controls share the 189.2 mm "
+                "input-to-detector path."
+            ),
+            "supplement_typo_sensitivity": (
+                "The explicit suspected-decimal-typo DONN/direct path is "
+                "18.9 mm; the published 47.3 mm focal-length lens remains "
+                "189.2 mm and is intentionally reported as not path matched."
+            ),
+        },
+        "operator_bindings": {
+            name: operator_bindings[name] for name in requested
+        },
+        "metrics": control_metrics,
+        "sample": "samples/controls.png",
+        "sample_records": "control_sample_records.jsonl",
+    }
+    write_json(output_dir / "control_metrics.json", result)
+    return result
+
+
+def run_huang2026_misalignment(
+    runtime_config: Mapping[str, Any],
+    *,
+    output_dir: Path,
+    device: torch.device,
+    checkpoint_dir: Path | None = None,
+) -> dict[str, Any]:
+    _train_dataset, eval_dataset = _build_huang2026_datasets(runtime_config)
+    model = _load_huang2026_model_for_evaluation(
+        runtime_config,
+        output_dir=checkpoint_dir or output_dir,
+        device=device,
+    )
+    diffuser = _huang2026_diffuser(runtime_config).to(device)
+    detector = _huang2026_detector_response(runtime_config).to(device)
+    misalignment_contract = runtime_config.get("misalignment", {})
+    lateral_values = tuple(
+        int(value)
+        for value in misalignment_contract.get(
+            "lateral_test_pixels",
+            (0, 5, -5, 10, -10),
+        )
+    )
+    axial_values_mm = tuple(
+        float(value)
+        for value in misalignment_contract.get(
+            "axial_test_mm",
+            (0.0, 0.5, -0.5, 1.0, -1.0),
+        )
+    )
+    lateral_layer_index = int(
+        misalignment_contract.get("lateral_layer_index", 1)
+    )
+    axial_segment_index = int(
+        misalignment_contract.get("axial_segment_index", 2)
+    )
+    if lateral_layer_index not in range(3) or axial_segment_index not in range(5):
+        raise ValueError("misalignment layer/segment index is outside the Huang path")
+    boundary = str(misalignment_contract.get("boundary", "zero"))
+    conditions: list[tuple[str, MisalignmentTransform]] = [
+        ("ideal", MisalignmentTransform(boundary=boundary))
+    ]
+    for pixels in lateral_values:
+        if pixels == 0:
+            continue
+        shifts = [(0, 0)] * 3
+        shifts[lateral_layer_index] = (pixels, 0)
+        conditions.append(
+            (
+                f"lateral_layer_{lateral_layer_index + 1}_x_{pixels:+d}px",
+                MisalignmentTransform(
+                    layer_shifts=tuple(shifts),
+                    boundary=boundary,
+                ),
+            )
+        )
+    for millimetres in axial_values_mm:
+        if millimetres == 0.0:
+            continue
+        offsets = [0.0] * 5
+        offsets[axial_segment_index] = millimetres * 1e-3
+        conditions.append(
+            (
+                f"axial_segment_{axial_segment_index + 1}_{millimetres:+.1f}mm",
+                MisalignmentTransform(
+                    axial_offsets=tuple(offsets),
+                    boundary=boundary,
+                ),
+            )
+        )
+    results: dict[str, Any] = {}
+    means: list[float] = []
+    labels: list[str] = []
+    detector_initial_state = {
+        name: value.detach().clone()
+        for name, value in detector.state_dict().items()
+    }
+    for label, transform in conditions:
+        detector.load_state_dict(detector_initial_state, strict=True)
+        condition = evaluate_huang2026_model(
+            model,
+            eval_dataset,
+            runtime_config,
+            device=device,
+            diffuser=diffuser,
+            detector=detector,
+            output_dir=output_dir,
+            misalignment=transform,
+            misalignment_label=label,
+        )
+        results[label] = condition
+        mean = condition["pcc"]["dataset"]["mean"]
+        means.append(float(mean))
+        labels.append(label)
+    ideal_mean = float(results["ideal"]["pcc"]["dataset"]["mean"])
+    for label, condition in results.items():
+        condition_mean = float(condition["pcc"]["dataset"]["mean"])
+        condition["delta_mean_pcc_from_ideal"] = condition_mean - ideal_mean
+        condition["relative_mean_pcc_change_from_ideal"] = (
+            0.0
+            if ideal_mean == 0.0
+            else (condition_mean - ideal_mean) / abs(ideal_mean)
+        )
+    result = {
+        "protocol": "huang2026_visible_misalignment_v1",
+        "conditions": results,
+        "condition_labels": labels,
+        "condition_mean_pcc_statistics": scalar_summary(means),
+        "experimental_ranges": {
+            "lateral_pixels": list(
+                misalignment_contract.get(
+                    "lateral_experimental_range_pixels",
+                    (4, 12),
+                )
+            ),
+            "axial_mm": list(
+                misalignment_contract.get(
+                    "axial_experimental_range_mm",
+                    (0.05, 0.1),
+                )
+            ),
+        },
+        "ideal_mean_pcc": ideal_mean,
+        "detector_noise_sequence_matched_across_conditions": True,
+        "lateral_layer_index_zero_based": lateral_layer_index,
+        "axial_segment_index_zero_based": axial_segment_index,
+    }
+    write_json(output_dir / "misalignment_metrics.json", result)
+    return result
+
+
+def _snapshot_huang2026_action(
+    runtime_config: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    *,
+    config_path: Path,
+    output_dir: Path,
+) -> None:
+    """Create the portable configuration artifacts for a standalone action."""
+
+    _prepare_huang2026_output(output_dir, resume=False)
+    write_json(output_dir / "config.json", _huang2026_jsonable(runtime_config))
+    write_json(output_dir / "contract.json", _huang2026_jsonable(contract))
+    shutil.copyfile(config_path, output_dir / "source_config.json")
+
+
+def _huang2026_action_output(
+    runtime_config: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    *,
+    config_path: Path,
+    output_dir: Path,
+    checkpoint_dir: Path,
+    requires_checkpoint: bool,
+) -> tuple[Path, bool]:
+    """Prepare an independent action directory or safely reuse a training run."""
+
+    checkpoint_path = checkpoint_dir / "checkpoints" / "latest.pt"
+    if requires_checkpoint and not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Huang action requires a trained checkpoint: {checkpoint_path}"
+        )
+    shared_training_dir = (
+        checkpoint_dir.resolve() == output_dir.resolve()
+        and checkpoint_path.is_file()
+        and (output_dir / "config.json").is_file()
+    )
+    if shared_training_dir:
+        (output_dir / "samples").mkdir(parents=True, exist_ok=True)
+        return output_dir / f"{runtime_config['action']}_manifest.json", True
+    _snapshot_huang2026_action(
+        runtime_config,
+        contract,
+        config_path=config_path,
+        output_dir=output_dir,
+    )
+    return output_dir / "manifest.json", False
+
+
+def run_huang2026_inspection(
+    runtime_config: Mapping[str, Any],
+    *,
+    output_dir: Path,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Exercise Note S6 Equation (S18) and one untrained visible optical path."""
+
+    _train_dataset, eval_dataset = _build_huang2026_datasets(runtime_config)
+    batch = _huang2026_batch_records(
+        eval_dataset,
+        [0],
+        iteration=4_000_000_000,
+    )
+    amplitude = batch["amplitude"][0, 0]
+    phase = torch.zeros_like(amplitude)
+    inverse = SLMPhaseResponse.inverse_sinc(amplitude)
+    modulation = 1.0 + inverse / math.pi
+    hologram_phase = SLMPhaseResponse.phase_only_hologram(amplitude, phase)
+    recovered_amplitude = SLMPhaseResponse.first_order_amplitude(modulation)
+
+    validation_amplitude = torch.linspace(
+        0.0,
+        1.0,
+        1001,
+        dtype=amplitude.dtype,
+    )
+    validation_modulation = (
+        1.0
+        + SLMPhaseResponse.inverse_sinc(validation_amplitude) / math.pi
+    )
+    validation_recovered = SLMPhaseResponse.first_order_amplitude(
+        validation_modulation
+    )
+    encoding = {
+        "protocol": "huang2026_slm_input_encoding_s18_v1",
+        "equation": "S18",
+        "inverse_sinc_domain_rad": [-math.pi, 0.0],
+        "boundary": {
+            "target_amplitude_0_inverse_sinc": float(
+                SLMPhaseResponse.inverse_sinc(torch.tensor(0.0))
+            ),
+            "target_amplitude_1_inverse_sinc": float(
+                SLMPhaseResponse.inverse_sinc(torch.tensor(1.0))
+            ),
+        },
+        "monotonic_first_order_amplitude": bool(
+            torch.all(torch.diff(validation_recovered) >= -1e-6)
+        ),
+        "maximum_amplitude_recovery_error": float(
+            (validation_recovered - validation_amplitude).abs().max()
+        ),
+        "sample_amplitude_recovery_error": float(
+            (recovered_amplitude - amplitude).abs().max()
+        ),
+        "input_encoding_scope": (
+            "phase-only hologram and first-order amplitude simulation; "
+            "carrier-order spatial filtering and calibrated SLM LUT are omitted"
+        ),
+        "hologram_sample": "samples/slm_s18_phase_only_hologram.png",
+    }
+    if not encoding["monotonic_first_order_amplitude"]:
+        raise AssertionError("S18 first-order amplitude is not monotonic")
+    if encoding["maximum_amplitude_recovery_error"] > 1e-5:
+        raise AssertionError("S18 inverse-sinc recovery exceeded tolerance")
+
+    model = _build_huang2026_model(runtime_config).to(device)
+    diffuser = _huang2026_diffuser(runtime_config).to(device)
+    detector = _huang2026_detector_response(runtime_config).to(device)
+    encoded_batch = dict(batch)
+    encoded_batch["amplitude"] = recovered_amplitude[None, None]
+    with torch.no_grad():
+        output, target, object_field, heights = _huang2026_forward_batch(
+            model,
+            eval_dataset,
+            encoded_batch,
+            runtime_config,
+            iteration=4_000_000_000,
+            device=device,
+            diffuser=diffuser,
+            detector=detector,
+        )
+        direct = VisibleDirectPropagationOperator(
+            _huang2026_optics_config(runtime_config),
+            refractive_index_difference=float(
+                runtime_config["diffuser"]["refractive_index_difference"]
+            ),
+        ).to(device)
+        corrupted = _huang2026_control_operator_output(
+            direct,
+            object_field=object_field,
+            diffuser_height=heights,
+            dataset=eval_dataset,
+            batch=encoded_batch,
+            runtime_config=runtime_config,
+            iteration=4_000_000_000,
+            device=device,
+            detector=detector,
+        )
+    pcc_output = _huang2026_primary_output(output)
+    sample_pcc = huang2026_pcc_per_image(pcc_output, target)
+    metrics = {
+        "status_label": runtime_config["status_label"],
+        "untrained_optical_path": True,
+        "sample_pcc": scalar_summary(sample_pcc),
+        "slm_encoding": encoding,
+        "sample_panel_condition": {
+            "mode": runtime_config["mode"],
+            "nr": (
+                int(runtime_config["coherence"]["nr"])
+                if runtime_config["mode"] == "incoherent"
+                else 1
+            ),
+            "displayed_wavelength_nm": float(
+                runtime_config["wavelengths_nm"][0]
+            ),
+        },
+    }
+    save_phase(
+        output_dir / "samples" / "slm_s18_phase_only_hologram.png",
+        hologram_phase,
+    )
+    _save_huang2026_sample_grid(
+        output_dir / "samples" / "inspection.png",
+        target=target,
+        corrupted=corrupted,
+        reconstruction=output,
+    )
+    _write_huang2026_sample_records(
+        output_dir / "sample_records.jsonl",
+        _huang2026_sample_metadata_rows(batch, global_step=0),
+    )
+    write_json(output_dir / "slm_encoding.json", encoding)
+    write_json(output_dir / "metrics.json", metrics)
+    return {
+        "profile_id": HUANG2026_PROFILE_ID,
+        "mode": runtime_config["mode"],
+        "status_label": runtime_config["status_label"],
+        "slm_encoding": encoding,
+        "metrics": metrics,
+        "output_dir": str(output_dir),
+    }
+
+
+def _huang2026_peak_rss_bytes() -> int | None:
+    if resource is None:
+        return None
+    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return value if platform.system() == "Darwin" else value * 1024
+
+
+def _huang2026_synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _huang2026_benchmark_step(
+    label: str,
+    model: torch.nn.Module,
+    forward: Callable[[], torch.Tensor],
+    target: torch.Tensor,
+    *,
+    device: torch.device,
+) -> tuple[dict[str, Any], torch.Tensor]:
+    phase = _huang2026_phase_parameter(model)
+    model.zero_grad(set_to_none=True)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+    rss_before = _huang2026_peak_rss_bytes()
+    _huang2026_synchronize(device)
+    started = time.perf_counter()
+    output = forward()
+    expanded_target = (
+        target[:, None].expand_as(output) if output.ndim == 4 else target
+    )
+    loss = F.mse_loss(output, expanded_target)
+    loss.backward()
+    _huang2026_synchronize(device)
+    elapsed = time.perf_counter() - started
+    if phase.grad is None:
+        raise AssertionError(f"{label} phase gradient is missing")
+    gradient_norms = [
+        float(value)
+        for value in phase.grad.detach().flatten(start_dim=1).norm(dim=1).cpu()
+    ]
+    if any(not math.isfinite(value) or value <= 0.0 for value in gradient_norms):
+        raise AssertionError(f"{label} phase gradients must be finite and nonzero")
+    rss_after = _huang2026_peak_rss_bytes()
+    result = {
+        "label": label,
+        "elapsed_seconds": elapsed,
+        "loss": float(loss.detach().cpu()),
+        "output_shape": list(output.shape),
+        "output_finite": bool(torch.isfinite(output).all()),
+        "output_nonnegative": bool(torch.all(output >= 0)),
+        "phase_gradient_norms": gradient_norms,
+        "peak_rss_before_bytes": rss_before,
+        "peak_rss_after_bytes": rss_after,
+        "observed_peak_rss_increment_bytes": (
+            None
+            if rss_before is None or rss_after is None
+            else max(0, rss_after - rss_before)
+        ),
+        "cuda_peak_allocated_bytes": (
+            int(torch.cuda.max_memory_allocated(device))
+            if device.type == "cuda"
+            else None
+        ),
+    }
+    if not result["output_finite"] or not result["output_nonnegative"]:
+        raise AssertionError(f"{label} produced invalid detector intensity")
+    return result, output.detach()
+
+
+def run_huang2026_resource_assessment(
+    runtime_config: Mapping[str, Any],
+    *,
+    output_dir: Path,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Benchmark one 400x400 coherent step and chunked Nr=20 IC step."""
+
+    seed_everything(int(runtime_config["seed"]))
+    field_shape = tuple(int(value) for value in runtime_config["field_shape"])
+    resized_shape = tuple(int(value) for value in runtime_config["resized_shape"])
+    if field_shape != (400, 400) or resized_shape != (320, 320):
+        raise ValueError(
+            "Huang resource assessment requires the paper-scale 400x400/320x320 binding"
+        )
+    source = torch.linspace(0.0, 1.0, 28 * 28).reshape(28, 28)
+    amplitude = prepare_huang2026_visible_amplitude(
+        source,
+        resized_shape=resized_shape,
+        canvas_shape=field_shape,
+    )
+    complex_dtype = _huang2026_complex_dtype(runtime_config)
+    object_field = _huang2026_complex_field(
+        amplitude,
+        device=device,
+        complex_dtype=complex_dtype,
+    )
+    target = amplitude[:, 0].to(device=device, dtype=object_field.real.dtype).square()
+    diffuser = _huang2026_diffuser(runtime_config).to(device)
+    height = diffuser.sample_height(
+        [int(runtime_config["seed"]) + 8801],
+        device=device,
+        dtype=object_field.real.dtype,
+    )
+    detector = _huang2026_detector_response(runtime_config).to(device)
+
+    coherent_runtime = json.loads(
+        json.dumps(_huang2026_jsonable(runtime_config), allow_nan=False)
+    )
+    coherent_runtime["mode"] = "coherent"
+    coherent_runtime["wavelengths_nm"] = [660.0]
+    coherent_model = _build_huang2026_model(coherent_runtime).to(device)
+    coherent_result, coherent_output = _huang2026_benchmark_step(
+        "400x400_coherent_forward_backward",
+        coherent_model,
+        lambda: coherent_model(object_field, height, detector=detector),
+        target,
+        device=device,
+    )
+    del coherent_model
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    ic_coherent_model = _build_huang2026_model(coherent_runtime).to(device)
+    if not isinstance(ic_coherent_model, Huang2026ThreeLayerDONN):
+        raise AssertionError("resource assessment coherent model binding is invalid")
+    ic_model = Huang2026IncoherentDONN(ic_coherent_model).to(device)
+    ic_nr = 20
+    ic_chunk_size = min(4, ic_nr)
+    coherence_sampler = Huang2026CoherenceSampler(
+        field_shape,
+        split="train",
+        base_seed=int(runtime_config["seed"]),
+        coherence_length_pixels=4.0,
+    )
+
+    def _resource_screens(start: int, count: int) -> torch.Tensor:
+        return coherence_sampler.sample_ensemble(
+            iteration=0,
+            object_id=0,
+            num_realizations=count,
+            start_realization=start,
+            device=device,
+            dtype=complex_dtype,
+        )[None]
+
+    ic_result, ic_output = _huang2026_benchmark_step(
+        "400x400_incoherent_nr20_chunk4_forward_backward",
+        ic_model,
+        lambda: ic_model.forward_from_screen_generator(
+            object_field,
+            height,
+            num_realizations=ic_nr,
+            chunk_size=ic_chunk_size,
+            screen_generator=_resource_screens,
+            detector=detector,
+            checkpoint_chunks=True,
+        ),
+        target,
+        device=device,
+    )
+    complex_bytes = torch.empty((), dtype=complex_dtype).element_size()
+    real_bytes = object_field.real.element_size()
+    assessment = {
+        "protocol": "huang2026_visible_resource_assessment_v1",
+        "status_label": "resource assessment; not a training result",
+        "device": str(device),
+        "field_shape": list(field_shape),
+        "resized_shape": list(resized_shape),
+        "complex_dtype": str(complex_dtype).removeprefix("torch."),
+        "coherent": coherent_result,
+        "incoherent": {
+            **ic_result,
+            "nr": ic_nr,
+            "chunk_size": ic_chunk_size,
+            "streamed_screen_generation": True,
+            "activation_checkpointing": True,
+        },
+        "bounded_tensor_estimates": {
+            "one_complex_field_bytes": math.prod(field_shape) * complex_bytes,
+            "one_real_field_bytes": math.prod(field_shape) * real_bytes,
+            "three_phase_layers_bytes": 3 * math.prod(field_shape) * real_bytes,
+            "ic_screen_chunk_bytes": (
+                ic_chunk_size * math.prod(field_shape) * complex_bytes
+            ),
+            "full_nr20_screens_not_materialized": True,
+        },
+        "claim_boundary": (
+            "Single synthetic forward/backward resource probe. It does not "
+            "estimate convergence or reproduce the 60,000-object training run."
+        ),
+    }
+    save_coherent_grid(
+        [
+            ("synthetic target", target[:, None]),
+            ("coherent output", coherent_output[:, None]),
+            ("IC Nr=20 output", ic_output[:, None]),
+            ("IC absolute error", (ic_output - target).abs()[:, None]),
+        ],
+        output_dir / "samples" / "resource_assessment.png",
+    )
+    write_json(output_dir / "resource_assessment.json", assessment)
+    write_json(
+        output_dir / "metrics.json",
+        {
+            "coherent_loss": coherent_result["loss"],
+            "incoherent_loss": ic_result["loss"],
+            "coherent_phase_gradient_norms": coherent_result[
+                "phase_gradient_norms"
+            ],
+            "incoherent_phase_gradient_norms": ic_result[
+                "phase_gradient_norms"
+            ],
+        },
+    )
+    return {
+        "profile_id": HUANG2026_PROFILE_ID,
+        "status_label": assessment["status_label"],
+        "assessment": assessment,
+        "output_dir": str(output_dir),
+    }
+
+
+def run_huang2026_visible(args: argparse.Namespace) -> dict[str, Any]:
+    """Route the public Huang profile without touching any frozen Luo path."""
+
+    config_path = _huang2026_config_path(args)
+    contract = load_huang2026_contract(config_path)
+    if str(contract["mode"]) != str(args.mode):
+        raise ValueError(
+            f"Huang config mode {contract['mode']!r} does not match --mode "
+            f"{args.mode!r}"
+        )
+    device = select_device(args.device)
+    runtime_config = build_huang2026_runtime_config(
+        contract,
+        args,
+        config_path=config_path,
+        device=device,
+    )
+    output_dir = Path(args.output_dir)
+    action = str(runtime_config["action"])
+    if action == "train":
+        return train_huang2026_model(
+            runtime_config,
+            contract=contract,
+            config_path=config_path,
+            output_dir=output_dir,
+            device=device,
+        )
+    if action in {"inspect", "assess"}:
+        _snapshot_huang2026_action(
+            runtime_config,
+            contract,
+            config_path=config_path,
+            output_dir=output_dir,
+        )
+        result = (
+            run_huang2026_inspection(
+                runtime_config,
+                output_dir=output_dir,
+                device=device,
+            )
+            if action == "inspect"
+            else run_huang2026_resource_assessment(
+                runtime_config,
+                output_dir=output_dir,
+                device=device,
+            )
+        )
+        manifest = _huang2026_manifest(
+            runtime_config,
+            action=f"{action}_complete",
+            artifacts={
+                "config": "config.json",
+                "contract": "contract.json",
+                "source_config": "source_config.json",
+                "metrics": "metrics.json",
+                "samples": "samples/",
+                "sample_records": (
+                    "sample_records.jsonl" if action == "inspect" else None
+                ),
+                **(
+                    {"slm_encoding": "slm_encoding.json"}
+                    if action == "inspect"
+                    else {"resource_assessment": "resource_assessment.json"}
+                ),
+            },
+        )
+        write_json(output_dir / "manifest.json", manifest)
+        return result
+    if action not in {"evaluate", "control", "misalignment"}:
+        raise ValueError(
+            "Huang action must be inspect, assess, train, evaluate, control, "
+            "or misalignment"
+        )
+
+    checkpoint_dir = (
+        Path(args.run_dir) if args.run_dir is not None else output_dir
+    )
+    requires_checkpoint = action in {"evaluate", "misalignment"} or (
+        action == "control" and "donn" in set(runtime_config["controls"])
+    )
+    manifest_path, shared_training_dir = _huang2026_action_output(
+        runtime_config,
+        contract,
+        config_path=config_path,
+        output_dir=output_dir,
+        checkpoint_dir=checkpoint_dir,
+        requires_checkpoint=requires_checkpoint,
+    )
+    checkpoint_path = checkpoint_dir / "checkpoints" / "latest.pt"
+    checkpoint_binding = (
+        _huang2026_checkpoint_binding(
+            checkpoint_path,
+            source_kind=(
+                "shared_output_dir"
+                if checkpoint_dir.resolve() == output_dir.resolve()
+                else "external_run_dir"
+            ),
+        )
+        if requires_checkpoint
+        else None
+    )
+    if action == "evaluate":
+        result = run_huang2026_evaluation(
+            runtime_config,
+            output_dir=output_dir,
+            checkpoint_dir=checkpoint_dir,
+            device=device,
+        )
+        artifacts = {
+            "metrics": "metrics.json",
+            "sample": "samples/ideal_evaluation.png",
+            "sample_records": "ideal_evaluation_sample_records.jsonl",
+        }
+    elif action == "control":
+        result = run_huang2026_controls(
+            runtime_config,
+            output_dir=output_dir,
+            checkpoint_dir=checkpoint_dir,
+            device=device,
+        )
+        artifacts = {
+            "metrics": "control_metrics.json",
+            "sample": "samples/controls.png",
+            "sample_records": "control_sample_records.jsonl",
+        }
+    else:
+        result = run_huang2026_misalignment(
+            runtime_config,
+            output_dir=output_dir,
+            checkpoint_dir=checkpoint_dir,
+            device=device,
+        )
+        artifacts = {
+            "metrics": "misalignment_metrics.json",
+            "samples": "samples/",
+            "sample_records": "*_evaluation_sample_records.jsonl",
+        }
+    action_manifest = _huang2026_manifest(
+        runtime_config,
+        action=f"{action}_complete",
+        artifacts={
+            "config": "config.json",
+            "contract": "contract.json",
+            "source_config": "source_config.json",
+            **artifacts,
+            "checkpoint_source": (
+                "checkpoints/latest.pt" if requires_checkpoint else None
+            ),
+            "shared_training_directory": shared_training_dir,
+        },
+    )
+    if checkpoint_binding is not None:
+        binding_after = _huang2026_checkpoint_binding(
+            checkpoint_path,
+            source_kind=checkpoint_binding["source_kind"],
+        )
+        if binding_after != checkpoint_binding:
+            raise RuntimeError("Huang checkpoint changed during the action")
+        action_manifest["checkpoint_binding"] = checkpoint_binding
+    write_json(manifest_path, action_manifest)
+    return result
 
 
 if __name__ == "__main__":
