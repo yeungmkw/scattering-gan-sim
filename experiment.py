@@ -11536,11 +11536,12 @@ def _save_huang2026_sample_grid(
     corrupted: torch.Tensor,
     reconstruction: torch.Tensor,
 ) -> None:
+    primary_corrupted = _huang2026_primary_output(corrupted)
     primary = _huang2026_primary_output(reconstruction)
     save_coherent_grid(
         [
             ("clean target", target[:, None]),
-            ("corrupted intensity", corrupted[:, None]),
+            ("corrupted intensity", primary_corrupted[:, None]),
             ("reconstruction", primary[:, None]),
             ("absolute error", (primary - target).abs()[:, None]),
         ],

@@ -196,6 +196,30 @@ def test_actual_inspect_cli_route_writes_s18_and_optical_artifacts(
     ]
 
 
+def test_actual_multiwavelength_train_writes_first_wavelength_sample_panel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(experiment, "_build_huang2026_datasets", _tiny_datasets)
+    output = tmp_path / "multiwavelength"
+    result = experiment.dispatch(
+        _args(
+            output,
+            action="train",
+            mode="multiwavelength",
+            extra=["--epochs", "1", "--checkpoint-interval", "1"],
+        )
+    )
+
+    assert result["metrics"]["sample_panel_condition"] == {
+        "mode": "multiwavelength",
+        "nr": 1,
+        "displayed_wavelength_nm": 491.0,
+        "multiwavelength_display_policy": "first configured wavelength",
+    }
+    assert (output / "samples" / "ideal_evaluation.png").is_file()
+
+
 def test_direct_and_lens_control_is_lazy_and_uses_explicit_operator_routes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
