@@ -33,28 +33,34 @@ pixel value in the paper to be recreated. Exact author-level numerical
 equivalence remains impossible because several implementation and metric
 details are unpublished.
 
-The execution decision is:
+The completed execution record and next decision are:
 
 1. **Freeze R0 and its diffuser model.** Do not tune unpublished parameters
    merely to chase digitized paper values, and do not repeat completed
    post-hoc evaluations without a new, declared evidence gap.
-2. **Run the fixed-four-layer backend ablation next.** B0 measures the same
+2. **The fixed-four-layer backend ablation is complete.** B0 measures the same
    lightweight supervised U-Net without the D2NN; R1 adds supervised U-Net
    refinement after frozen R0; R2 adds PatchGAN training after the same R1
-   warmup. This isolates the optical-front-end and adversarial contributions
-   before another optical model is trained.
-3. **Keep R1 and R2 causally matched.** They share a 20-epoch supervised
+   warmup. See
+   [`luo2022-fixed4-backend-results.md`](luo2022-fixed4-backend-results.md).
+3. **R1 and R2 are causally matched.** They share a 20-epoch supervised
    warmup and then branch for 10 continued epochs: supervised-only for R1 and
    adversarial for R2. B0 trains for 30 supervised epochs with the same U-Net
    capacity, batch size, seed, and reconstruction objective.
-4. **Defer the depth scan.** Independent two-layer and five-layer models remain
-   useful for a later depth trend, but are not the current gate. No reduced-depth
-   claim is permitted from the fixed-four-layer study.
-5. **Defer visible-light optimization until the backend result and later depth
-   evidence are stable.** Visible-light work then starts from measured hardware
-   geometry, quantization, alignment, efficiency, and detector constraints.
+4. **Do not make GAN the default backend.** R2 improves SSIM and some PSNR
+   conditions but reduces the primary PCC and worst-tail fidelity relative to
+   the matched supervised R1 branch. R1 is the stronger default for a later
+   depth-by-backend study.
+5. **The next candidate gate is the pure-optical 2/4/5-layer trend.** It tests
+   whether the source paper's depth ordering survives the frozen project
+   protocol. If it does, compare the same supervised backend across depths to
+   form an optical-depth versus digital-cost Pareto study. This roadmap records
+   the decision only; no depth run starts as part of the backend freeze.
+6. **Visible-light optimization remains later.** It begins only after the depth
+   evidence and selected backend are stable, using measured hardware geometry,
+   quantization, alignment, efficiency, and detector constraints.
 
-The public, executable source of truth for this stage is
+The public, executable source of truth for the completed backend stage is
 [`configs/luo2022_fixed4_backend.json`](../configs/luo2022_fixed4_backend.json).
 Its status is `exploratory fixed-depth backend ablation`.
 
@@ -73,8 +79,8 @@ depth/backend program.
 | Direct/no-D2NN control | complete | retain beside the trained network result |
 | Full-canvas, center, and target-support PCC | complete | target support is primary; full canvas is regression |
 | Example outputs and phase-map panels | generation path exists | regenerate read-only from the frozen checkpoint when a final figure layout is chosen |
-| Fixed-four-layer backend ablation | contract defined for B0, R1, and R2 | current experiment |
-| Figure-7-style depth trend | 4-layer complete; 2-layer and 5-layer missing | deferred until the backend ablation is complete |
+| Fixed-four-layer backend ablation | B0, R1, and R2 complete with matched evaluation | frozen exploratory result |
+| Figure-7-style depth trend | 4-layer complete; 2-layer and 5-layer missing | next candidate gate; not started |
 | `n=1`, `n=10`, `n=15` memory curves | missing independent models | optional later, not an R0 blocker |
 | Hardware, resolution-target, pruning, and lens panels | not part of the current numerical scope | do not block the next research stage |
 
@@ -108,6 +114,10 @@ its reported results are not treated as a reusable pretrained system.
 
 ## Fixed-Four-Layer Backend Ablation
 
+This ablation has completed. The table below retains its causal contract; the
+metrics, figures, failure modes, and claim boundary are frozen in
+[`luo2022-fixed4-backend-results.md`](luo2022-fixed4-backend-results.md).
+
 The current comparison keeps the R0 four-layer optical model frozen. Cached
 operator outputs are raw `float32` detector intensities. Scaling is fitted on
 the training split only, using a separate global dataset maximum for each
@@ -135,6 +145,12 @@ This single-seed, fixed-depth study is an exploratory result; it cannot support
 depth-efficiency, hardware, multiple-scattering, or broad GAN-superiority
 claims.
 
+The completed comparison shows that R1 provides the best target-support PCC
+and worst-tail fidelity. R2 trades lower PCC for higher SSIM and partial PSNR
+gains. The R1-minus-B0 result remains an end-to-end operator-path difference,
+not a preprocessing-independent pure optical effect, because the direct and
+four-layer operators use separate train-fitted global intensity scales.
+
 ## Visible-Light Translation
 
 Visible-light simulation and optimization begin after the depth/backend
@@ -142,8 +158,8 @@ terahertz comparison is stable.
 
 1. Use the sealed R0, fixed-four-layer backend result, and later depth trend as
    the terahertz references.
-2. Establish which backend contribution provides a real gain under the same
-   terahertz conditions before varying optical depth.
+2. Use R1 as the protocol-specific PCC-priority backend candidate; retain R2
+   only when the documented SSIM/PCC trade-off is relevant.
 3. Scale the validated system to visible wavelengths in an ideal,
    wavelength-normalized simulation.
 4. Add laboratory constraints: available source, spatial light modulator or
@@ -154,7 +170,7 @@ terahertz comparison is stable.
 
 ## Experiment Matrix
 
-The `R0`-`R4` levels above define the causal comparison sequence. The
+The `R0`/`B0`/`R1`/`R2` levels above define the causal comparison sequence. The
 `E0`-`E4` identifiers below classify experiment families and do not imply
 execution order; the paper reproduction `R0` belongs to the trainable-D2NN
 family `E4`.

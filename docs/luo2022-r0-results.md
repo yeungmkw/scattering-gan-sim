@@ -96,8 +96,8 @@ excluded from the public repository.
 ## Acceptance and Claim Boundary
 
 The project-defined post-training absolute-level, optical-control,
-memory-structure, and integrity gates passed. The depth-trend gate remains
-deferred; the next controlled study keeps all four optical layers frozen.
+memory-structure, and integrity gates passed. The fixed-four-layer backend
+follow-on has also completed; the separate depth-trend gate remains deferred.
 
 The result supports the following narrow statement:
 
@@ -110,19 +110,20 @@ It does not establish volumetric or multiple-scattering validity, hardware
 performance, exact author ROI equivalence, multi-seed uncertainty, or an
 advantage over all digital reconstruction methods.
 
-## Next Research Gate
+## Completed Follow-on Gate
 
-The next experiment is the fixed-four-layer B0/R1/R2 backend ablation defined
-in
-[`configs/luo2022_fixed4_backend.json`](../configs/luo2022_fixed4_backend.json).
-The four-layer result and every number in this document remain unchanged.
+The fixed-four-layer B0/R1/R2 backend ablation defined in
+[`configs/luo2022_fixed4_backend.json`](../configs/luo2022_fixed4_backend.json)
+has completed. The four-layer result and every number in this document remain
+unchanged. See the independent
+[`fixed-four-layer backend result`](luo2022-fixed4-backend-results.md).
 
 - B0 trains the lightweight supervised U-Net on the direct/no-D2NN operator.
 - R1 trains the same U-Net after frozen R0.
 - R2 branches from R1's identical 20-epoch supervised warmup and adds 10
   adversarial epochs; R1 receives a matched 10-epoch supervised continuation.
 
-This is an exploratory fixed-depth backend ablation. It can measure digital
-and adversarial marginal effects under this protocol, but it cannot establish
-an optical depth trend. Independent two-layer and five-layer training is
-deferred and remains necessary before any reduced-depth claim.
+The follow-on result remains an exploratory fixed-depth backend ablation. It
+measures supervised and adversarial marginal effects under this protocol, but
+it cannot establish an optical depth trend. Independent two-layer and
+five-layer training remains necessary before any reduced-depth claim.

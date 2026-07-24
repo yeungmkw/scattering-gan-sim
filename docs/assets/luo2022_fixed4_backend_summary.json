@@ -1,0 +1,1293 @@
+{
+  "causal_deltas": {
+    "digital_reconstruction_total_gain_R1_minus_R0": {
+      "final_epoch_known": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.05413254452004676,
+            0.05811604695842024
+          ],
+          "count": 20,
+          "mean": 0.0561242957392335,
+          "sample_std": 0.004544582775887371,
+          "standard_error": 0.0010161996016258854
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.1463840796961158,
+            0.1554064726608724
+          ],
+          "count": 20,
+          "mean": 0.1508952761784941,
+          "sample_std": 0.010293206116791648,
+          "standard_error": 0.0023016308583562765
+        },
+        "psnr": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            8.739334069174612,
+            8.965369302636299
+          ],
+          "count": 20,
+          "mean": 8.852351685905456,
+          "sample_std": 0.25787252414814554,
+          "standard_error": 0.05766204935247095
+        },
+        "ssim": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.009907844607106179,
+            0.01196461454285049
+          ],
+          "count": 20,
+          "mean": 0.010936229574978334,
+          "sample_std": 0.002346468056327629,
+          "standard_error": 0.0005246862080980384
+        }
+      },
+      "no_diffuser": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.04362300579216266,
+            0.04448689575526929
+          ],
+          "count": 10000,
+          "mean": 0.044054950773715976,
+          "sample_std": 0.022038009262924308,
+          "standard_error": 0.0002203800926292431
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.12120202022519956,
+            0.12322433414730181
+          ],
+          "count": 10000,
+          "mean": 0.12221317718625069,
+          "sample_std": 0.05158964086995571,
+          "standard_error": 0.0005158964086995571
+        },
+        "psnr": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            9.740671898518434,
+            9.811699624957212
+          ],
+          "count": 10000,
+          "mean": 9.776185761737823,
+          "sample_std": 1.8119317969076547,
+          "standard_error": 0.018119317969076548
+        },
+        "ssim": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.017505218965380254,
+            0.018332238381535946
+          ],
+          "count": 10000,
+          "mean": 0.0179187286734581,
+          "sample_std": 0.02109743408560442,
+          "standard_error": 0.0002109743408560442
+        }
+      },
+      "seed_disjoint_unseen": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.059401524650036376,
+            0.06294053616029116
+          ],
+          "count": 20,
+          "mean": 0.06117103040516377,
+          "sample_std": 0.0040374848520836224,
+          "standard_error": 0.0009028090587384663
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.15863732766342153,
+            0.16677770402568592
+          ],
+          "count": 20,
+          "mean": 0.16270751584455373,
+          "sample_std": 0.009286956585946757,
+          "standard_error": 0.0020766266230266314
+        },
+        "psnr": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            8.2967320823988,
+            8.58262554395351
+          ],
+          "count": 20,
+          "mean": 8.439678813176155,
+          "sample_std": 0.32616184406074095,
+          "standard_error": 0.07293200549865028
+        },
+        "ssim": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.005104418580134778,
+            0.008281007306377014
+          ],
+          "count": 20,
+          "mean": 0.006692712943255896,
+          "sample_std": 0.0036240144532842388,
+          "standard_error": 0.0008103542668985293
+        }
+      }
+    },
+    "end_to_end_operator_path_difference_R1_minus_B0": {
+      "final_epoch_known": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.2652068235072759,
+            0.2702988621827694
+          ],
+          "count": 20,
+          "mean": 0.26775284284502265,
+          "sample_std": 0.005809257460439444,
+          "standard_error": 0.0012989894580340393
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.255198691411825,
+            0.26981010803827904
+          ],
+          "count": 20,
+          "mean": 0.262504399725052,
+          "sample_std": 0.01666944940016422,
+          "standard_error": 0.003727402200626029
+        },
+        "psnr": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            11.604677077882272,
+            11.856625065548435
+          ],
+          "count": 20,
+          "mean": 11.730651071715354,
+          "sample_std": 0.2874351159264406,
+          "standard_error": 0.06427244583320536
+        },
+        "ssim": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.6966297794396993,
+            0.6993201980540339
+          ],
+          "count": 20,
+          "mean": 0.6979749887468666,
+          "sample_std": 0.0030693667906035037,
+          "standard_error": 0.0006863312791669797
+        }
+      },
+      "no_diffuser": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.2614167402832312,
+            0.2638956629545885
+          ],
+          "count": 10000,
+          "mean": 0.26265620161890985,
+          "sample_std": 0.06323782324891174,
+          "standard_error": 0.0006323782324891173
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.24677387731196668,
+            0.2503119682553193
+          ],
+          "count": 10000,
+          "mean": 0.248542922783643,
+          "sample_std": 0.09025742202430262,
+          "standard_error": 0.0009025742202430262
+        },
+        "psnr": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            12.740520560287914,
+            12.778999701285878
+          ],
+          "count": 10000,
+          "mean": 12.759760130786896,
+          "sample_std": 0.9816107397439594,
+          "standard_error": 0.009816107397439594
+        },
+        "ssim": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.7055587843426953,
+            0.7066271512141934
+          ],
+          "count": 10000,
+          "mean": 0.7060929677784443,
+          "sample_std": 0.027254256925972633,
+          "standard_error": 0.00027254256925972635
+        }
+      },
+      "seed_disjoint_unseen": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.26027665005964984,
+            0.26651217544572603
+          ],
+          "count": 20,
+          "mean": 0.26339441275268793,
+          "sample_std": 0.007113805427904076,
+          "standard_error": 0.0015906952515500493
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.24497864478061793,
+            0.2614994550314744
+          ],
+          "count": 20,
+          "mean": 0.2532390499060462,
+          "sample_std": 0.018847783043005325,
+          "standard_error": 0.004214492410932775
+        },
+        "psnr": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            11.11092463227837,
+            11.431428297580789
+          ],
+          "count": 20,
+          "mean": 11.27117646492958,
+          "sample_std": 0.3656469299255331,
+          "standard_error": 0.08176113910775941
+        },
+        "ssim": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.6899742298907802,
+            0.6943163604573145
+          ],
+          "count": 20,
+          "mean": 0.6921452951740473,
+          "sample_std": 0.004953724037729714,
+          "standard_error": 0.0011076863690138374
+        }
+      }
+    },
+    "gan_marginal_contribution_R2_minus_R1": {
+      "final_epoch_known": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            -0.009008831772837926,
+            -0.006281380618777006
+          ],
+          "count": 20,
+          "mean": -0.007645106195807466,
+          "sample_std": 0.003111615400913505,
+          "standard_error": 0.0006957783556277858
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            -0.022065335243750855,
+            -0.016214587547968545
+          ],
+          "count": 20,
+          "mean": -0.0191399613958597,
+          "sample_std": 0.006674831411719136,
+          "standard_error": 0.0014925376774954874
+        },
+        "psnr": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.1934827161834997,
+            0.45834316451565826
+          ],
+          "count": 20,
+          "mean": 0.32591294034957896,
+          "sample_std": 0.3021663097049884,
+          "standard_error": 0.06756644090106086
+        },
+        "ssim": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.021679241166337196,
+            0.02428464982546978
+          ],
+          "count": 20,
+          "mean": 0.02298194549590349,
+          "sample_std": 0.0029723830974423683,
+          "standard_error": 0.0006646450661052516
+        }
+      },
+      "no_diffuser": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            -0.011200483060128916,
+            -0.010741079950086843
+          ],
+          "count": 10000,
+          "mean": -0.01097078150510788,
+          "sample_std": 0.011719467092910057,
+          "standard_error": 0.00011719467092910057
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            -0.027766427407906875,
+            -0.026835107137514722
+          ],
+          "count": 10000,
+          "mean": -0.0273007672727108,
+          "sample_std": 0.023758170163065178,
+          "standard_error": 0.00023758170163065177
+        },
+        "psnr": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            -0.2005996894791415,
+            -0.15909572029563876
+          ],
+          "count": 10000,
+          "mean": -0.17984770488739013,
+          "sample_std": 1.0587747240689478,
+          "standard_error": 0.010587747240689479
+        },
+        "ssim": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.0150566107685066,
+            0.015348520154287743
+          ],
+          "count": 10000,
+          "mean": 0.015202565461397172,
+          "sample_std": 0.007446668004620994,
+          "standard_error": 7.446668004620994e-05
+        }
+      },
+      "seed_disjoint_unseen": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            -0.00790711229468089,
+            -0.005077555984609289
+          ],
+          "count": 20,
+          "mean": -0.0064923341396450895,
+          "sample_std": 0.0032281021711650882,
+          "standard_error": 0.0007218255893039798
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            -0.020583360317744052,
+            -0.014304784808434844
+          ],
+          "count": 20,
+          "mean": -0.017444072563089448,
+          "sample_std": 0.007162919204428954,
+          "standard_error": 0.0016016774258441854
+        },
+        "psnr": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.3905290465503575,
+            0.6341850278324235
+          ],
+          "count": 20,
+          "mean": 0.5123570371913905,
+          "sample_std": 0.27797517207710004,
+          "standard_error": 0.06215713808215971
+        },
+        "ssim": {
+          "aggregation_unit": "matched_diffuser",
+          "ci95_normal": [
+            0.025124199922703153,
+            0.028372408668972626
+          ],
+          "count": 20,
+          "mean": 0.02674830429583789,
+          "sample_std": 0.003705722225391791,
+          "standard_error": 0.0008286246801707842
+        }
+      }
+    }
+  },
+  "claim_boundary": [
+    "single deterministic split and seed",
+    "fixed four-layer thin-phase optical model",
+    "no optical-depth trend",
+    "no hardware or visible-light performance claim",
+    "R1 minus B0 is an end-to-end path difference because input scales are operator-specific",
+    "GAN produces a metric trade-off and does not improve the primary PCC objective"
+  ],
+  "fixed_example_object_ids": [
+    3,
+    2,
+    1,
+    18,
+    4,
+    8,
+    11,
+    0,
+    61,
+    7
+  ],
+  "models": {
+    "B0": {
+      "inference_digital_parameter_count": 7557,
+      "mean_digital_inference_seconds_per_object": 0.0004238374443991655,
+      "optical_layers": 0,
+      "training_only_digital_parameter_count": 0
+    },
+    "R0": {
+      "inference_digital_parameter_count": 0,
+      "mean_digital_inference_seconds_per_object": 0.0,
+      "optical_layers": 4,
+      "training_only_digital_parameter_count": 0
+    },
+    "R1": {
+      "inference_digital_parameter_count": 7557,
+      "mean_digital_inference_seconds_per_object": 0.00042368132291764886,
+      "optical_layers": 4,
+      "training_only_digital_parameter_count": 0
+    },
+    "R2": {
+      "inference_digital_parameter_count": 7557,
+      "mean_digital_inference_seconds_per_object": 0.00043133518828686736,
+      "optical_layers": 4,
+      "training_only_digital_parameter_count": 2885
+    }
+  },
+  "optical_reference_tag": "luo2022-r0-v3",
+  "overall": {
+    "final_epoch_known": {
+      "B0": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.6856695509028818,
+            0.6911580980372045
+          ],
+          "maximum": 0.6968613165050745,
+          "mean": 0.6884138244700432,
+          "minimum": 0.6753105169206858,
+          "pair_count": 200000,
+          "sample_std": 0.006261614535743574,
+          "standard_error": 0.0014001395750823417,
+          "unit_count": 20
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.6312420964155337,
+            0.6472093578510693
+          ],
+          "maximum": 0.6709781132504344,
+          "mean": 0.6392257271333015,
+          "minimum": 0.6019936184778809,
+          "pair_count": 200000,
+          "sample_std": 0.018216266318555167,
+          "standard_error": 0.004073280978452919,
+          "unit_count": 20
+        },
+        "psnr": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            12.434469452058595,
+            12.481359529655654
+          ],
+          "maximum": 12.554746143817901,
+          "mean": 12.457914490857124,
+          "minimum": 12.349607515239716,
+          "pair_count": 200000,
+          "sample_std": 0.053494592335337716,
+          "standard_error": 0.011961754489045436,
+          "unit_count": 20
+        },
+        "ssim": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.18874818558335377,
+            0.1899632301153235
+          ],
+          "maximum": 0.19124129787534475,
+          "mean": 0.18935570784933864,
+          "minimum": 0.1865555089816451,
+          "pair_count": 200000,
+          "sample_std": 0.0013861847801907269,
+          "standard_error": 0.0003099603397882069,
+          "unit_count": 20
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 10000,
+          "cvar5_mean": 0.3460569218486082,
+          "pair_count": 200000,
+          "percentile_5": 0.4166268095374107
+        }
+      },
+      "R0": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.897349185736539,
+            0.9027355574151257
+          ],
+          "maximum": 0.9133430208027363,
+          "mean": 0.9000423715758323,
+          "minimum": 0.8885101206660271,
+          "pair_count": 200000,
+          "sample_std": 0.0061450475639792815,
+          "standard_error": 0.0013740744078027162,
+          "unit_count": 20
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.7446257539869747,
+            0.7570439473727444
+          ],
+          "maximum": 0.7820499322265386,
+          "mean": 0.7508348506798596,
+          "minimum": 0.725364369635284,
+          "pair_count": 200000,
+          "sample_std": 0.014167308453224024,
+          "standard_error": 0.0031679064759616315,
+          "unit_count": 20
+        },
+        "psnr": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            15.318461236155754,
+            15.353966517178291
+          ],
+          "maximum": 15.43395606470108,
+          "mean": 15.336213876667022,
+          "minimum": 15.268713881492614,
+          "pair_count": 200000,
+          "sample_std": 0.04050623567685071,
+          "standard_error": 0.009057469648606539,
+          "unit_count": 20
+        },
+        "ssim": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.8758208932992673,
+            0.8769680407431868
+          ],
+          "maximum": 0.8797404555737972,
+          "mean": 0.876394467021227,
+          "minimum": 0.8742103832066059,
+          "pair_count": 200000,
+          "sample_std": 0.0013087243187853656,
+          "standard_error": 0.00029263965406111823,
+          "unit_count": 20
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 10000,
+          "cvar5_mean": 0.540847680400312,
+          "pair_count": 200000,
+          "percentile_5": 0.5957629323005676
+        }
+      },
+      "R1": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.9549198201644764,
+            0.957413514465655
+          ],
+          "maximum": 0.9627051360547543,
+          "mean": 0.9561666673150657,
+          "minimum": 0.9508333200275898,
+          "pair_count": 200000,
+          "sample_std": 0.0028449336594588612,
+          "standard_error": 0.0006361465054027251,
+          "unit_count": 20
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.8987495952404658,
+            0.9047106584762412
+          ],
+          "maximum": 0.9166329284071922,
+          "mean": 0.9017301268583535,
+          "minimum": 0.8895228568613529,
+          "pair_count": 200000,
+          "sample_std": 0.006800685006820746,
+          "standard_error": 0.0015206793968814808,
+          "unit_count": 20
+        },
+        "psnr": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            24.06340308317173,
+            24.313728041973235
+          ],
+          "maximum": 24.849238666343687,
+          "mean": 24.18856556257248,
+          "minimum": 23.68126829319,
+          "pair_count": 200000,
+          "sample_std": 0.28558348180867354,
+          "standard_error": 0.06385840785752686,
+          "unit_count": 20
+        },
+        "ssim": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.8857795154626933,
+            0.8888818777297174
+          ],
+          "maximum": 0.8957256139993668,
+          "mean": 0.8873306965962053,
+          "minimum": 0.8811791231393814,
+          "pair_count": 200000,
+          "sample_std": 0.003539333122396152,
+          "standard_error": 0.0007914189456694379,
+          "unit_count": 20
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 10000,
+          "cvar5_mean": 0.7797878431856632,
+          "pair_count": 200000,
+          "percentile_5": 0.8220946758985519
+        }
+      },
+      "R2": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.9473863062579407,
+            0.9496568159805759
+          ],
+          "maximum": 0.9531055313169956,
+          "mean": 0.9485215611192583,
+          "minimum": 0.9427861615955829,
+          "pair_count": 200000,
+          "sample_std": 0.002590313307850256,
+          "standard_error": 0.0005792116639375511,
+          "unit_count": 20
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.880018825377524,
+            0.8851615055474639
+          ],
+          "maximum": 0.8936552269220353,
+          "mean": 0.8825901654624939,
+          "minimum": 0.8703743816971778,
+          "pair_count": 200000,
+          "sample_std": 0.005867031860472462,
+          "standard_error": 0.0013119082066173487,
+          "unit_count": 20
+        },
+        "psnr": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            24.42928701500861,
+            24.5996699908355
+          ],
+          "maximum": 24.88741748046875,
+          "mean": 24.514478502922056,
+          "minimum": 24.14828405895233,
+          "pair_count": 200000,
+          "sample_std": 0.1943815898763402,
+          "standard_error": 0.04346504485379816,
+          "unit_count": 20
+        },
+        "ssim": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.9097089958656298,
+            0.9109162883185874
+          ],
+          "maximum": 0.9134673493802548,
+          "mean": 0.9103126420921086,
+          "minimum": 0.9079655497074127,
+          "pair_count": 200000,
+          "sample_std": 0.001377340813028356,
+          "standard_error": 0.0003079827686116232,
+          "unit_count": 20
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 10000,
+          "cvar5_mean": 0.7241716240823269,
+          "pair_count": 200000,
+          "percentile_5": 0.7797635823488236
+        }
+      }
+    },
+    "no_diffuser": {
+      "B0": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.7026586238578998,
+            0.7056478790207661
+          ],
+          "maximum": 0.8770245313644409,
+          "mean": 0.7041532514393329,
+          "minimum": 0.3391941785812378,
+          "pair_count": 10000,
+          "sample_std": 0.07625650925679481,
+          "standard_error": 0.0007625650925679481,
+          "unit_count": 10000
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.6763470745049307,
+            0.6806804218314697
+          ],
+          "maximum": 0.9297681450843811,
+          "mean": 0.6785137481682002,
+          "minimum": 0.10148975998163223,
+          "pair_count": 10000,
+          "sample_std": 0.11054457465660673,
+          "standard_error": 0.0011054457465660673,
+          "unit_count": 10000
+        },
+        "psnr": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            12.513752916104833,
+            12.523325549738368
+          ],
+          "maximum": 13.411507606506348,
+          "mean": 12.5185392329216,
+          "minimum": 11.470112800598145,
+          "pair_count": 10000,
+          "sample_std": 0.24419983759017477,
+          "standard_error": 0.0024419983759017476,
+          "unit_count": 10000
+        },
+        "ssim": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.1932644786183537,
+            0.19420238668277853
+          ],
+          "maximum": 0.2883056700229645,
+          "mean": 0.1937334326505661,
+          "minimum": 0.13928775489330292,
+          "pair_count": 10000,
+          "sample_std": 0.02392622613328661,
+          "standard_error": 0.0002392622613328661,
+          "unit_count": 10000
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 500,
+          "cvar5_mean": 0.42011086474359033,
+          "pair_count": 10000,
+          "percentile_5": 0.4819822311401367
+        }
+      },
+      "R0": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.9221231140864123,
+            0.9233858904826413
+          ],
+          "maximum": 0.9741964936256409,
+          "mean": 0.9227545022845268,
+          "minimum": 0.6826470494270325,
+          "pair_count": 10000,
+          "sample_std": 0.03221368357727071,
+          "standard_error": 0.0003221368357727071,
+          "unit_count": 10000
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.8033831334059823,
+            0.8063038541252029
+          ],
+          "maximum": 0.9375505447387695,
+          "mean": 0.8048434937655926,
+          "minimum": 0.27177873253822327,
+          "pair_count": 10000,
+          "sample_std": 0.07450818161276991,
+          "standard_error": 0.0007450818161276991,
+          "unit_count": 10000
+        },
+        "psnr": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            15.473110838509912,
+            15.531116365431432
+          ],
+          "maximum": 22.946195602416992,
+          "mean": 15.502113601970672,
+          "minimum": 11.549333572387695,
+          "pair_count": 10000,
+          "sample_std": 1.4797328296306222,
+          "standard_error": 0.014797328296306223,
+          "unit_count": 10000
+        },
+        "ssim": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.8814263085839977,
+            0.8823890349271069
+          ],
+          "maximum": 0.9474979639053345,
+          "mean": 0.8819076717555523,
+          "minimum": 0.8104104399681091,
+          "pair_count": 10000,
+          "sample_std": 0.024559345487477992,
+          "standard_error": 0.00024559345487477994,
+          "unit_count": 10000
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 500,
+          "cvar5_mean": 0.6055219532251358,
+          "pair_count": 10000,
+          "percentile_5": 0.6623341262340545
+        }
+      },
+      "R1": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.9664985485053065,
+            0.9671203576111792
+          ],
+          "maximum": 0.9938374757766724,
+          "mean": 0.9668094530582428,
+          "minimum": 0.8074914216995239,
+          "pair_count": 10000,
+          "sample_std": 0.015862477190630355,
+          "standard_error": 0.00015862477190630356,
+          "unit_count": 10000
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.9264070661246,
+            0.9277062757790866
+          ],
+          "maximum": 0.9809468388557434,
+          "mean": 0.9270566709518433,
+          "minimum": 0.5473865866661072,
+          "pair_count": 10000,
+          "sample_std": 0.03314310343078276,
+          "standard_error": 0.00033143103430782755,
+          "unit_count": 10000
+        },
+        "psnr": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            25.258084348899306,
+            25.298514378517684
+          ],
+          "maximum": 29.616487503051758,
+          "mean": 25.278299363708495,
+          "minimum": 21.307504653930664,
+          "pair_count": 10000,
+          "sample_std": 1.0313783065912745,
+          "standard_error": 0.010313783065912746,
+          "unit_count": 10000
+        },
+        "ssim": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.8996264197113604,
+            0.9000263811466604
+          ],
+          "maximum": 0.9274868369102478,
+          "mean": 0.8998264004290104,
+          "minimum": 0.8461447954177856,
+          "pair_count": 10000,
+          "sample_std": 0.010203097839285712,
+          "standard_error": 0.00010203097839285711,
+          "unit_count": 10000
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 500,
+          "cvar5_mean": 0.8289877244234085,
+          "pair_count": 10000,
+          "percentile_5": 0.8654540985822677
+        }
+      },
+      "R2": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.9553837601484837,
+            0.9562935829577862
+          ],
+          "maximum": 0.9901757836341858,
+          "mean": 0.955838671553135,
+          "minimum": 0.5804747343063354,
+          "pair_count": 10000,
+          "sample_std": 0.023209765543434145,
+          "standard_error": 0.00023209765543434144,
+          "unit_count": 10000
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.8988263777261076,
+            0.9006854296321574
+          ],
+          "maximum": 0.9800334572792053,
+          "mean": 0.8997559036791325,
+          "minimum": 0.3208719491958618,
+          "pair_count": 10000,
+          "sample_std": 0.04742479352167875,
+          "standard_error": 0.0004742479352167875,
+          "unit_count": 10000
+        },
+        "psnr": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            25.06794824223724,
+            25.12895507540497
+          ],
+          "maximum": 29.964292526245117,
+          "mean": 25.098451658821105,
+          "minimum": 20.592342376708984,
+          "pair_count": 10000,
+          "sample_std": 1.5562967644829466,
+          "standard_error": 0.015562967644829466,
+          "unit_count": 10000
+        },
+        "ssim": {
+          "aggregation_unit": "object",
+          "ci95_normal": [
+            0.9147896382580778,
+            0.9152682935227374
+          ],
+          "maximum": 0.946945309638977,
+          "mean": 0.9150289658904076,
+          "minimum": 0.8619298934936523,
+          "pair_count": 10000,
+          "sample_std": 0.012210593486216868,
+          "standard_error": 0.00012210593486216867,
+          "unit_count": 10000
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 500,
+          "cvar5_mean": 0.767622864484787,
+          "pair_count": 10000,
+          "percentile_5": 0.813322788476944
+        }
+      }
+    },
+    "seed_disjoint_unseen": {
+      "B0": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.6855325478198308,
+            0.6906683203045348
+          ],
+          "maximum": 0.6978645939201117,
+          "mean": 0.6881004340621828,
+          "minimum": 0.6767909658074379,
+          "pair_count": 200000,
+          "sample_std": 0.005859151220801744,
+          "standard_error": 0.001310146042016358,
+          "unit_count": 20
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.631082370775451,
+            0.6448064523626053
+          ],
+          "maximum": 0.6620116371758282,
+          "mean": 0.6379444115690281,
+          "minimum": 0.6010751431374811,
+          "pair_count": 200000,
+          "sample_std": 0.015657132325321472,
+          "standard_error": 0.003501041221212816,
+          "unit_count": 20
+        },
+        "psnr": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            12.44031023733343,
+            12.475114541089878
+          ],
+          "maximum": 12.532876920604705,
+          "mean": 12.457712389211654,
+          "minimum": 12.362357569408417,
+          "pair_count": 200000,
+          "sample_std": 0.03970652505559538,
+          "standard_error": 0.008878648917460989,
+          "unit_count": 20
+        },
+        "ssim": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.1887576568585902,
+            0.1897509361465008
+          ],
+          "maximum": 0.19172667302340268,
+          "mean": 0.1892542965025455,
+          "minimum": 0.1870828421294689,
+          "pair_count": 200000,
+          "sample_std": 0.0011331836777605762,
+          "standard_error": 0.0002533875734465865,
+          "unit_count": 20
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 10000,
+          "cvar5_mean": 0.3441140110122971,
+          "pair_count": 200000,
+          "percentile_5": 0.41309161484241486
+        }
+      },
+      "R0": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.8873342003135645,
+            0.8933134325058496
+          ],
+          "maximum": 0.9014853273212909,
+          "mean": 0.890323816409707,
+          "minimum": 0.8707246647179127,
+          "pair_count": 200000,
+          "sample_std": 0.006821413079186159,
+          "standard_error": 0.0015253143347666407,
+          "unit_count": 20
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.7216896343558482,
+            0.7352622569051929
+          ],
+          "maximum": 0.7535997216194869,
+          "mean": 0.7284759456305205,
+          "minimum": 0.6828508723035455,
+          "pair_count": 200000,
+          "sample_std": 0.015484340129225055,
+          "standard_error": 0.00346240371156751,
+          "unit_count": 20
+        },
+        "psnr": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            15.271552334364998,
+            15.30686774756516
+          ],
+          "maximum": 15.356298684310913,
+          "mean": 15.289210040965079,
+          "minimum": 15.180390361976624,
+          "pair_count": 200000,
+          "sample_std": 0.04028962478013012,
+          "standard_error": 0.009009033979633096,
+          "unit_count": 20
+        },
+        "ssim": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.874132337139521,
+            0.8752814203271532
+          ],
+          "maximum": 0.8767232539713383,
+          "mean": 0.8747068787333371,
+          "minimum": 0.8705791284203529,
+          "pair_count": 200000,
+          "sample_std": 0.0013109327139530214,
+          "standard_error": 0.00029313346623272425,
+          "unit_count": 20
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 10000,
+          "cvar5_mean": 0.5167945473343134,
+          "pair_count": 200000,
+          "percentile_5": 0.5715660065412521
+        }
+      },
+      "R1": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.9495519798500726,
+            0.9534377137796689
+          ],
+          "maximum": 0.957864613622427,
+          "mean": 0.9514948468148707,
+          "minimum": 0.9370200752198696,
+          "pair_count": 200000,
+          "sample_std": 0.004433043474007521,
+          "standard_error": 0.000991258655509264,
+          "unit_count": 20
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.8862191248644837,
+            0.8961477980856649
+          ],
+          "maximum": 0.906960246348381,
+          "mean": 0.8911834614750743,
+          "minimum": 0.8571054027497769,
+          "pair_count": 200000,
+          "sample_std": 0.011327136861705518,
+          "standard_error": 0.0025328248013217172,
+          "unit_count": 20
+        },
+        "psnr": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            23.572076440298883,
+            23.88570126798359
+          ],
+          "maximum": 24.282732764434815,
+          "mean": 23.728888854141235,
+          "minimum": 22.58983314151764,
+          "pair_count": 200000,
+          "sample_std": 0.35779920108911145,
+          "standard_error": 0.080006333593037,
+          "unit_count": 20
+        },
+        "ssim": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.879277489952205,
+            0.8835216934009805
+          ],
+          "maximum": 0.8872597783744335,
+          "mean": 0.8813995916765928,
+          "minimum": 0.8644745684921742,
+          "pair_count": 200000,
+          "sample_std": 0.004842003786633208,
+          "standard_error": 0.001082704961422324,
+          "unit_count": 20
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 10000,
+          "cvar5_mean": 0.757190329682827,
+          "pair_count": 200000,
+          "percentile_5": 0.8027122497558594
+        }
+      },
+      "R2": {
+        "pearson_full_canvas": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.943507694878068,
+            0.9464973304723835
+          ],
+          "maximum": 0.9501608382105827,
+          "mean": 0.9450025126752257,
+          "minimum": 0.9384920902311802,
+          "pair_count": 200000,
+          "sample_std": 0.0034107287841032654,
+          "standard_error": 0.0007626621414070106,
+          "unit_count": 20
+        },
+        "pearson_target_support": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.8701296915789443,
+            0.8773490862450255
+          ],
+          "maximum": 0.8860632170855999,
+          "mean": 0.8737393889119849,
+          "minimum": 0.8563117444127798,
+          "pair_count": 200000,
+          "sample_std": 0.00823625368865164,
+          "standard_error": 0.0018416823127758455,
+          "unit_count": 20
+        },
+        "psnr": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            24.133931307347172,
+            24.348560475318077
+          ],
+          "maximum": 24.6403923910141,
+          "mean": 24.241245891332625,
+          "minimum": 23.783051149177552,
+          "pair_count": 200000,
+          "sample_std": 0.24485990282508255,
+          "standard_error": 0.05475233876808774,
+          "unit_count": 20
+        },
+        "ssim": {
+          "aggregation_unit": "diffuser",
+          "ci95_normal": [
+            0.9074037778839203,
+            0.9088920140609411
+          ],
+          "maximum": 0.9109909777462483,
+          "mean": 0.9081478959724307,
+          "minimum": 0.9037966799855233,
+          "pair_count": 200000,
+          "sample_std": 0.001697855744077945,
+          "standard_error": 0.00037965208597467705,
+          "unit_count": 20
+        },
+        "worst_5_percent_target_pcc": {
+          "bottom_count": 10000,
+          "cvar5_mean": 0.7049692579738795,
+          "pair_count": 200000,
+          "percentile_5": 0.7633537918329238
+        }
+      }
+    }
+  },
+  "protocol": {
+    "conditions": [
+      "final_epoch_known",
+      "seed_disjoint_unseen",
+      "no_diffuser"
+    ],
+    "confidence_intervals": "normal approximation; diffuser unit for known/unseen and object unit for no-diffuser",
+    "dataset": "MNIST",
+    "diffuser_counts": {
+      "final_epoch_known": 20,
+      "no_diffuser": 1,
+      "seed_disjoint_unseen": 20
+    },
+    "evaluation_object_count": 10000,
+    "input_scaling": {
+      "clipping": false,
+      "fit_split": "training only",
+      "per_image_normalization": false,
+      "quantity": "raw detector intensity",
+      "rule": "operator-specific global maximum"
+    },
+    "seed": 0,
+    "target_support_definition": "pixels where clean target > 0",
+    "training_object_count": 50000,
+    "training_replicates": 1,
+    "validation_object_count": 10000
+  },
+  "public_tag": "luo2022-fixed4-backend-v1",
+  "schema_version": 1,
+  "source_commits": {
+    "enhanced_evaluator": "44c6fb8f32731e4b219db42f4cf6e139d06daff3",
+    "formal_training": "1f5b05c082a780e01980de7885a4350818d1d292"
+  },
+  "status_label": "exploratory fixed-depth backend ablation",
+  "training_budget": {
+    "B0_generator_updates": 46890,
+    "R1_R2_matched_generator_updates": true,
+    "R1_R2_matched_object_order": true,
+    "R1_R2_shared_start": true,
+    "R1_continuation_generator_updates": 15630,
+    "R1_total_generator_updates": 46890,
+    "R2_continuation_generator_updates": 15630,
+    "R2_total_generator_updates": 46890,
+    "adversarial_weight_R2": 0.01,
+    "shared_warmup_generator_updates": 31260
+  }
+}

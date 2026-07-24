@@ -2,8 +2,8 @@
 
 A compact research simulation for reconstructing clean targets from
 scattering-corrupted coherent intensity measurements. The repository contains
-both a legacy U-Net/PatchGAN reconstruction path and a sealed, paper-aligned
-four-layer diffractive R0 baseline.
+a legacy U-Net/PatchGAN path, a sealed paper-aligned four-layer diffractive R0
+baseline, and a completed fixed-four-layer digital-backend ablation.
 
 ```text
 MNIST target -> coherent field -> scattering-like corruption -> propagation
@@ -127,7 +127,20 @@ for each diffuser, then reports distributions for all training diffusers,
 epochs 1 through 99, the final 10 epochs, the final epoch, unseen diffusers,
 and the no-diffuser control.
 
-## Exploratory Result
+## Results
+
+### Fixed-Four-Layer Backend Result
+
+The completed comparison keeps the sealed R0 checkpoint read-only and
+evaluates four systems: pure optical R0, direct propagation plus U-Net (B0),
+frozen R0 plus U-Net (R1), and the same R1 branch plus PatchGAN (R2). See the
+[fixed-four-layer backend result](docs/luo2022-fixed4-backend-results.md) and
+its executable contract in
+[`configs/luo2022_fixed4_backend.json`](configs/luo2022_fixed4_backend.json).
+
+![Fixed-four-layer backend metric comparison](docs/assets/luo2022_fixed4_backend_metrics.png)
+
+### Legacy Exploratory Result
 
 The included fixed-phase-diffuser comparison uses 2,048 training samples and
 256 evaluation samples. PatchGAN slightly improves L1, MSE, PSNR, and SSIM, but
@@ -138,7 +151,10 @@ hardware.
 See [the comparison note](docs/gpu-phase-comparison.md) and the
 [research roadmap](docs/research-roadmap.md) for details. The independent
 [R0 result summary](docs/luo2022-r0-results.md) records the all-optical
-four-layer reference and its claim boundary.
+four-layer reference and its claim boundary. The controlled
+[fixed-four-layer backend result](docs/luo2022-fixed4-backend-results.md)
+records the B0/R1/R2 comparison. It is an
+`exploratory fixed-depth backend ablation`, not a multi-seed claim candidate.
 
 ## Repository Layout
 

@@ -6,6 +6,8 @@ This document originally described the legacy digital-reconstruction
 prototype. That path remains reusable, but it is no longer the only validated
 system. A separate paper-aligned `luo2022_r0` profile now implements the
 four-layer trainable diffractive baseline without U-Net or GAN.
+A third completed exploratory path keeps that four-layer model frozen and attaches the
+same lightweight U-Net, with an optional training-only PatchGAN branch.
 
 ## Purpose
 
@@ -52,6 +54,21 @@ Exact equality with every paper figure is not the goal. The project requires
 the key populations, controls, trends, and provenance needed to draw and
 audit a compact reproduction-style figure set.
 
+## Frozen-Optical Backend Ablation
+
+```text
+MNIST amplitude -> frozen diffuser protocol
+                -> direct detector path -----------------> B0 U-Net
+                -> sealed four-layer optical operator ---> R1 U-Net
+                                                       \-> R2 U-Net + PatchGAN training
+```
+
+R1 and R2 share the same supervised warm-up, generator initialization,
+optimizer state, object order, diffuser assignment, and continuation update
+budget. The discriminator is used only to train R2 and is discarded at
+inference. The completed result is documented in
+[`luo2022-fixed4-backend-results.md`](luo2022-fixed4-backend-results.md).
+
 ## Main Files
 
 | File | Role |
@@ -94,9 +111,10 @@ uv run python -m experiment full \
 
 ## Claim Boundary
 
-The project now has two distinct evidence levels: an exploratory
-U-Net/PatchGAN pipeline and a sealed four-layer terahertz R0 baseline. Neither
-proves hardware validity. Omitted effects still include hardware alignment,
-detector calibration, fabrication constraints, and any optical implementation
-of the GAN. Unpublished author details also prevent calling R0 an exact
-numerical reproduction.
+The project now has three distinct evidence levels: the legacy exploratory
+U-Net/PatchGAN pipeline, the sealed four-layer terahertz R0 baseline, and the
+completed fixed-depth R0/B0/R1/R2 backend ablation. Neither digital result is a
+hardware or broad GAN-superiority claim. Omitted effects still include
+hardware alignment, detector calibration, fabrication constraints, volumetric
+multiple scattering, and any optical implementation of the GAN. Unpublished
+author details also prevent calling R0 an exact numerical reproduction.
