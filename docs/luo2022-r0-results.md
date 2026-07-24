@@ -97,7 +97,9 @@ excluded from the public repository.
 
 The project-defined post-training absolute-level, optical-control,
 memory-structure, and integrity gates passed. The fixed-four-layer backend
-follow-on has also completed; the separate depth-trend gate remains deferred.
+follow-on has also completed. The separate depth-trend study is deferred
+because its missing depths require independent from-scratch training; it is
+not a prerequisite for closing R0 or entering the next research stage.
 
 The result supports the following narrow statement:
 
@@ -125,5 +127,6 @@ unchanged. See the independent
 
 The follow-on result remains an exploratory fixed-depth backend ablation. It
 measures supervised and adversarial marginal effects under this protocol, but
-it cannot establish an optical depth trend. Independent two-layer and
-five-layer training remains necessary before any reduced-depth claim.
+it cannot establish an optical depth trend. The paper's depth trend may be
+cited as external background; independent two-layer and five-layer training
+remains necessary only before making a project-owned reduced-depth claim.

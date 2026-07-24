@@ -47,8 +47,9 @@ The terahertz four-layer R0 run is sealed as a
   full-canvas PCC is retained for historical regression;
 - the known/new memory-effect ordering and the trained-versus-direct control
   gap are present;
-- the remaining depth-trend gate requires independent 2-layer and 5-layer
-  runs.
+- an independent 2/4/5-layer depth trend remains unavailable because the
+  2-layer and 5-layer cases require from-scratch training; this optional
+  evidence is deferred and does not block the next research stage.
 
 Exact equality with every paper figure is not the goal. The project requires
 the key populations, controls, trends, and provenance needed to draw and

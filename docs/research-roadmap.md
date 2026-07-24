@@ -49,24 +49,26 @@ The completed execution record and next decision are:
    capacity, batch size, seed, and reconstruction objective.
 4. **Do not make GAN the default backend.** R2 improves SSIM and some PSNR
    conditions but reduces the primary PCC and worst-tail fidelity relative to
-   the matched supervised R1 branch. R1 is the stronger default for a later
-   depth-by-backend study.
-5. **The next candidate gate is the pure-optical 2/4/5-layer trend.** It tests
-   whether the source paper's depth ordering survives the frozen project
-   protocol. If it does, compare the same supervised backend across depths to
-   form an optical-depth versus digital-cost Pareto study. This roadmap records
-   the decision only; no depth run starts as part of the backend freeze.
-6. **Visible-light optimization remains later.** It begins only after the depth
-   evidence and selected backend are stable, using measured hardware geometry,
-   quantization, alignment, efficiency, and detector constraints.
+   the matched supervised R1 branch. R1 is the stronger default whenever a
+   PCC-priority digital backend is needed.
+5. **The pure-optical 2/4/5-layer trend is deferred.** Each missing depth
+   requires an independent from-scratch optical training run, so the expected
+   evidence gain does not currently justify the GPU cost. The source paper's
+   depth trend may be cited as external background with explicit provenance.
+   Local 2-layer and 5-layer training becomes necessary only if the project
+   later makes its own reduced-depth or depth-Pareto claim.
+6. **Visible-light optimization remains a separate later route.** It is not
+   blocked by a local 2/4/5-layer sweep, but it must establish its own
+   wavelength-, geometry-, quantization-, alignment-, efficiency-, and
+   detector-constrained baseline before supporting a physical claim.
 
 The public, executable source of truth for the completed backend stage is
 [`configs/luo2022_fixed4_backend.json`](../configs/luo2022_fixed4_backend.json).
 Its status is `exploratory fixed-depth backend ablation`.
 
 The `n=1`, `n=10`, and `n=15` paper curves require separate models. They are
-optional later controls, not blockers for closing R0 or starting the
-depth/backend program.
+optional later controls, not blockers for closing R0 or choosing the next
+research route.
 
 ### Key Data and Figure Readiness
 
@@ -80,7 +82,7 @@ depth/backend program.
 | Full-canvas, center, and target-support PCC | complete | target support is primary; full canvas is regression |
 | Example outputs and phase-map panels | generation path exists | regenerate read-only from the frozen checkpoint when a final figure layout is chosen |
 | Fixed-four-layer backend ablation | B0, R1, and R2 complete with matched evaluation | frozen exploratory result |
-| Figure-7-style depth trend | 4-layer complete; 2-layer and 5-layer missing | next candidate gate; not started |
+| Figure-7-style depth trend | 4-layer complete; 2-layer and 5-layer require independent training | deferred; cite the paper for background, retrain only for a project-specific depth claim |
 | `n=1`, `n=10`, `n=15` memory curves | missing independent models | optional later, not an R0 blocker |
 | Hardware, resolution-target, pruning, and lens panels | not part of the current numerical scope | do not block the next research stage |
 
@@ -153,11 +155,14 @@ four-layer operators use separate train-fitted global intensity scales.
 
 ## Visible-Light Translation
 
-Visible-light simulation and optimization begin after the depth/backend
-terahertz comparison is stable.
+Visible-light simulation and optimization may be considered after the frozen
+four-layer/backend evidence is stable. A local 2/4/5-layer sweep is not a
+prerequisite, although any visible-light design must establish its own
+physics- and hardware-constrained baseline.
 
-1. Use the sealed R0, fixed-four-layer backend result, and later depth trend as
-   the terahertz references.
+1. Use the sealed R0 and fixed-four-layer backend result as the project-owned
+   terahertz references; use the paper's depth trend only as clearly labeled
+   external context until local depth variants are trained.
 2. Use R1 as the protocol-specific PCC-priority backend candidate; retain R2
    only when the documented SSIM/PCC trade-off is relevant.
 3. Scale the validated system to visible wavelengths in an ideal,

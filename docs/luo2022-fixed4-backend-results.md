@@ -232,9 +232,14 @@ validity.
 
 ## Next Decision Gate
 
-The next candidate study is a pure-optical 2/4/5-layer terahertz depth trend,
-followed by a depth-by-supervised-backend Pareto comparison if the optical
-trend is credible. R1, not R2, is the default digital backend candidate because
-the adversarial branch does not improve the primary PCC objective. These are
-future gates only; no depth, multi-seed, visible-light, or hardware experiment
-is part of this frozen result.
+The pure-optical 2/4/5-layer terahertz depth trend is scientifically useful but
+deferred: the missing depths require independent from-scratch training, and
+the current evidence gain does not justify that GPU cost. The source paper's
+depth values may be used as explicitly external reference data. Local depth
+training is required only before making a project-specific reduced-depth or
+depth-by-backend Pareto claim.
+
+R1, not R2, remains the default PCC-priority digital backend candidate because
+the adversarial branch does not improve the primary PCC objective. No depth,
+multi-seed, visible-light, or hardware experiment is part of this frozen
+result, and none is launched automatically from this decision.
