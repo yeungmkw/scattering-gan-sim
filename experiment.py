@@ -10072,14 +10072,59 @@ def build_huang2026_runtime_config(
     evaluation_action = args.action in {"evaluate", "control", "misalignment"} or bool(
         args.evaluation_only
     )
-    configured_nr = _huang2026_config_value(
-        contract,
-        "coherence.nr_blind_test"
-        if evaluation_action
-        else "coherence.nr_training",
-        default=2000 if evaluation_action else 20,
-    )
-    nr = int(args.nr if args.nr is not None else (4 if small_run else configured_nr))
+    if args.mode == "incoherent":
+        configured_nr = _huang2026_config_value(
+            contract,
+            "coherence.nr_blind_test"
+            if evaluation_action
+            else "coherence.nr_training",
+            default=2000 if evaluation_action else 20,
+        )
+        nr = int(
+            args.nr
+            if args.nr is not None
+            else (4 if small_run else configured_nr)
+        )
+        nr_training_contract = int(
+            args.nr
+            if args.nr is not None and not evaluation_action
+            else (
+                4
+                if small_run
+                else _huang2026_config_value(
+                    contract,
+                    "coherence.nr_training",
+                    default=20,
+                )
+            )
+        )
+        nr_blind_test_contract = int(
+            4
+            if small_run
+            else _huang2026_config_value(
+                contract,
+                "coherence.nr_blind_test",
+                default=2000,
+            )
+        )
+    else:
+        if args.nr is not None and int(args.nr) != 1:
+            raise ValueError("--nr greater than one is only valid for incoherent mode")
+        nr = 1
+        nr_training_contract = int(
+            _huang2026_config_value(
+                contract,
+                "coherence.nr_training",
+                default=1,
+            )
+        )
+        nr_blind_test_contract = int(
+            _huang2026_config_value(
+                contract,
+                "coherence.nr_blind_test",
+                default=1,
+            )
+        )
     if nr <= 0:
         raise ValueError("--nr must be positive")
     configured_chunk = _huang2026_config_value(
@@ -10254,28 +10299,8 @@ def build_huang2026_runtime_config(
                 )
             ),
             "nr": nr,
-            "nr_training_contract": int(
-                args.nr
-                if args.nr is not None and not evaluation_action
-                else (
-                    4
-                    if small_run
-                    else _huang2026_config_value(
-                        contract,
-                        "coherence.nr_training",
-                        default=20,
-                    )
-                )
-            ),
-            "nr_blind_test_contract": int(
-                4
-                if small_run
-                else _huang2026_config_value(
-                    contract,
-                    "coherence.nr_blind_test",
-                    default=2000,
-                )
-            ),
+            "nr_training_contract": nr_training_contract,
+            "nr_blind_test_contract": nr_blind_test_contract,
             "chunk_size": min(nr, coherence_chunk_size),
         },
         "training": {

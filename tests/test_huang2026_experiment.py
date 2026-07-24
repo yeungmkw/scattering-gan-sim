@@ -217,6 +217,14 @@ def test_actual_multiwavelength_train_writes_first_wavelength_sample_panel(
         "displayed_wavelength_nm": 491.0,
         "multiwavelength_display_policy": "first configured wavelength",
     }
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["runtime"]["coherence"] == {
+        "coherence_length_pixels": 4.0,
+        "nr": 1,
+        "nr_training_contract": 1,
+        "nr_blind_test_contract": 1,
+        "chunk_size": 1,
+    }
     assert (output / "samples" / "ideal_evaluation.png").is_file()
 
 
