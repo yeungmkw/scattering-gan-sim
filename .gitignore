@@ -46,6 +46,7 @@ docs/*-metric-region-diagnosis.md
 docs/improvement-research-*.md
 docs/research-appendix-*.md
 docs/*supplement*-audit*.md
+docs/archive/internal/
 
 # Local diagnosis notebooks, scratch data, and working notes
 work/

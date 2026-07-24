@@ -13,7 +13,7 @@ MNIST amplitude -> correlated diffuser -> trainable phase layers
                 -> detector intensity
 ```
 
-![Fixed-diffuser U-Net and PatchGAN comparison](docs/assets/gpu_phase_comparison_samples.png)
+![Fixed-four-layer unseen-diffuser examples](docs/assets/luo2022_fixed4_backend_samples_unseen.png)
 
 ## Scope
 
@@ -148,10 +148,11 @@ reduces Pearson correlation. This is evidence that the synthetic inverse path
 trains end to end; it is not evidence of validity for real scattering media or
 hardware.
 
-See [the comparison note](docs/gpu-phase-comparison.md) and the
-[research roadmap](docs/research-roadmap.md) for details. The independent
-[R0 result summary](docs/luo2022-r0-results.md) records the all-optical
-four-layer reference and its claim boundary. The controlled
+The original comparison and its figures remain available in the
+[legacy archive](docs/archive/legacy/gpu-phase-comparison.md). See the
+[research roadmap](docs/research-roadmap.md) for the current decisions. The
+independent [R0 result summary](docs/luo2022-r0-results.md) records the
+all-optical four-layer reference and its claim boundary. The controlled
 [fixed-four-layer backend result](docs/luo2022-fixed4-backend-results.md)
 records the B0/R1/R2 comparison. It is an
 `exploratory fixed-depth backend ablation`, not a multi-seed claim candidate.

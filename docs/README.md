@@ -9,13 +9,12 @@ Recommended reading order:
 
 1. `system-overview.md`: what the current pipeline does and how files map to
    the optical/DNN/GAN stages.
-2. `gpu-phase-comparison.md`: the completed GPU run comparing coherent U-Net
-   and U-Net+PatchGAN.
-3. `research-roadmap.md`: what should be added next before making stronger
+2. `research-roadmap.md`: completed decisions and the evidence required before
+   making stronger
    claims.
-4. `luo2022-r0-results.md`: the sealed public R0 protocol, key results,
+3. `luo2022-r0-results.md`: the sealed public R0 protocol, key results,
    controls, integrity boundary, and completed follow-on boundary.
-5. `luo2022-fixed4-backend-results.md`: the completed R0/B0/R1/R2 fixed-depth
+4. `luo2022-fixed4-backend-results.md`: the completed R0/B0/R1/R2 fixed-depth
    comparison, matched GAN branch, costs, and claim boundary.
 
 The executable Luo 2022 R0 source of truth is
@@ -36,3 +35,15 @@ It explains how the polluted optical signal is generated, how that signal is
 fed through DNN reconstruction, and how GAN refinement is attached after the
 baseline. Its result cells expect a locally generated `outputs/` run; the
 public repository instead keeps the representative figures under `docs/assets/`.
+
+## Archive
+
+Superseded but still useful public material is kept under
+[`archive/`](archive/). The legacy fixed-phase U-Net/PatchGAN result and its
+figures remain reproducible there, but they are no longer part of the main
+reading path.
+
+Detailed reproduction contracts, evidence ledgers, acceptance notes, and
+research surveys are retained locally under the Git-ignored
+`archive/internal/` directory. They remain available for audit and future
+research decisions without cluttering the public documentation surface.
