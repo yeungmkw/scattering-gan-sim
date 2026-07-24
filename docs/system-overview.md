@@ -119,3 +119,6 @@ hardware or broad GAN-superiority claim. Omitted effects still include
 hardware alignment, detector calibration, fabrication constraints, volumetric
 multiple scattering, and any optical implementation of the GAN. Unpublished
 author details also prevent calling R0 an exact numerical reproduction.
+The R1-minus-B0 direction survives a common-global-epoch-25 checkpoint
+sensitivity evaluation, while the much larger terminal-checkpoint effect size
+is explicitly treated as checkpoint-selection-sensitive.

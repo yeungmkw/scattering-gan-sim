@@ -81,7 +81,7 @@ research route.
 | Direct/no-D2NN control | complete | retain beside the trained network result |
 | Full-canvas, center, and target-support PCC | complete | target support is primary; full canvas is regression |
 | Example outputs and phase-map panels | generation path exists | regenerate read-only from the frozen checkpoint when a final figure layout is chosen |
-| Fixed-four-layer backend ablation | B0, R1, and R2 complete with matched evaluation | frozen exploratory result |
+| Fixed-four-layer backend ablation | B0, R1, and R2 complete with matched evaluation and epoch-25 checkpoint sensitivity | frozen exploratory result |
 | Figure-7-style depth trend | 4-layer complete; 2-layer and 5-layer require independent training | deferred; cite the paper for background, retrain only for a project-specific depth claim |
 | `n=1`, `n=10`, `n=15` memory curves | missing independent models | optional later, not an R0 blocker |
 | Hardware, resolution-target, pruning, and lens panels | not part of the current numerical scope | do not block the next research stage |
@@ -152,6 +152,10 @@ and worst-tail fidelity. R2 trades lower PCC for higher SSIM and partial PSNR
 gains. The R1-minus-B0 result remains an end-to-end operator-path difference,
 not a preprocessing-independent pure optical effect, because the direct and
 four-layer operators use separate train-fitted global intensity scales.
+Its direction remains positive in a common-global-epoch-25 sensitivity
+evaluation, but the approximately `+0.25` terminal effect shrinks to about
+`+0.055`--`+0.062`. Future backend experiments must predeclare checkpoint
+selection and retain terminal plus selected-checkpoint results.
 
 ## Visible-Light Translation
 

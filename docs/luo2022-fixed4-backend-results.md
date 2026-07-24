@@ -10,6 +10,7 @@ This result is frozen as an
   [`configs/luo2022_fixed4_backend.json`](../configs/luo2022_fixed4_backend.json);
 - formal training source: `1f5b05c`;
 - enhanced evaluator source: `44c6fb8`;
+- checkpoint-sensitivity evaluator source: `554c9a9`;
 - optical reference: the unchanged `luo2022-r0-v3` four-layer R0;
 - dataset: deterministic 50,000-object training, 10,000-object validation,
   and 10,000-object evaluation splits from MNIST;
@@ -140,23 +141,57 @@ interval uses paired-object deltas.
 
 ### 2. End-to-End Optical-Path Difference: R1 Minus B0
 
-With the same lightweight U-Net architecture and update budget, the frozen
-four-layer path exceeds the direct path in target-support PCC by:
+At the protocol-fixed global-epoch-30 checkpoints, the frozen four-layer path
+exceeds the direct path in target-support PCC by:
 
-| Condition | Mean delta | 95% CI |
+| Condition | Terminal mean delta | 95% CI |
 |---|---:|---:|
 | Final known | +0.262504 | [+0.255199, +0.269810] |
 | Unseen | +0.253239 | [+0.244979, +0.261500] |
 | No diffuser | +0.248543 | [+0.246774, +0.250312] |
 
-This comparison supports a useful end-to-end four-layer-plus-U-Net path under
-the declared protocol. It must not be described as an isolated optical causal
-effect because each operator uses its own training-fitted intensity scale.
-B0 also peaks earlier on the validation set and then degrades by epoch 30;
-the table retains the protocol-fixed final checkpoint rather than selecting a
-post-hoc early-stopped digital upper bound.
+This terminal-checkpoint comparison is valid under the declared fixed-budget
+protocol, but its magnitude is checkpoint-selection-sensitive. It must not be
+described as an isolated optical causal effect because each operator uses its
+own training-fitted intensity scale.
 The known and unseen intervals use matched-diffuser deltas; the no-diffuser
 interval uses paired-object deltas.
+
+#### Post-Hoc Checkpoint-Selection Sensitivity
+
+The cached validation curves expose a material selection effect. The
+validation statistic is full-canvas PCC on the fixed validation cache, not the
+formal target-support test statistic.
+
+| Variant | Peak validation PCC | Peak global epoch | Epoch-30 PCC | Peak minus terminal | Last-10-epoch SD |
+|---|---:|---:|---:|---:|---:|
+| B0 | 0.942725 | 25 | 0.679118 | +0.263607 | 0.077710 |
+| R1 | 0.971990 | 25 | 0.950489 | +0.021501 | 0.025112 |
+
+Both variants independently peak at the same global epoch 25, so that epoch
+also gives a clean matched-budget sensitivity point. A read-only evaluation
+of the original epoch-25 weights on the complete formal test protocol gives:
+
+| Condition | B0 at epoch 25 | R1 at epoch 25 | R1 minus B0 | 95% CI | Terminal delta |
+|---|---:|---:|---:|---:|---:|
+| Final known | 0.872975 | 0.934933 | +0.061958 | [+0.059730, +0.064186] | +0.262504 |
+| Unseen | 0.872149 | 0.928444 | +0.056294 | [+0.053639, +0.058949] | +0.253239 |
+| No diffuser | 0.898323 | 0.953752 | +0.055429 | [+0.054645, +0.056214] | +0.248543 |
+
+The epoch-25 shadow artifacts changed only compatibility metadata; the B0 and
+R1 generator-state hashes exactly match the original selected checkpoints.
+The evaluator completed normally, retained the sealed R0 hashes, and used the
+same 10,000-object, known/unseen/no-diffuser protocol.
+
+The robust conclusion is therefore about direction, not headline magnitude:
+R1 remains ahead of B0 by approximately 0.055--0.062 target-support PCC at the
+common validation-selected checkpoint, but the approximately 0.25 terminal
+advantage depends strongly on retaining epoch 30. This sensitivity analysis
+is post hoc and does not replace the frozen endpoint result. Future backend
+studies must predeclare checkpoint selection and report both the terminal and
+selected-checkpoint views. R1's validation trajectory is less volatile in
+this single run, but that observation alone does not establish that the
+optical front end causally stabilizes training.
 
 ### 3. Adversarial Marginal Effect: R2 Minus R1
 
@@ -221,9 +256,11 @@ The supported statement is narrow:
 > Under one deterministic MNIST split, one seed, the frozen four-layer
 > thin-phase protocol, and operator-specific train-only global scaling, a small
 > supervised U-Net substantially improves the four-layer output and the
-> four-layer-plus-U-Net path exceeds the direct-plus-U-Net path. Adding the
-> matched PatchGAN trades lower PCC and worst-tail fidelity for higher SSIM and
-> partial PSNR gains.
+> four-layer-plus-U-Net path exceeds the direct-plus-U-Net path in both the
+> fixed-terminal and common-epoch-25 sensitivity views, although the size of
+> that difference is checkpoint-selection-sensitive. Adding the matched
+> PatchGAN trades lower PCC and worst-tail fidelity for higher SSIM and partial
+> PSNR gains.
 
 The result does not support general GAN superiority, a reduced optical-depth
 claim, multi-seed uncertainty, broad out-of-distribution generalization,
@@ -242,4 +279,6 @@ depth-by-backend Pareto claim.
 R1, not R2, remains the default PCC-priority digital backend candidate because
 the adversarial branch does not improve the primary PCC objective. No depth,
 multi-seed, visible-light, or hardware experiment is part of this frozen
-result, and none is launched automatically from this decision.
+result, and none is launched automatically from this decision. Any next
+training protocol must predeclare whether it uses a terminal checkpoint,
+validation-selected checkpoint, or both.

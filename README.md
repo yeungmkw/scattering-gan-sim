@@ -137,6 +137,9 @@ frozen R0 plus U-Net (R1), and the same R1 branch plus PatchGAN (R2). See the
 [fixed-four-layer backend result](docs/luo2022-fixed4-backend-results.md) and
 its executable contract in
 [`configs/luo2022_fixed4_backend.json`](configs/luo2022_fixed4_backend.json).
+Its R1-minus-B0 direction survives a read-only common-epoch-25 checkpoint
+sensitivity test, but the large terminal-checkpoint effect size does not;
+checkpoint selection is therefore part of the stated claim boundary.
 
 ![Fixed-four-layer backend metric comparison](docs/assets/luo2022_fixed4_backend_metrics.png)
 

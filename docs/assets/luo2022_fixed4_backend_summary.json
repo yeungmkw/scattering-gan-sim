@@ -421,12 +421,77 @@
       }
     }
   },
+  "checkpoint_selection_sensitivity": {
+    "formal_test_target_support_pcc": {
+      "final_epoch_known": {
+        "B0_mean": 0.8729751929082721,
+        "R1_mean": 0.9349331324234604,
+        "R1_minus_B0": {
+          "ci95_normal": [
+            0.05973008208089125,
+            0.06418579694948544
+          ],
+          "mean": 0.06195793951518834
+        },
+        "terminal_R1_minus_B0": 0.262504399725052
+      },
+      "no_diffuser": {
+        "B0_mean": 0.898323255354166,
+        "R1_mean": 0.9537523024857044,
+        "R1_minus_B0": {
+          "ci95_normal": [
+            0.05464457596203196,
+            0.056213518301044825
+          ],
+          "mean": 0.05542904713153839
+        },
+        "terminal_R1_minus_B0": 0.248542922783643
+      },
+      "seed_disjoint_unseen": {
+        "B0_mean": 0.8721494240079821,
+        "R1_mean": 0.9284436169470848,
+        "R1_minus_B0": {
+          "ci95_normal": [
+            0.05363947051116665,
+            0.05894891536703869
+          ],
+          "mean": 0.05629419293910267
+        },
+        "terminal_R1_minus_B0": 0.2532390499060462
+      }
+    },
+    "interpretation": "R1 remains ahead under the common epoch-25 view, but the approximately 0.25 terminal effect size is not checkpoint-selection-robust.",
+    "post_hoc": true,
+    "r0_hashes_unchanged": true,
+    "selected_generator_weights_match_source_checkpoints": true,
+    "selection": {
+      "B0": {
+        "global_epoch": 25,
+        "last_10_epoch_validation_pcc_sample_std": 0.07771039922682267,
+        "peak_minus_terminal_validation_pcc": 0.2636068573951721,
+        "selected_validation_pcc": 0.9427248616218566,
+        "terminal_validation_pcc": 0.6791180042266846
+      },
+      "R1": {
+        "global_epoch": 25,
+        "last_10_epoch_validation_pcc_sample_std": 0.025111817110753807,
+        "peak_minus_terminal_validation_pcc": 0.02150088195800781,
+        "selected_validation_pcc": 0.9719897730827332,
+        "terminal_validation_pcc": 0.9504888911247253
+      },
+      "criterion": "maximum cached-validation full-canvas PCC",
+      "selected_validation_gap_R1_minus_B0": 0.029264911460876508,
+      "terminal_validation_gap_R1_minus_B0": 0.2713708868980408
+    },
+    "status": "post-hoc read-only checkpoint sensitivity"
+  },
   "claim_boundary": [
     "single deterministic split and seed",
     "fixed four-layer thin-phase optical model",
     "no optical-depth trend",
     "no hardware or visible-light performance claim",
     "R1 minus B0 is an end-to-end path difference because input scales are operator-specific",
+    "R1 minus B0 direction is positive but its terminal effect size is checkpoint-selection-sensitive",
     "GAN produces a metric trade-off and does not improve the primary PCC objective"
   ],
   "fixed_example_object_ids": [
@@ -1274,6 +1339,7 @@
   "public_tag": "luo2022-fixed4-backend-v1",
   "schema_version": 1,
   "source_commits": {
+    "checkpoint_sensitivity_evaluator": "554c9a95ca253cda89380bb931ba10e5174f4d48",
     "enhanced_evaluator": "44c6fb8f32731e4b219db42f4cf6e139d06daff3",
     "formal_training": "1f5b05c082a780e01980de7885a4350818d1d292"
   },
